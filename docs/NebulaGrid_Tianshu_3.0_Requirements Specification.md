@@ -150,7 +150,7 @@ NebulaGrid 3.0 的目标是提供一个浏览器即可访问的统一入口，�
 
 ## 3.2 部署拓扑
 
-最小可用部署仍然保持一个主控节点和若干计算节点。主控节点运行 Web 后端、调度器、节点监控器和数据库；计算节点只需要能够被主控节点通过 SSH 访问，并具备统一目录结构、conda/miniconda 环境或可解包环境。若后续要提升可靠性，可以将数据库独立部署，并把调度器保持为单实例以避免重复派发任务。
+最小可用部署仍然保持一个主控节点和若干计算节点。主控节点运行 Web 后端、调度器、节点监控器和数据库；主控节点与计算节点通过 NFS 协议共享 `~/data` 与 `~/envs` 两个目录。`~/data` 存储任务日志、环境安装日志、运行时文件和所有用户数据，`~/envs` 存储 miniconda、用户环境目录和节点监控/远端执行代码。计算节点只需要能够被主控节点通过 SSH 访问，并以一致路径挂载这两个 NFS 目录。若后续要提升可靠性，可以将数据库独立部署，并把调度器保持为单实例以避免重复派发任务。
 
 ```text
 用户浏览器 / 展示大屏
@@ -162,8 +162,8 @@ NebulaGrid 3.0 的目标是提供一个浏览器即可访问的统一入口，�
 ├── Monitor：节点状态采集与看门狗
 ├── Executor：SSH 启动/停止任务
 ├── DB：用户、节点、GPU、任务、事件、审计
-└── Storage：用户文件、环境包、任务日志
-        │ SSH / SFTP / 共享目录
+└── NFS Storage：~/data（用户数据、日志）与 ~/envs（miniconda、环境、节点监控代码）
+        │ SSH 控制命令 + NFS 共享文件
         ▼
 [计算节点 A/B/C...]：运行用户训练命令，返回状态与日志
 ```
@@ -341,7 +341,7 @@ nebulagrid/
 
 ## 5.4 环境管理
 
-3.0 的环境管理应同时支持“已有 conda 环境登记”和“用户上传 conda-pack 环境包”。考虑到主节点不联网、用户不希望直接 SSH 到主节点，推荐流程是：用户在个人电脑或 WSL/Linux 环境中维护 conda 环境，使用 conda-pack 打包后上传到系统，由系统在用户环境目录解包并执行校验。
+3.0 的环境管理应同时支持“已有 conda 环境登记”和“用户上传 conda-pack 环境包”。考虑到主节点不联网、用户不希望直接 SSH 到主节点，推荐流程是：用户在个人电脑或 WSL/Linux 环境中维护 conda 环境，使用 conda-pack 打包后上传到系统，由系统在 NFS 共享的 `~/envs/user_envs/<username>/` 下解包并执行校验。
 
 除完整环境导入外，3.0 还应支持“环境内包安装”能力。用户可在环境详情页上传 .whl 文件或压缩的 Python 包（.zip/.tar/.tar.gz/.tgz），选择目标环境后由系统自动安装或导入。该功能用于解决主控节点不联网、用户无法直接 SSH 维护环境时的增量更新问题。
 
@@ -378,7 +378,7 @@ nebulagrid/
 
 ## 5.6 日志管理
 
-- 任务日志路径默认为 data/task_log/<task_id>.log，可由配置修改。
+- 任务日志路径默认为 `~/data/logs/task_logs/<task_id>.log`，由 master 与计算节点通过 NFS 共享，可由配置修改。
 
 - 等待任务显示“任务尚未运行，暂无日志”；dispatching/starting 显示“环境启动中，暂无日志”；运行任务支持 tail 刷新；历史任务支持全量查看和下载。
 
@@ -651,7 +651,7 @@ while True:
 
 ```bash
 source ~/.bashrc
-source /path/to/miniconda/bin/activate
+source ~/envs/miniconda/bin/activate
 conda activate <env_name>
 cd <resolved_user_project_path>
 export PYTHONUNBUFFERED=1
@@ -697,7 +697,7 @@ export QT_QPA_PLATFORM=offscreen
 
 ## 10.1 路径模型
 
-用户界面统一展示虚拟路径，例如 /workspace/project/train.py。后端 PathResolver 将虚拟路径解析为服务器真实路径，并检查该路径是否落在用户 home_path 或管理员配置的 visible_roots 内。所有文件 API、任务 workdir、环境路径和日志下载都必须调用同一个 PathResolver。
+用户界面统一展示虚拟路径，例如 `/workspace/project/train.py`。后端 PathResolver 将虚拟路径解析为服务器真实路径，并检查该路径是否落在 NFS 共享的 `~/data/users/<username>/`、`~/envs/user_envs/<username>/` 或管理员配置的 visible_roots 内。所有文件 API、任务 workdir、环境路径和日志下载都必须调用同一个 PathResolver。master 与计算节点必须以相同路径挂载 `~/data` 和 `~/envs`，否则远端任务可能找不到项目路径、日志路径或环境路径。
 
 ```python
 def resolve_virtual_path(user, virtual_path, mode):
@@ -722,7 +722,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 3. 系统将包保存到临时目录，校验压缩包类型、大小、路径安全和是否包含 Linux 可执行结构。
 
-4. 系统解包到用户环境目录，例如 /data/users/<username>/envs/<env_name>。
+4. 系统解包到 NFS 共享的用户环境目录，例如 `~/envs/user_envs/<username>/<env_name>`。
 
 5. 执行 conda-unpack 或等价修复脚本，记录导入日志。
 
@@ -756,12 +756,12 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 | **日志类型**        | **保存位置**                         | **查看权限**                     | **保留策略**                                   |
 |---------------------|--------------------------------------|----------------------------------|------------------------------------------------|
-| 任务日志            | data/task_log/<task_id>.log        | 任务可见者                       | 默认长期保留；管理员可归档。                   |
+| 任务日志            | ~/data/logs/task_logs/<task_id>.log | 任务可见者                       | 默认长期保留；管理员可归档。                   |
 | 任务事件            | task_events 表                       | 任务可见者                       | 随任务永久保留。                               |
 | 系统日志            | server_log_path 或 logging 服务      | 管理员                           | 按大小/日期轮转。                              |
 | 审计日志            | audit_logs 表                        | 管理员；用户可查看自己的登录记录 | 建议长期保留，不随任务删除。                   |
-| 环境导入日志        | data/env_logs/<env_id>.log         | 环境所有者/管理员                | 随环境保留或归档。                             |
-| 环境包安装/编译日志 | data/env_install_logs/<job_id>.log | 环境所有者/导师可见范围/管理员   | 随 env_install_jobs 保留；管理员可按时间归档。 |
+| 环境导入日志        | ~/data/logs/env_logs/<env_id>.log  | 环境所有者/管理员                | 随环境保留或归档。                             |
+| 环境包安装/编译日志 | ~/data/logs/env_install_logs/<job_id>.log | 环境所有者/导师可见范围/管理员   | 随 env_install_jobs 保留；管理员可按时间归档。 |
 
 # 11. 安全、审计与运维需求
 
@@ -798,7 +798,9 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 - 配置修改前自动生成备份，管理员后台提供 diff 和回滚。
 
-- 任务日志和用户文件不宜与数据库备份混在一起，应制定独立备份策略。
+- `~/data` 中的任务日志、用户文件、上传包和运行时文件不宜与数据库备份混在一起，应制定独立备份策略。
+
+- `~/envs` 中的 miniconda、用户环境和节点监控/远端执行代码需要单独备份；其中用户环境体积较大，可按环境元数据和关键环境包分层备份。
 
 - master 重启后，dispatching/starting/running 状态任务需要执行恢复扫描：确认远端进程是否仍存在，无法确认时标记 lost/offline 并要求用户手动处理。
 
@@ -938,7 +940,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 | 继续沿用全局列表和 JSON dump | 历史增长后页面变慢，状态恢复困难，权限和审计难实现。 | 尽早迁移数据库，JSON 只用于导入/导出。                                           |
 | 用户命令具备 shell 能力      | 可能绕过 GPU 分配或误删文件。                        | 限制路径、审计操作、GPU 违规检测、必要时引入容器。                               |
 | 主控节点不联网               | 环境维护困难。                                       | 采用本地/WSL 打包 conda-pack 后上传导入。                                        |
-| 共享目录不一致               | 任务在节点上找不到项目路径或环境。                   | 要求统一挂载路径，或在节点侧建立一致映射。                                       |
+| NFS 共享目录不一致           | 任务在节点上找不到项目路径、日志路径或环境。          | master 与所有计算节点必须用一致路径挂载 `~/data` 和 `~/envs`，并在上线前做读写检查。 |
 | 导师权限过大                 | 可能误操作学生任务或文件。                           | 默认导师只读学生任务与文件，写权限显式配置。                                     |
 | 节点异常恢复语义不清         | 任务重复运行或资源不释放。                           | 使用任务事件和节点状态机，危险操作二次确认。                                     |
 | 环境包直接写入 site-packages | 可能污染环境、覆盖已有包或导致难以卸载。             | 优先 pip install；纯 Python 目录导入时必须生成 manifest，并提供安装前后差异。    |
@@ -966,12 +968,17 @@ security:
   allow_self_register: false
 
 paths:
-  user_root: /home/ddltm/data/users
-  env_root: /home/ddltm/data/envs
-  task_log_root: /home/ddltm/data/task_log
+  nfs_data_root: ~/data
+  nfs_env_root: ~/envs
+  user_root: ~/data/users
+  env_root: ~/envs/user_envs
+  task_log_root: ~/data/logs/task_logs
+  env_install_log_root: ~/data/logs/env_install_logs
+  remote_code_root: ~/envs/nebulagrid_remote
   visible_roots:
-    - /home/ddltm/data/users
-    - /home/ddltm/data/shared
+    - ~/data/users
+    - ~/data/shared
+    - ~/envs/user_envs
 
 scheduler:
   interval_seconds: 2
@@ -1050,6 +1057,7 @@ offline --> [*]
 | 计算节点           | 实际执行用户任务的 GPU 服务器或工作站。                  |
 | 任务               | 用户提交的一条训练/推理/脚本命令及其资源需求。           |
 | 环境               | 任务运行所需的软件环境，通常为 conda/miniconda 环境。    |
+| NFS 共享目录       | master 通过 NFS 共享给计算节点的 `~/data` 与 `~/envs`；前者保存用户数据和日志，后者保存 miniconda、环境和节点监控代码。 |
 | GPU 复用           | 允许多个轻量任务共享同一 GPU，但受显存和任务数阈值限制。 |
 | 前驱任务           | 当前任务开始前必须完成的依赖任务。                       |
 | 审计日志           | 记录用户对系统资源执行的关键操作，用于追溯和排障。       |

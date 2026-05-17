@@ -167,15 +167,17 @@ flowchart TB
 ├── nebulagrid-envworker.service   # 环境包安装与编译安装作业器
 ├── postgresql.service             # 主数据库
 ├── redis.service                  # 实时事件与缓存
-└── /data/nebulagrid/              # 用户文件、环境、日志、上传包
+├── ~/data/                        # NFS 共享：用户数据、任务日志、环境安装日志、运行时文件
+└── ~/envs/                        # NFS 共享：miniconda、用户环境、节点监控/远端执行代码
 
 计算节点 node-01/node-02/...
 ├── SSH Server
 ├── NVIDIA Driver / CUDA runtime
-├── miniconda 或用户环境目录
-├── /data/users 或共享挂载目录
-└── ~/.nebulagrid/runner.py        # 由 master 下发或自动更新的远程执行脚本
+├── ~/data                         # 通过 NFS 挂载 master 的 ~/data
+└── ~/envs                         # 通过 NFS 挂载 master 的 ~/envs，包含 miniconda 与 runner/monitor/env_installer
 ```
+
+部署约定：master 作为 NFS server，共享 `~/data` 与 `~/envs` 到所有计算节点。`~/data` 存放所有用户数据、任务日志、环境安装日志、上传包、运行时 pid/pgid 文件和备份；`~/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与计算节点必须使用一致的挂载路径，避免任务工作目录、日志路径和环境路径在远端解析失败。
 
 中期可演进为：数据库独立部署，Redis 独立部署，API 多实例，Scheduler/Monitor/Executor 保持单实例或通过 leader election 控制。
 
@@ -785,7 +787,7 @@ Executor 负责把已分配任务真正变成远端进程：
 不建议直接通过 `ssh.exec_command("source ... && python train.py")` 裸跑任务。推荐在计算节点放置受控 runner：
 
 ```text
-~/.nebulagrid/runner.py
+~/envs/nebulagrid_remote/runner.py
 ```
 
 runner 输入 JSON：
@@ -793,12 +795,12 @@ runner 输入 JSON：
 ```json
 {
   "task_id": "2026051809201250",
-  "env_activate": "source ~/envs/miniconda3/bin/activate && conda activate torch201",
-  "workdir": "/data/users/xz/project1",
+  "env_activate": "source ~/envs/miniconda/bin/activate && conda activate torch201",
+  "workdir": "~/data/users/xz/project1",
   "command": "python train.py --config model.yaml",
   "cuda_visible_devices": "0,2",
-  "log_path": "/data/nebulagrid/task_log/2026051809201250.log",
-  "pid_file": "/data/nebulagrid/runtime/2026051809201250.pid"
+  "log_path": "~/data/logs/task_logs/2026051809201250.log",
+  "pid_file": "~/data/runtime/2026051809201250.pid"
 }
 ```
 
@@ -1114,8 +1116,8 @@ MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在
 | 日志类型 | 存储位置 | 用途 |
 |---|---|---|
 | 服务日志 | /var/log/nebulagrid/ | API、scheduler、monitor 等服务自身日志 |
-| 任务日志 | /data/nebulagrid/task_logs/<task_no>.log | 用户训练 stdout/stderr |
-| 环境安装日志 | /data/nebulagrid/env_install_logs/<job_no>.log | whl/源码包/编译安装日志 |
+| 任务日志 | ~/data/logs/task_logs/<task_no>.log | 用户训练 stdout/stderr，master 与计算节点通过 NFS 共享 |
+| 环境安装日志 | ~/data/logs/env_install_logs/<job_no>.log | whl/源码包/编译安装日志 |
 | 审计日志 | PostgreSQL audit_logs | 谁在何时做了什么 |
 | 任务事件 | PostgreSQL task_events | 任务状态机事件 |
 
@@ -1269,12 +1271,16 @@ redis:
   url: redis://127.0.0.1:6379/0
 
 storage:
-  root: /data/nebulagrid
-  users_root: /data/nebulagrid/users
-  task_log_root: /data/nebulagrid/task_logs
-  env_package_root: /data/nebulagrid/env_packages
-  env_install_log_root: /data/nebulagrid/env_install_logs
-  runtime_root: /data/nebulagrid/runtime
+  nfs_data_root: ~/data
+  nfs_env_root: ~/envs
+  users_root: ~/data/users
+  task_log_root: ~/data/logs/task_logs
+  env_package_root: ~/data/env_packages
+  env_install_log_root: ~/data/logs/env_install_logs
+  runtime_root: ~/data/runtime
+  miniconda_root: ~/envs/miniconda
+  user_env_root: ~/envs/user_envs
+  remote_code_root: ~/envs/nebulagrid_remote
 
 scheduler:
   enabled: true
@@ -1287,7 +1293,7 @@ scheduler:
 executor:
   ssh_connect_timeout_seconds: 10
   kill_grace_seconds: 10
-  remote_runner_path: ~/.nebulagrid/runner.py
+  remote_runner_path: ~/envs/nebulagrid_remote/runner.py
 
 monitor:
   interval_seconds: 5
@@ -1347,9 +1353,10 @@ Nginx 负责：
 2. master 可免密或密码登录；
 3. 安装 NVIDIA 驱动；
 4. `nvidia-smi` 可用；
-5. 用户数据目录可访问；
-6. miniconda 或环境目录规范统一；
-7. master 自动下发 `runner.py`、`monitor.py`、`env_installer.py`。
+5. 通过 NFS 挂载 master 共享的 `~/data`，用于访问所有用户数据、任务日志、环境安装日志和运行时文件；
+6. 通过 NFS 挂载 master 共享的 `~/envs`，用于访问 miniconda、用户环境和节点监控/远端执行代码；
+7. `~/data` 与 `~/envs` 在 master 和所有计算节点上的路径必须一致；
+8. `runner.py`、`monitor.py`、`env_installer.py` 由 master 统一维护在 `~/envs/nebulagrid_remote/`，计算节点通过 NFS 读取并执行。
 
 ---
 

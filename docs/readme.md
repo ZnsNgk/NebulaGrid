@@ -1,0 +1,682 @@
+# NebulaGrid（天枢）3.0 部署文档
+
+本文档根据 `docs/` 目录中的需求规格说明书与系统架构设计书整理，用于指导 NebulaGrid 3.0 在实验室主控节点和计算节点上的部署、配置、启动、验证与日常运维。
+
+> 当前仓库处于项目骨架阶段，部分脚本、服务入口和前端构建命令需要在实现后按实际文件名补齐。本文档优先固化部署约定、目录规划、配置项和验收检查口径。
+
+## 1. 部署目标
+
+NebulaGrid 3.0 是纯 B/S 架构的分布式 GPU 任务调度与实验资源管理平台。部署后应满足：
+
+- 用户通过浏览器访问统一入口，不依赖 PyQt 客户端或直接 SSH 到 master。
+- master 主控节点运行 Web/API、调度器、节点监控、任务执行器、运行守护、环境安装 worker、数据库和缓存。
+- master 与计算节点通过 NFS 共享 `~/data` 和 `~/envs`：`~/data` 存放任务日志与所有用户数据，`~/envs` 存放 miniconda、用户环境和节点监控/远端执行代码。
+- PostgreSQL 作为任务、节点、GPU、用户、审计和事件的单一事实来源。
+- Redis 用于实时事件、日志流、缓存或后续异步任务协调。
+- Nginx 负责 HTTPS、前端静态文件、API 反向代理和 WebSocket/SSE 代理。
+
+## 2. 推荐拓扑
+
+```text
+用户浏览器 / 展示大屏
+        |
+        | HTTPS
+        v
+[Nginx on master]
+        |
+        | HTTP / WebSocket / SSE
+        v
+[NebulaGrid Web/API 主控节点]
+├── API Server：鉴权、接口、WebSocket/SSE、审计入口
+├── Scheduler：等待任务扫描与资源分配，保持单实例
+├── Monitor：节点状态采集与 watchdog
+├── Executor：通过 SSH 启动、停止和恢复任务
+├── Runtime Guard：运行中任务 GPU 分配一致性检测
+├── Env Worker：环境导入、whl/源码包/编译安装作业
+├── PostgreSQL：用户、节点、GPU、任务、事件、审计
+├── Redis：实时事件、缓存、日志流辅助
+└── NFS Storage：~/data（用户数据、日志、运行时文件）与 ~/envs（miniconda、环境、节点监控代码）
+        |
+        | SSH 控制命令 + NFS 共享文件
+        v
+[计算节点 A/B/C...]：运行用户训练命令，返回状态与日志
+```
+
+最小可用部署可以把 PostgreSQL、Redis、API 和所有后台 worker 放在同一台 master 上。后续如需提高可靠性，可将数据库独立部署，但调度器仍应保持单实例，避免重复派发任务。
+
+## 3. 机器准备
+
+### 3.1 master 主控节点
+
+建议系统：
+
+- Linux 服务器，推荐 Ubuntu Server 22.04 LTS 或兼容发行版。
+- Python 3.11+。
+- Node.js 20+，用于前端构建。
+- PostgreSQL 14+。
+- Redis 6+。
+- Nginx。
+- systemd。
+- 可访问所有计算节点的网络。
+- 作为 NFS server 共享 `~/data` 和 `~/envs`，并具备读写用户数据、任务日志、环境目录和远端脚本目录的权限。
+
+建议系统用户：
+
+```bash
+sudo useradd --system --create-home --shell /usr/sbin/nologin nebulagrid
+sudo mkdir -p /opt/nebulagrid /etc/nebulagrid /var/log/nebulagrid
+sudo mkdir -p ~/data/users ~/data/logs/task_logs ~/data/logs/env_install_logs ~/data/runtime ~/data/backups
+sudo mkdir -p ~/envs/miniconda ~/envs/user_envs ~/envs/nebulagrid_remote
+sudo chown -R nebulagrid:nebulagrid /opt/nebulagrid ~/data ~/envs /var/log/nebulagrid
+sudo chmod 750 /etc/nebulagrid ~/data ~/envs /var/log/nebulagrid
+```
+
+### 3.2 计算节点
+
+每个计算节点需要满足：
+
+- SSH 服务可用，master 能连接。
+- 优先使用 SSH key 登录；如使用密码或密钥文件，凭据只允许 master 服务账户读取。
+- NVIDIA 驱动已安装，`nvidia-smi` 可用。
+- 已挂载 master 通过 NFS 共享的 `~/data` 和 `~/envs`，且挂载路径与 master 保持一致。
+- `~/data` 下可访问用户工作目录、任务日志、环境安装日志和运行时文件。
+- `~/envs` 下可访问 miniconda、用户环境目录和 `nebulagrid_remote` 节点监控/远端执行代码。
+- 建议统一执行账户、工作根目录和日志目录权限，减少节点之间差异。
+
+计算节点预检查示例：
+
+```bash
+ssh node-a 'hostname && nvidia-smi && python3 --version'
+ssh node-a 'mount | grep -E "(/data|/envs|/home/.*/data|/home/.*/envs)"'
+ssh node-a 'test -x ~/envs/miniconda/bin/python || test -x ~/envs/miniconda3/bin/python'
+ssh node-a 'test -f ~/envs/nebulagrid_remote/runner.py && test -f ~/envs/nebulagrid_remote/monitor.py'
+```
+
+## 4. 目录规划
+
+### 4.1 代码目录
+
+推荐将仓库部署到：
+
+```text
+/opt/nebulagrid/current
+```
+
+对应当前仓库结构：
+
+```text
+backend/
+frontend/
+deploy/
+scripts/
+docs/
+```
+
+### 4.2 配置目录
+
+```text
+/etc/nebulagrid/config.yaml
+/etc/nebulagrid/secrets.env
+```
+
+`config.yaml` 保存非敏感配置，`secrets.env` 保存数据库密码、SECRET_KEY、SSH 凭据路径等敏感配置。敏感文件权限建议：
+
+```bash
+sudo chown root:nebulagrid /etc/nebulagrid/secrets.env
+sudo chmod 640 /etc/nebulagrid/secrets.env
+```
+
+### 4.3 数据与日志目录
+
+```text
+~/data/                     # 通过 NFS 共享到所有计算节点
+├── users/                  # 所有用户工作目录
+├── logs/
+│   ├── task_logs/          # 任务 stdout/stderr 日志
+│   └── env_install_logs/   # 环境安装日志
+├── env_packages/           # 上传的环境包、whl、源码包
+├── runtime/                # pid、pgid、runner 状态等运行时文件
+└── backups/                # 数据库、配置、用户数据和日志备份
+
+~/envs/                     # 通过 NFS 共享到所有计算节点
+├── miniconda/              # 统一 miniconda 安装目录
+├── user_envs/              # 用户 conda-pack 或登记环境
+└── nebulagrid_remote/      # runner.py、monitor.py、env_installer.py 等节点侧代码
+
+/var/log/nebulagrid/        # API、scheduler、monitor 等 master 服务日志
+```
+
+注意：
+
+- `~/data` 与 `~/envs` 必须在 master 和所有计算节点保持相同挂载路径，避免任务 workdir、日志路径或环境路径在节点侧失效。
+- 用户文件、任务日志、环境目录和数据库备份应分别设计备份策略，不建议混在同一个备份包中。
+- 解压、导入环境包时必须先进入隔离临时目录，完成路径安全检查后再移动到目标目录。
+- `~/envs/nebulagrid_remote` 由 master 统一维护，计算节点只执行该目录中的受控 runner、monitor 和 env_installer。
+
+## 5. 依赖安装
+
+### 5.1 系统依赖
+
+Ubuntu 示例：
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip postgresql redis-server nginx git
+```
+
+如果 master 不联网，应提前准备离线包、APT 本地源或内部镜像。
+
+### 5.2 后端依赖
+
+仓库实现后，建议使用虚拟环境隔离后端依赖：
+
+```bash
+cd /opt/nebulagrid/current/backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e .
+```
+
+如果后端采用 `pyproject.toml`、`requirements.txt` 或其他包管理工具，应以实际项目文件为准。
+
+### 5.3 前端依赖与构建
+
+仓库实现后，前端建议构建为静态文件，由 Nginx 托管：
+
+```bash
+cd /opt/nebulagrid/current/frontend
+npm ci
+npm run build
+```
+
+构建产物路径按前端框架确定，常见为 `dist/` 或 `build/`。
+
+## 6. 数据库与 Redis
+
+### 6.1 PostgreSQL 初始化
+
+示例：
+
+```bash
+sudo -u postgres psql
+```
+
+```sql
+CREATE USER nebulagrid WITH PASSWORD 'change-this-password';
+CREATE DATABASE nebulagrid OWNER nebulagrid;
+GRANT ALL PRIVILEGES ON DATABASE nebulagrid TO nebulagrid;
+```
+
+生产环境请使用强密码，并避免把真实密码写入 Git 仓库。
+
+### 6.2 数据库迁移
+
+后端实现迁移工具后执行：
+
+```bash
+cd /opt/nebulagrid/current/backend
+source .venv/bin/activate
+alembic upgrade head
+```
+
+如果项目采用其他迁移命令，以实际实现为准。迁移前建议先备份数据库。
+
+### 6.3 Redis
+
+本机 Redis 示例：
+
+```bash
+sudo systemctl enable --now redis-server
+redis-cli ping
+```
+
+期望返回：
+
+```text
+PONG
+```
+
+## 7. 配置文件
+
+推荐使用 YAML，并允许环境变量覆盖。
+
+示例 `config.yaml`：
+
+```yaml
+app:
+  name: NebulaGrid
+  env: production
+  base_url: https://nebulagrid.local
+
+database:
+  url: postgresql+psycopg://nebulagrid:${NEBULAGRID_DB_PASSWORD}@127.0.0.1:5432/nebulagrid
+
+redis:
+  url: redis://127.0.0.1:6379/0
+
+storage:
+  nfs_data_root: ~/data
+  nfs_env_root: ~/envs
+  users_root: ~/data/users
+  task_log_root: ~/data/logs/task_logs
+  env_package_root: ~/data/env_packages
+  env_install_log_root: ~/data/logs/env_install_logs
+  runtime_root: ~/data/runtime
+  miniconda_root: ~/envs/miniconda
+  user_env_root: ~/envs/user_envs
+  remote_code_root: ~/envs/nebulagrid_remote
+
+scheduler:
+  enabled: true
+  interval_seconds: 2
+  max_dispatch_per_round: 4
+  default_gpu_free_mem_ratio_for_reuse: 0.4
+  max_tasks_per_reuse_gpu: 5
+  exclusive_gpu_max_mem_util: 0.2
+
+executor:
+  ssh_connect_timeout_seconds: 10
+  kill_grace_seconds: 10
+  remote_runner_path: ~/envs/nebulagrid_remote/runner.py
+
+monitor:
+  interval_seconds: 5
+  watchdog_offline_seconds: 600
+
+runtime_guard:
+  enabled: true
+  interval_seconds: 5
+  startup_grace_seconds: 10
+  violation_confirm_count: 2
+  kill_grace_seconds: 10
+  cpu_only_policy: forbid_gpu
+
+env_install:
+  allow_compile_install_for_students: true
+  max_upload_size_mb: 2048
+  one_job_per_env: true
+  default_pip_no_index: true
+
+logs:
+  tail_default_kb: 256
+  tail_max_kb: 4096
+```
+
+示例 `secrets.env`：
+
+```bash
+NEBULAGRID_SECRET_KEY=replace-with-a-long-random-secret
+NEBULAGRID_DB_PASSWORD=replace-with-db-password
+NEBULAGRID_CONFIG=/etc/nebulagrid/config.yaml
+```
+
+安全要求：
+
+- `secret_key` 必须使用高强度随机值。
+- 不要把真实 `.env`、密钥、数据库密码提交到 Git。
+- 节点 IP、SSH 用户名、真实系统路径只应对管理员可见。
+
+## 8. systemd 服务
+
+架构设计建议在 master 上拆分以下服务：
+
+```text
+nebulagrid-api.service
+nebulagrid-scheduler.service
+nebulagrid-monitor.service
+nebulagrid-executor.service
+nebulagrid-runtime-guard.service
+nebulagrid-env-worker.service
+```
+
+### 8.1 API 服务示例
+
+`/etc/systemd/system/nebulagrid-api.service`：
+
+```ini
+[Unit]
+Description=NebulaGrid API Server
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=nebulagrid
+Group=nebulagrid
+WorkingDirectory=/opt/nebulagrid/current/backend
+EnvironmentFile=/etc/nebulagrid/secrets.env
+ExecStart=/opt/nebulagrid/current/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=nebulagrid
+LogsDirectory=nebulagrid
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 8.2 后台 worker 服务模板
+
+以调度器为例，实际模块路径按实现调整：
+
+```ini
+[Unit]
+Description=NebulaGrid Scheduler
+After=network.target postgresql.service redis-server.service nebulagrid-api.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=nebulagrid
+Group=nebulagrid
+WorkingDirectory=/opt/nebulagrid/current/backend
+EnvironmentFile=/etc/nebulagrid/secrets.env
+ExecStart=/opt/nebulagrid/current/backend/.venv/bin/python -m app.workers.scheduler
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+其他 worker 可复用该模板，将 `Description` 和 `ExecStart` 替换为：
+
+```text
+app.workers.node_monitor
+app.workers.task_executor
+app.workers.runtime_guard
+app.workers.env_install_worker
+app.workers.log_streamer
+```
+
+启用服务：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now nebulagrid-api
+sudo systemctl enable --now nebulagrid-scheduler
+sudo systemctl enable --now nebulagrid-monitor
+sudo systemctl enable --now nebulagrid-executor
+sudo systemctl enable --now nebulagrid-runtime-guard
+sudo systemctl enable --now nebulagrid-env-worker
+```
+
+查看状态：
+
+```bash
+systemctl status nebulagrid-api
+journalctl -u nebulagrid-api -f
+```
+
+## 9. Nginx 反向代理
+
+Nginx 负责 HTTPS、静态前端文件、API 反向代理、WebSocket/SSE 代理和上传大小限制。
+
+示例配置：
+
+```nginx
+server {
+    listen 80;
+    server_name nebulagrid.local;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name nebulagrid.local;
+
+    ssl_certificate /etc/letsencrypt/live/nebulagrid.local/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/nebulagrid.local/privkey.pem;
+
+    client_max_body_size 2048m;
+
+    root /opt/nebulagrid/current/frontend/dist;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8000/ws/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+    }
+
+    location /events/ {
+        proxy_pass http://127.0.0.1:8000/events/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+启用配置：
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+## 10. 初始化管理员与节点登记
+
+项目实现初始化脚本后，建议提供一次性管理员创建命令：
+
+```bash
+cd /opt/nebulagrid/current
+sudo -u nebulagrid backend/.venv/bin/python scripts/init_admin.py
+```
+
+节点登记建议由管理员后台完成，至少录入：
+
+- 节点名称。
+- host/IP。
+- SSH 端口和 SSH 用户。
+- 公共/私人归属。
+- 私人节点所有人和开放范围。
+- GPU index、GPU UUID、型号、显存、是否可调度。
+- watchdog 超时时间和是否允许调度。
+
+GPU UUID 建议作为运行时守护检测的核心依据，GPU index 只用于显示和 `CUDA_VISIBLE_DEVICES`。
+
+## 11. 上线验证
+
+### 11.1 master 检查
+
+```bash
+systemctl status postgresql
+systemctl status redis-server
+systemctl status nginx
+systemctl status nebulagrid-api
+curl -f http://127.0.0.1:8000/api/health
+```
+
+### 11.2 Web 检查
+
+- 浏览器访问 `https://nebulagrid.local`。
+- 管理员可登录。
+- `/api/auth/me` 能返回当前用户和权限。
+- 展示大屏只显示脱敏信息。
+
+### 11.3 节点检查
+
+- 管理员后台能看到节点在线。
+- 节点 CPU、内存、网络、GPU 利用率和显存占用能刷新。
+- watchdog 超时逻辑可在测试节点上验证。
+- 节点 IP、SSH 用户等敏感字段只对管理员可见。
+
+### 11.4 任务检查
+
+建议按顺序验证：
+
+1. 提交 CPU-only 测试任务。
+2. 提交 `need_gpus=1` 的 GPU 测试任务。
+3. 指定 GPU 型号或指定节点提交任务。
+4. 查看运行中日志 tail。
+5. 停止自己的运行任务。
+6. 查看任务事件流和审计记录。
+7. 重启 API 或 master 后执行恢复扫描，确认不重复派发任务。
+
+## 12. 运维与备份
+
+### 12.1 日志位置
+
+| 类型 | 位置 | 说明 |
+|---|---|---|
+| 服务日志 | `/var/log/nebulagrid/` 或 `journalctl` | API、scheduler、monitor 等服务自身日志 |
+| 任务日志 | `~/data/logs/task_logs/<task_no>.log` | 用户训练 stdout/stderr，通过 NFS 对 master 和计算节点可见 |
+| 环境安装日志 | `~/data/logs/env_install_logs/<job_no>.log` | whl、源码包、编译安装日志 |
+| 审计日志 | PostgreSQL `audit_logs` | 谁在何时做了什么 |
+| 任务事件 | PostgreSQL `task_events` | 任务状态机事件 |
+
+### 12.2 数据库备份
+
+每日备份示例：
+
+```bash
+sudo mkdir -p ~/data/backups/db
+sudo -u postgres pg_dump nebulagrid | gzip > ~/data/backups/db/nebulagrid-$(date +%F).sql.gz
+```
+
+建议：
+
+- 至少保留最近 7 天每日备份。
+- 每月保留一个归档版本。
+- 恢复演练应定期执行，不能只备份不验证。
+
+### 12.3 配置备份
+
+每次修改配置前备份：
+
+```bash
+sudo mkdir -p ~/data/backups/config
+sudo cp /etc/nebulagrid/config.yaml ~/data/backups/config/config-$(date +%F-%H%M%S).yaml
+```
+
+管理员后台后续可提供配置 diff 和回滚能力。
+
+### 12.4 文件与环境备份
+
+建议独立备份：
+
+```text
+~/data/users
+~/data/env_packages
+~/data/logs/task_logs
+~/data/logs/env_install_logs
+~/envs/miniconda
+~/envs/user_envs
+~/envs/nebulagrid_remote
+```
+
+不要把用户文件、任务日志和数据库 dump 混为一个不可拆分的大备份包。
+
+## 13. 故障处理
+
+### 13.1 master 重启
+
+master 或服务重启后必须执行恢复扫描：
+
+- 查询 `dispatching`、`starting`、`running` 任务。
+- 根据远端 PID/PGID 和 runtime 文件确认进程是否仍存在。
+- 可以确认仍在运行的任务保持 running。
+- 无法确认的任务标记为 `lost` 或 `offline`，并写入任务事件与审计。
+- 不得重复派发已经可能在远端运行的任务。
+
+### 13.2 节点 offline
+
+处理流程：
+
+1. watchdog 超时后节点进入 `offline`。
+2. 查询该节点 `running`、`starting`、`dispatching` 任务。
+3. 尝试 SSH 重连。
+4. 无法连接时，任务标记 `offline`。
+5. 释放调度占用或按恢复策略处理。
+6. 写入 `task_events` 和 `audit_logs`。
+
+### 13.3 SSH 启动失败
+
+- 任务应进入 `failed` 或 `offline`。
+- 错误原因需要对管理员可见。
+- 已占用 GPU 资源必须释放。
+- 失败事件必须写入任务事件表。
+
+### 13.4 GPU 越权使用
+
+Runtime Guard 应检查任务进程树实际使用的 GPU UUID：
+
+- 普通任务使用未分配 GPU 时，按配置警告或中止。
+- CPU-only 任务调用 CUDA 时，默认按 `cpu_only_policy: forbid_gpu` 中止。
+- 中止时停止远端进程组，任务标记为 `alloc_error`。
+- 记录审计日志和任务事件。
+
+### 13.5 环境安装失败
+
+- 同一环境同一时间只允许一个安装作业。
+- 安装日志必须保存。
+- 失败时保留失败原因和可回滚信息。
+- 生产环境不建议自动安装未知来源包，至少要求用户确认风险。
+
+## 14. 安全基线
+
+- 后端服务层必须执行 RBAC 和资源归属校验，前端隐藏按钮不能作为权限依据。
+- 文件访问必须经过 PathResolver，禁止用户传入真实绝对路径绕过权限。
+- 上传和解压必须限制大小、类型、路径穿越、软链接逃逸和临时目录污染。
+- 用户命令保存原文和系统生成后的最终命令，管理员可审计。
+- 任务启动必须统一拼接环境激活和 CUDA 绑定前缀。
+- 普通用户不应获得 master shell。
+- 所有任务、节点、用户、文件、环境和配置写操作必须写入审计日志。
+- Nginx 和后端均应设置上传大小限制，避免大文件绕过应用限制。
+
+## 15. 发布与回滚建议
+
+推荐发布流程：
+
+1. 停止调度器，避免发布期间派发新任务。
+2. 备份数据库与配置文件。
+3. 拉取或解压新版本到新的 release 目录。
+4. 安装后端依赖并构建前端。
+5. 执行数据库迁移。
+6. 切换 `/opt/nebulagrid/current` 指向新版本。
+7. 重启 API 和后台 worker。
+8. 验证健康检查、登录、节点状态和任务提交。
+9. 恢复调度器。
+
+回滚原则：
+
+- 代码回滚必须确认数据库迁移是否兼容。
+- 如果迁移不可逆，应先从备份恢复数据库，再切回旧版本代码。
+- 回滚后必须执行 master 恢复扫描，避免任务状态分裂。
+
+## 16. 最小验收清单
+
+上线前至少确认：
+
+- [ ] HTTPS 可访问，Nginx 代理 API 和 WebSocket/SSE 正常。
+- [ ] PostgreSQL、Redis、API、scheduler、monitor、executor、runtime guard、env worker 均可启动。
+- [ ] 管理员账号可登录，普通用户、导师、展示者权限边界正确。
+- [ ] 至少一个计算节点在线，`nvidia-smi` 采集正常。
+- [ ] master 与计算节点均能通过相同路径访问 `~/data` 和 `~/envs`，NFS 挂载、权限和读写测试正常。
+- [ ] GPU 任务可提交、调度、运行、停止、释放资源。
+- [ ] 日志 tail、完整查看和下载按权限工作。
+- [ ] 文件路径越权返回 403 或 404，不泄露真实路径。
+- [ ] 环境登记或环境包导入流程可记录日志和状态。
+- [ ] master 重启后不会重复派发任务。
+- [ ] 节点 offline 后任务状态、资源释放和审计记录正确。
+- [ ] 数据库、配置、用户文件和任务日志均有备份策略。
