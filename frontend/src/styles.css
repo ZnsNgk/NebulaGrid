@@ -418,6 +418,24 @@ nav {
   margin-bottom: 14px;
 }
 
+.refresh-control {
+  display: grid;
+  grid-template-columns: auto 92px auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.refresh-control input {
+  min-height: 32px;
+  padding: 5px 8px;
+}
+
+.refresh-control span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .node-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
@@ -834,7 +852,8 @@ td {
   .form-grid,
   .task-form,
   .path-bar,
-  .gpu-row {
+  .gpu-row,
+  .refresh-control {
     grid-template-columns: 1fr;
   }
 

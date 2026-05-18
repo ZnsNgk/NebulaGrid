@@ -6,6 +6,10 @@ const state = {
   toast: null,
   loading: false,
   demo: localStorage.getItem("ng_demo_mode") === "1",
+  autoRefreshSeconds: Number(localStorage.getItem("ng_dashboard_refresh_seconds") || 5),
+  autoRefreshTimer: null,
+  autoRefreshBusy: false,
+  lastDashboardRefreshAt: null,
   drawer: null,
   data: {
     dashboard: null,
@@ -432,6 +436,7 @@ async function login(event) {
   state.user = payload.data.user;
   localStorage.setItem("ng_token", state.token);
   await refreshPage();
+  updateAutoRefreshTimer();
 }
 
 async function enterDemo(role = "admin") {
@@ -441,6 +446,7 @@ async function enterDemo(role = "admin") {
   state.token = payload.data.access_token;
   state.user = payload.data.user;
   await refreshPage();
+  updateAutoRefreshTimer();
 }
 
 async function logout() {
@@ -449,6 +455,7 @@ async function logout() {
   state.demo = false;
   localStorage.removeItem("ng_token");
   localStorage.removeItem("ng_demo_mode");
+  updateAutoRefreshTimer();
   render();
 }
 
@@ -466,6 +473,7 @@ async function refreshPage() {
     dashboard: async () => {
       state.data.dashboard = (await api("/dashboard/summary")).data;
       if (can("nodes:read")) state.data.nodes = (await api("/nodes")).data;
+      state.lastDashboardRefreshAt = new Date();
     },
     tasks: async () => {
       state.data.tasks = (await api("/tasks")).data;
@@ -499,7 +507,38 @@ function navigate(page) {
   state.page = page;
   location.hash = `/${page}`;
   state.drawer = null;
+  updateAutoRefreshTimer();
   run(refreshPage);
+}
+
+function setDashboardRefreshSeconds(value) {
+  const seconds = Math.max(0, Math.min(3600, Number(value) || 0));
+  state.autoRefreshSeconds = seconds;
+  localStorage.setItem("ng_dashboard_refresh_seconds", String(seconds));
+  updateAutoRefreshTimer();
+  render();
+}
+
+function updateAutoRefreshTimer() {
+  if (state.autoRefreshTimer) {
+    window.clearInterval(state.autoRefreshTimer);
+    state.autoRefreshTimer = null;
+  }
+  if (!state.user || state.page !== "dashboard" || state.autoRefreshSeconds <= 0) return;
+  state.autoRefreshTimer = window.setInterval(autoRefreshDashboard, state.autoRefreshSeconds * 1000);
+}
+
+async function autoRefreshDashboard() {
+  if (!state.user || state.page !== "dashboard" || state.autoRefreshBusy) return;
+  state.autoRefreshBusy = true;
+  try {
+    await refreshPage();
+    render();
+  } catch (error) {
+    console.warn("dashboard auto refresh failed", error);
+  } finally {
+    state.autoRefreshBusy = false;
+  }
 }
 
 async function submitNode(event) {
@@ -723,8 +762,12 @@ function renderDashboard() {
       <div class="panel-head">
         <div>
           <h2>计算节点监控</h2>
-          <span>master 节点不会显示在这里；这里只展示计算节点的实时快照。</span>
+          <span>master 节点不会显示在这里；这里只展示计算节点的实时快照。${state.lastDashboardRefreshAt ? ` 上次刷新：${formatTime(state.lastDashboardRefreshAt)}` : ""}</span>
         </div>
+        <label class="refresh-control">刷新间隔
+          <input name="dashboard_refresh_seconds" type="number" min="0" max="3600" step="1" value="${state.autoRefreshSeconds}">
+          <span>秒，0 为暂停</span>
+        </label>
       </div>
       ${state.data.nodes.length ? `<div class="node-grid">${state.data.nodes.map(renderNodeCard).join("")}</div>` : renderEmpty("暂无计算节点")}
     </section>
@@ -1166,6 +1209,12 @@ function formatDate(value) {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+function formatTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleTimeString("zh-CN", { hour12: false });
+}
+
 function emptyDash(value) {
   return value === null || value === undefined ? "-" : value;
 }
@@ -1214,6 +1263,7 @@ function bindEvents() {
   document.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.nav)));
   document.querySelector("[data-action='logout']")?.addEventListener("click", () => run(logout));
   document.querySelector("[data-action='refresh']")?.addEventListener("click", () => run(refreshPage, "已刷新"));
+  document.querySelector("[name='dashboard_refresh_seconds']")?.addEventListener("change", (event) => setDashboardRefreshSeconds(event.currentTarget.value));
   document.querySelector("[data-action='demo']")?.addEventListener("click", () => run(() => enterDemo("admin"), "已进入演示模式"));
   document.querySelector("[data-action='close-drawer']")?.addEventListener("click", () => {
     state.drawer = null;
@@ -1234,6 +1284,7 @@ window.addEventListener("hashchange", () => {
   const page = location.hash.replace("#/", "") || "dashboard";
   if (pages.some((item) => item.id === page)) {
     state.page = page;
+    updateAutoRefreshTimer();
     run(refreshPage);
   }
 });
@@ -1243,4 +1294,7 @@ if (state.demo && !demoStore.currentUser) {
   state.user = demoStore.currentUser;
 }
 
-loadMe().then(refreshPage).catch(() => null).finally(render);
+loadMe().then(refreshPage).catch(() => null).finally(() => {
+  updateAutoRefreshTimer();
+  render();
+});
