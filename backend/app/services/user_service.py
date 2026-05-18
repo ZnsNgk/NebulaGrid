@@ -1,5 +1,6 @@
 from itertools import count
 
+from app.core.config import get_settings
 from app.core.errors import forbidden, validation_error
 from app.core.rbac import Role, require_permission
 from app.core.security import hash_password
@@ -42,13 +43,14 @@ def create_user(user: UserRecord, payload: UserCreateRequest) -> UserInfo:
 
 def to_user_info(record: UserRecord) -> UserInfo:
     """把内部用户记录转换为用户管理接口的安全响应模型。"""
+    settings = get_settings()
     return UserInfo(
         id=record.id,
         username=record.username,
         real_name=record.real_name,
         role=record.role.value,
         state=record.state,
-        home_path=f"/data/user/{record.id}",
+        home_path=f"{settings.user_home_root}/{record.id}",
         linux_account_name=record.username,
         created_at=utc_now(),
     )

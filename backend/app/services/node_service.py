@@ -1,88 +1,166 @@
-from itertools import count
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
 
+from app.core.errors import not_found, validation_error
 from app.core.rbac import require_permission
+from app.db.models import Gpu, Node
 from app.schemas.nodes import GpuInfo, NodeCreateRequest, NodeInfo
 from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
-
-_NODE_ID = count(2)
-_GPU_ID = count(3)
-_NODES: list[NodeInfo] = [
-    NodeInfo(
-        id=1,
-        name="master-demo",
-        ip="127.0.0.1",
-        ssh_user="ddltm",
-        state="online",
-        scheduling_enabled=True,
-        gpus=[
-            GpuInfo(id=1, gpu_index=0, model="Demo GPU", total_vram_mb=24576),
-            GpuInfo(id=2, gpu_index=1, model="Demo GPU", total_vram_mb=24576),
-        ],
-    )
-]
+from app.services.metrics_service import LatestMetrics, get_latest_metrics
 
 
-def list_nodes(user: UserRecord) -> list[NodeInfo]:
-    """返回用户可见节点列表，展示者和登录用户都只能通过服务层获取数据。"""
+def list_nodes(user: UserRecord, db: Session) -> list[NodeInfo]:
+    """返回数据库中的计算节点，并从 InfluxDB 附带最新监控快照。"""
     require_permission(user.role, "nodes:read")
-    return _NODES
+    nodes = db.scalars(
+        select(Node)
+        .options(selectinload(Node.gpus))
+        .order_by(Node.id)
+    ).all()
+    compute_nodes = [node for node in nodes if not is_control_plane_node(node)]
+    latest_metrics = load_latest_metrics(compute_nodes)
+    return [build_node_info(node, latest_metrics) for node in compute_nodes]
 
 
-def create_node(user: UserRecord, payload: NodeCreateRequest) -> NodeInfo:
-    """创建新计算节点，并把初始 GPU 型号展开为 GPU 子资源。"""
+def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> NodeInfo:
+    """登记计算节点；GPU 可先手填，后续监控会按 nvidia-smi 结果自动校正。"""
     require_permission(user.role, "nodes:write")
-    node_id = next(_NODE_ID)
-    gpus = [
-        GpuInfo(id=next(_GPU_ID), gpu_index=index, model=model, total_vram_mb=0)
-        for index, model in enumerate(payload.gpu_models)
-    ]
-    node = NodeInfo(
-        id=node_id,
-        name=payload.name,
-        ip=payload.ip,
-        ssh_user=payload.ssh_user,
+    if is_control_plane_identity(payload.name, payload.ip):
+        raise validation_error("master/control-plane node should not be registered as compute node")
+    node = Node(
+        name=payload.name.strip(),
+        ip=payload.ip.strip(),
+        ssh_user=payload.ssh_user.strip(),
         is_public=payload.is_public,
         max_speed_mbps=payload.max_speed_mbps,
         state="offline",
         scheduling_enabled=False,
-        gpus=gpus,
     )
-    _NODES.append(node)
-    record_audit(user.id, "node.create", "node", str(node.id), detail_json=node.model_dump())
-    return node
+    node.gpus = [
+        Gpu(gpu_index=index, model=model.strip() or "Unknown", total_vram_mb=0)
+        for index, model in enumerate(payload.gpu_models)
+        if model.strip()
+    ]
+    db.add(node)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise validation_error("node name already exists") from exc
+    db.refresh(node)
+    node_info = build_node_info(node, LatestMetrics())
+    record_audit(user.id, "node.create", "node", str(node.id), detail_json=node_info.model_dump())
+    return node_info
 
 
-def get_node(node_id: int) -> NodeInfo | None:
-    """按 ID 查找节点，供节点管理动作复用同一查找逻辑。"""
-    return next((node for node in _NODES if node.id == node_id), None)
+def get_node(node_id: int, db: Session) -> NodeInfo | None:
+    """按 ID 查找节点，并隐藏 master/control-plane 节点。"""
+    node = db.get(Node, node_id)
+    if node is None or is_control_plane_node(node):
+        return None
+    return build_node_info(node, load_latest_metrics([node]))
 
 
-def reconnect_node(user: UserRecord, node_id: int) -> NodeInfo:
-    """把节点标记为重连中，真实 SSH 重连会在后续 worker 中实现。"""
+def reconnect_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
+    """把节点标记为等待监控器重连，下一轮 SSH 成功后会自动恢复在线。"""
     require_permission(user.role, "nodes:write")
-    node = require_node(node_id)
+    node = require_node_model(node_id, db)
     node.state = "reconnecting"
+    db.commit()
     record_audit(user.id, "node.reconnect", "node", str(node.id))
-    return node
+    return build_node_info(node, load_latest_metrics([node]))
 
 
-def force_offline_node(user: UserRecord, node_id: int) -> NodeInfo:
-    """强制节点离线并关闭调度开关，避免调度器继续选择该节点。"""
+def force_offline_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
+    """强制节点离线并关闭调度开关，监控器不会自动打开手动下线节点。"""
     require_permission(user.role, "nodes:write")
-    node = require_node(node_id)
+    node = require_node_model(node_id, db)
     node.state = "manual_offline"
     node.scheduling_enabled = False
+    db.commit()
     record_audit(user.id, "node.force_offline", "node", str(node.id))
-    return node
+    return build_node_info(node, load_latest_metrics([node]))
 
 
-def require_node(node_id: int) -> NodeInfo:
-    """返回节点对象，找不到时抛出统一 NOT_FOUND 业务错误。"""
-    from app.core.errors import not_found
-
-    node = get_node(node_id)
+def require_node(node_id: int, db: Session) -> NodeInfo:
+    """返回节点信息，找不到时抛出统一 NOT_FOUND 业务错误。"""
+    node = get_node(node_id, db)
     if node is None:
         raise not_found("node not found")
     return node
 
+
+def require_node_model(node_id: int, db: Session) -> Node:
+    """返回 ORM 节点对象，供管理动作和 worker 共用隐藏 master 的规则。"""
+    node = db.get(Node, node_id)
+    if node is None or is_control_plane_node(node):
+        raise not_found("node not found")
+    return node
+
+
+def build_node_info(node: Node, latest_metrics: LatestMetrics) -> NodeInfo:
+    """把节点 ORM 对象转换为前端模型，并附带 InfluxDB 最新监控快照。"""
+    metric = latest_metrics.nodes.get(node.id)
+    return NodeInfo(
+        id=node.id,
+        name=node.name,
+        ip=node.ip,
+        ssh_user=node.ssh_user,
+        owner_type=node.owner_type,
+        owner_user_id=node.owner_user_id,
+        is_public=node.is_public,
+        max_speed_mbps=node.max_speed_mbps,
+        state=node.state,
+        scheduling_enabled=node.scheduling_enabled,
+        gpus=[build_gpu_info(gpu, latest_metrics) for gpu in sorted(node.gpus, key=lambda item: item.gpu_index)],
+        cpu_usage=metric.cpu_usage if metric else None,
+        avail_ram_mb=metric.avail_ram_mb if metric else None,
+        upload_mbps=metric.upload_mbps if metric else None,
+        download_mbps=metric.download_mbps if metric else None,
+        metric_collected_at=metric.collected_at if metric else None,
+    )
+
+
+def build_gpu_info(gpu: Gpu, latest_metrics: LatestMetrics) -> GpuInfo:
+    """把 GPU ORM 对象转换为前端模型，并附带 InfluxDB 最新监控快照。"""
+    metric = latest_metrics.gpus.get(gpu.id)
+    return GpuInfo(
+        id=gpu.id,
+        gpu_index=gpu.gpu_index,
+        model=gpu.model,
+        total_vram_mb=gpu.total_vram_mb,
+        schedulable=gpu.schedulable,
+        remark=gpu.remark,
+        free_vram_mb=metric.free_vram_mb if metric else None,
+        gpu_usage=metric.gpu_usage if metric else None,
+        process_count=metric.process_count if metric else None,
+        metric_collected_at=metric.collected_at if metric else None,
+    )
+
+
+def load_latest_metrics(nodes: list[Node]) -> LatestMetrics:
+    """读取节点和 GPU 的 InfluxDB 最新快照，InfluxDB 不可用时保持列表可用。"""
+    node_ids = [node.id for node in nodes]
+    gpu_ids = [gpu.id for node in nodes for gpu in node.gpus]
+    try:
+        return get_latest_metrics(node_ids, gpu_ids)
+    except Exception:
+        return LatestMetrics()
+
+
+def is_control_plane_node(node: Node) -> bool:
+    """识别 master/control-plane 节点，避免它们出现在计算节点列表中。"""
+    return is_control_plane_identity(node.name, node.ip)
+
+
+def is_control_plane_identity(name: str, ip: str) -> bool:
+    """根据登记名和地址过滤控制节点；生产环境应只登记真实计算节点。"""
+    lowered_name = name.strip().lower()
+    lowered_ip = ip.strip().lower()
+    return (
+        "master" in lowered_name
+        or "control" in lowered_name
+        or lowered_ip in {"127.0.0.1", "localhost", "::1"}
+    )

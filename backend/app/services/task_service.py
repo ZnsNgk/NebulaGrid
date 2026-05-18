@@ -120,7 +120,7 @@ def resubmit_task(user: UserRecord, task_id: str) -> TaskInfo:
 
 
 def get_task_log(user: UserRecord, task_id: str, tail: str | None) -> str:
-    """返回任务日志占位内容，真实版本会读取 /data/logs/task_logs。"""
+    """返回任务日志占位内容，真实版本会读取配置的任务日志目录。"""
     task = get_task_for_user(user, task_id)
     return f"[{task.task_id}] log tail={tail or 'default'}\nlog storage is not connected yet\n"
 

@@ -91,33 +91,6 @@ class Gpu(Base):
     node: Mapped[Node] = relationship(back_populates="gpus")
 
 
-class NodeMetric(Base):
-    """节点监控快照表，保存 CPU、内存和网络采样结果。"""
-
-    __tablename__ = "node_metrics"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
-    cpu_usage: Mapped[int] = mapped_column(Integer, default=0)
-    avail_ram_mb: Mapped[int] = mapped_column(Integer, default=0)
-    upload_mbps: Mapped[int] = mapped_column(Integer, default=0)
-    download_mbps: Mapped[int] = mapped_column(Integer, default=0)
-    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
-
-
-class GpuMetric(Base):
-    """GPU 监控快照表，保存利用率、显存和进程数量。"""
-
-    __tablename__ = "gpu_metrics"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    gpu_id: Mapped[int] = mapped_column(ForeignKey("gpus.id", ondelete="CASCADE"), index=True)
-    gpu_usage: Mapped[int] = mapped_column(Integer, default=0)
-    free_vram_mb: Mapped[int] = mapped_column(Integer, default=0)
-    process_count: Mapped[int] = mapped_column(Integer, default=0)
-    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
-
-
 class Env(Base, TimestampMixin):
     """用户 Python/conda 环境表，记录环境来源、路径和可用状态。"""
 
@@ -299,4 +272,3 @@ class TaskRuntimeGuard(Base):
     violation_count: Mapped[int] = mapped_column(Integer, default=0)
     last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     state: Mapped[str] = mapped_column(String(32), default="not_started")
-

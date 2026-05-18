@@ -1,8 +1,8 @@
-# NebulaGrid 3.0 完整部署教程
+﻿# NebulaGrid 3.0 完整部署教程
 
-本文是一份从零开始的部署教程，目标是让没有接触过 NebulaGrid 的同学也能把系统跑起来。教程覆盖主节点、计算节点、NFS、PostgreSQL、Redis、Miniconda base 环境、后端依赖、数据库初始化、systemd 服务、Nginx、前端页面和基础验证。
+本文是一份从零开始的部署教程，目标是让没有接触过 NebulaGrid 的同学也能把系统跑起来。教程覆盖主节点、计算节点、NFS、PostgreSQL、InfluxDB、Redis、Miniconda base 环境、后端依赖、数据库初始化、systemd 服务、Nginx、前端页面和基础验证。
 
-> 重要说明：当前仓库已经具备 API、前端测试控制台、数据库表结构、worker 入口和远端脚本骨架。调度器、执行器、节点监控和环境安装 worker 的真实硬件闭环仍需继续接入 SSH 执行和数据库 CRUD。本教程用于部署当前代码并开始联调真实机器。
+> 重要说明：当前仓库已经具备 API、前端测试控制台、数据库表结构、真实节点监控 worker 和远端监控脚本。调度器、执行器和环境安装 worker 的真实硬件闭环仍需继续接入 SSH 执行和数据库 CRUD。本教程用于部署当前代码并开始联调真实机器。
 
 ## 0. 部署拓扑
 
@@ -10,7 +10,7 @@
 
 | 角色 | 示例主机名 | 示例 IP | 作用 |
 |---|---|---|---|
-| 主节点 | `master` | `192.168.1.10` | API、前端静态文件、PostgreSQL、Redis、NFS server、worker |
+| 主节点 | `master` | `192.168.1.10` | API、前端静态文件、PostgreSQL、InfluxDB、Redis、NFS server、worker |
 | 计算节点 1 | `node-a` | `192.168.1.21` | GPU 任务执行 |
 | 计算节点 2 | `node-b` | `192.168.1.22` | GPU 任务执行 |
 
@@ -32,7 +32,7 @@
 
 - 网络互通，主节点能访问计算节点的 SSH 端口。
 - 所有机器都有同名 Linux 主账户，例如 `ddltm`。
-- 所有机器的 `/data` 路径一致。
+- 所有机器的 `/home/ddltm/data` 和 `/home/ddltm/envs` 路径一致。
 - 计算节点已经安装 NVIDIA 驱动，并且 `nvidia-smi` 可以正常输出。
 
 计算节点上验证 GPU：
@@ -50,13 +50,14 @@ sudo apt update
 sudo apt install -y \
   build-essential curl git rsync nginx \
   nfs-kernel-server postgresql postgresql-contrib redis-server \
-  openssh-client
+  influxdb2 openssh-client
 ```
 
 启动基础服务：
 
 ```bash
 sudo systemctl enable --now postgresql
+sudo systemctl enable --now influxdb
 sudo systemctl enable --now redis-server
 sudo systemctl enable --now nfs-kernel-server
 sudo systemctl enable --now nginx
@@ -66,6 +67,7 @@ sudo systemctl enable --now nginx
 
 ```bash
 systemctl status postgresql --no-pager
+systemctl status influxdb --no-pager
 systemctl status redis-server --no-pager
 systemctl status nfs-kernel-server --no-pager
 systemctl status nginx --no-pager
@@ -76,6 +78,19 @@ redis-cli ping
 
 ```text
 PONG
+```
+
+初始化 InfluxDB，用于保存节点 CPU/GPU、内存/显存、上传/下载等历史监控指标。请把 token 换成随机长字符串并保存好，后续会写入 `/etc/nebulagrid/backend.env`：
+
+```bash
+influx setup \
+  --host-url http://127.0.0.1:8086 \
+  --org nebulagrid \
+  --bucket nebulagrid_metrics \
+  --username nebulagrid \
+  --password replace-with-influx-password \
+  --token replace-with-influx-token \
+  --force
 ```
 
 ## 3. 创建统一 Linux 主账户
@@ -137,27 +152,30 @@ sudo -u ddltm ssh ddltm@node-a 'hostname && id && nvidia-smi -L'
 
 以下命令在主节点执行。
 
-创建 NebulaGrid 数据目录：
+创建 NebulaGrid 数据目录和环境目录。`/home/ddltm/data` 只放用户数据、任务日志、运行时文件和备份；`/home/ddltm/envs` 放 Miniconda、用户环境以及远端执行脚本，避免环境文件和用户数据混在同一个共享根下。
 
 ```bash
-sudo mkdir -p /data/user
-sudo mkdir -p /data/logs/task_logs
-sudo mkdir -p /data/logs/env_install_logs
-sudo mkdir -p /data/runtime
-sudo mkdir -p /data/backups
-sudo mkdir -p /data/env_packages
-sudo mkdir -p /data/envs/miniconda
-sudo mkdir -p /data/envs/user_envs
-sudo mkdir -p /data/envs/nebulagrid_remote
-sudo chown -R ddltm:ddltm /data
-sudo chmod 750 /data
+sudo mkdir -p /home/ddltm/data/user
+sudo mkdir -p /home/ddltm/data/logs/task_logs
+sudo mkdir -p /home/ddltm/data/logs/env_install_logs
+sudo mkdir -p /home/ddltm/data/runtime
+sudo mkdir -p /home/ddltm/data/backups
+sudo mkdir -p /home/ddltm/envs/packages
+sudo mkdir -p /home/ddltm/envs/miniconda3
+sudo mkdir -p /home/ddltm/envs/user_envs
+sudo mkdir -p /home/ddltm/envs/nebulagrid_remote
+sudo chown -R ddltm:ddltm /home/ddltm/data
+sudo chown -R ddltm:ddltm /home/ddltm/envs
+sudo chmod 750 /home/ddltm/data
+sudo chmod 750 /home/ddltm/envs
 ```
 
 写入 NFS export 配置。请把 `192.168.1.0/24` 替换成你的实际内网网段。
 
 ```bash
 sudo tee /etc/exports.d/nebulagrid.exports >/dev/null <<'EOF'
-/data 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
+/home/ddltm/data 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
+/home/ddltm/envs 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
 EOF
 ```
 
@@ -183,38 +201,45 @@ sudo apt install -y nfs-common
 创建挂载点：
 
 ```bash
-sudo mkdir -p /data
+sudo mkdir -p /home/ddltm/data
+sudo mkdir -p /home/ddltm/envs
 ```
 
 临时挂载测试。请把 `master` 替换成主节点主机名或 IP。
 
 ```bash
-sudo mount -t nfs master:/data /data
+sudo mount -t nfs master:/home/ddltm/data /home/ddltm/data
+sudo mount -t nfs master:/home/ddltm/envs /home/ddltm/envs
 ```
 
 如果使用 IP：
 
 ```bash
-sudo mount -t nfs 192.168.1.10:/data /data
+sudo mount -t nfs 192.168.1.10:/home/ddltm/data /home/ddltm/data
+sudo mount -t nfs 192.168.1.10:/home/ddltm/envs /home/ddltm/envs
 ```
 
 写入开机自动挂载：
 
 ```bash
-echo 'master:/data /data nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
+echo 'master:/home/ddltm/data /home/ddltm/data nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
+echo 'master:/home/ddltm/envs /home/ddltm/envs nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
 ```
 
 如果使用 IP：
 
 ```bash
-echo '192.168.1.10:/data /data nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
+echo '192.168.1.10:/home/ddltm/data /home/ddltm/data nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
+echo '192.168.1.10:/home/ddltm/envs /home/ddltm/envs nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
 ```
 
 验证 NFS 读写：
 
 ```bash
-sudo -u ddltm touch /data/runtime/nfs-test-$(hostname)
-ls -l /data/runtime/
+sudo -u ddltm touch /home/ddltm/data/runtime/nfs-test-$(hostname)
+sudo -u ddltm touch /home/ddltm/envs/nfs-test-$(hostname)
+ls -l /home/ddltm/data/runtime/
+ls -l /home/ddltm/envs/
 ```
 
 主节点和计算节点都应该能看到同一批测试文件。
@@ -228,27 +253,27 @@ ls -l /data/runtime/
 ```bash
 cd /tmp
 curl -fsSLO https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh -b -p /data/envs/miniconda
-sudo chown -R ddltm:ddltm /data/envs/miniconda
+bash Miniconda3-latest-Linux-x86_64.sh -b -p /home/ddltm/envs/miniconda3
+sudo chown -R ddltm:ddltm /home/ddltm/envs/miniconda3
 ```
 
 升级 pip：
 
 ```bash
-sudo -u ddltm /data/envs/miniconda/bin/python -m pip install -U pip setuptools wheel
+sudo -u ddltm /home/ddltm/envs/miniconda3/bin/python -m pip install -U pip setuptools wheel
 ```
 
 验证：
 
 ```bash
-sudo -u ddltm /data/envs/miniconda/bin/python --version
-sudo -u ddltm /data/envs/miniconda/bin/pip --version
+sudo -u ddltm /home/ddltm/envs/miniconda3/bin/python --version
+sudo -u ddltm /home/ddltm/envs/miniconda3/bin/pip --version
 ```
 
 计算节点也应该能通过 NFS 访问同一路径：
 
 ```bash
-sudo -u ddltm ssh ddltm@node-a '/data/envs/miniconda/bin/python --version'
+sudo -u ddltm ssh ddltm@node-a '/home/ddltm/envs/miniconda3/bin/python --version'
 ```
 
 ## 8. 主节点创建 PostgreSQL 数据库
@@ -284,64 +309,15 @@ sudo apt install -y postgresql-client
 
 ## 9. 拷贝代码到主节点
 
-推荐代码位置有两种。
-
-方式 A 是系统级部署目录：
-
-```text
-/opt/nebulagrid/current
-```
-
-方式 B 是主账户目录，适合你希望尽量不使用 sudo 的部署方式：
+系统根目录统一放在主账户下：
 
 ```text
 /home/ddltm/master
 ```
 
-如果选择方式 B，后文所有 `/opt/nebulagrid/current` 都替换为 `/home/ddltm/master`。
+这样代码更新、后端依赖安装和前端静态文件检查都可以由 `ddltm` 主账户完成，避免把业务代码放进系统目录后再反复处理属主和 sudo 权限。以下命令以 `ddltm` 身份执行。
 
-### 9.1 系统级目录方式
-
-创建目录：
-
-```bash
-sudo mkdir -p /opt/nebulagrid
-sudo chown -R ddltm:ddltm /opt/nebulagrid
-```
-
-方式 A：用 git 拉取：
-
-```bash
-sudo -u ddltm git clone <your-repo-url> /opt/nebulagrid/current
-```
-
-方式 B：从本地电脑拷贝：
-
-```bash
-rsync -av --delete ./NebulaGrid/ ddltm@master:/opt/nebulagrid/current/
-```
-
-方式 C：用 scp 拷贝压缩包：
-
-```bash
-tar czf nebulagrid.tar.gz NebulaGrid
-scp nebulagrid.tar.gz ddltm@master:/tmp/
-ssh ddltm@master
-mkdir -p /opt/nebulagrid/current
-tar xzf /tmp/nebulagrid.tar.gz -C /opt/nebulagrid/current --strip-components=1
-```
-
-确认目录结构：
-
-```bash
-ls -la /opt/nebulagrid/current
-ls -la /opt/nebulagrid/current/backend
-ls -la /opt/nebulagrid/current/frontend
-```
-
-### 9.2 主账户目录方式，推荐少 sudo 测试部署
-
-以下命令以 `ddltm` 身份执行，不需要 sudo：
+先创建目录：
 
 ```bash
 mkdir -p /home/ddltm/master
@@ -379,36 +355,23 @@ ls -la /home/ddltm/master/frontend
 
 ## 10. 安装后端 Python 包
 
-以下命令在主节点执行。
-
-```bash
-cd /opt/nebulagrid/current/backend
-sudo -u ddltm /data/envs/miniconda/bin/python -m pip install -e .
-```
-
-如果代码部署在 `/home/ddltm/master`，并且当前已经是 `ddltm` 用户，则使用：
+以下命令在主节点以 `ddltm` 身份执行。
 
 ```bash
 cd /home/ddltm/master/backend
-/data/envs/miniconda/bin/python -m pip install -e .
+/home/ddltm/envs/miniconda3/bin/python -m pip install -e .
 ```
 
 如果你希望运行测试，也安装 dev 依赖：
 
 ```bash
-sudo -u ddltm /data/envs/miniconda/bin/python -m pip install -e ".[dev]"
-```
-
-主账户目录方式：
-
-```bash
-/data/envs/miniconda/bin/python -m pip install -e ".[dev]"
+/home/ddltm/envs/miniconda3/bin/python -m pip install -e ".[dev]"
 ```
 
 验证关键包：
 
 ```bash
-sudo -u ddltm /data/envs/miniconda/bin/python - <<'PY'
+/home/ddltm/envs/miniconda3/bin/python - <<'PY'
 import fastapi
 import sqlalchemy
 import psycopg
@@ -429,15 +392,21 @@ NEBULAGRID_APP_NAME=NebulaGrid
 NEBULAGRID_ENV=production
 NEBULAGRID_DATABASE_URL=postgresql+psycopg://nebulagrid:replace-with-strong-password@127.0.0.1:5432/nebulagrid
 NEBULAGRID_REDIS_URL=redis://127.0.0.1:6379/0
-NEBULAGRID_DATA_ROOT=/data
-NEBULAGRID_USER_HOME_ROOT=/data/user
+NEBULAGRID_INFLUXDB_URL=http://127.0.0.1:8086
+NEBULAGRID_INFLUXDB_ORG=nebulagrid
+NEBULAGRID_INFLUXDB_BUCKET=nebulagrid_metrics
+NEBULAGRID_INFLUXDB_TOKEN=replace-with-influx-token
+NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
+NEBULAGRID_DATA_ROOT=/home/ddltm/data
+NEBULAGRID_USER_HOME_ROOT=/home/ddltm/data/user
 NEBULAGRID_WORKSPACE_ALIAS=/workspace
-NEBULAGRID_VISIBLE_ROOTS=/data/user,/data/envs/user_envs,/data/envs/miniconda
-NEBULAGRID_TASK_LOG_ROOT=/data/logs/task_logs
-NEBULAGRID_ENV_PACKAGE_ROOT=/data/env_packages
-NEBULAGRID_ENV_INSTALL_LOG_ROOT=/data/logs/env_install_logs
-NEBULAGRID_RUNTIME_ROOT=/data/runtime
-NEBULAGRID_REMOTE_CODE_ROOT=/data/envs/nebulagrid_remote
+NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/user_envs,/home/ddltm/envs/miniconda3
+NEBULAGRID_TASK_LOG_ROOT=/home/ddltm/data/logs/task_logs
+NEBULAGRID_ENV_PACKAGE_ROOT=/home/ddltm/envs/packages
+NEBULAGRID_ENV_INSTALL_LOG_ROOT=/home/ddltm/data/logs/env_install_logs
+NEBULAGRID_RUNTIME_ROOT=/home/ddltm/data/runtime
+NEBULAGRID_REMOTE_CODE_ROOT=/home/ddltm/envs/nebulagrid_remote
+NEBULAGRID_MINICONDA_PYTHON=/home/ddltm/envs/miniconda3/bin/python
 NEBULAGRID_MAIN_LINUX_USER=ddltm
 NEBULAGRID_SESSION_SECRET=replace-with-random-secret
 NEBULAGRID_CORS_ORIGINS=http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1,http://localhost,null
@@ -461,18 +430,11 @@ sudo grep -v SECRET /etc/nebulagrid/backend.env
 
 ## 12. 初始化数据库表和默认账号
 
-以下命令在主节点执行。
-
-```bash
-cd /opt/nebulagrid/current/backend
-sudo -u ddltm bash -lc 'set -a; source /etc/nebulagrid/backend.env; set +a; /data/envs/miniconda/bin/python scripts/init_db.py'
-```
-
-主账户目录方式：
+以下命令在主节点以 `ddltm` 身份执行。
 
 ```bash
 cd /home/ddltm/master/backend
-bash -lc 'set -a; source /etc/nebulagrid/backend.env; set +a; /data/envs/miniconda/bin/python scripts/init_db.py'
+bash -lc 'set -a; source /etc/nebulagrid/backend.env; set +a; /home/ddltm/envs/miniconda3/bin/python scripts/init_db.py'
 ```
 
 初始化完成后会创建：
@@ -481,6 +443,12 @@ bash -lc 'set -a; source /etc/nebulagrid/backend.env; set +a; /data/envs/minicon
 - 默认管理员账号：`admin`。
 - 默认管理员密码：`admin123`。
 - 基础 settings 项。
+
+如果你是从旧版本升级，并且 PostgreSQL 中已经存在旧的监控表，请执行一次清理脚本。节点监控历史现在写入 InfluxDB，不再写入 PostgreSQL：
+
+```bash
+bash -lc 'set -a; source /etc/nebulagrid/backend.env; set +a; /home/ddltm/envs/miniconda3/bin/python scripts/drop_postgres_metrics_tables.py'
+```
 
 验证数据库表：
 
@@ -492,24 +460,17 @@ psql 'postgresql://nebulagrid:replace-with-strong-password@127.0.0.1:5432/nebula
 
 ## 13. 同步远端脚本到 NFS
 
-以下命令在主节点执行。
+以下命令在主节点以 `ddltm` 身份执行。
 
 ```bash
-sudo -u ddltm rsync -av /opt/nebulagrid/current/backend/app/remote/ /data/envs/nebulagrid_remote/
-sudo -u ddltm chmod +x /data/envs/nebulagrid_remote/*.py
-```
-
-主账户目录方式：
-
-```bash
-rsync -av /home/ddltm/master/backend/app/remote/ /data/envs/nebulagrid_remote/
-chmod +x /data/envs/nebulagrid_remote/*.py
+rsync -av /home/ddltm/master/backend/app/remote/ /home/ddltm/envs/nebulagrid_remote/
+chmod +x /home/ddltm/envs/nebulagrid_remote/*.py
 ```
 
 在计算节点上验证：
 
 ```bash
-sudo -u ddltm ssh ddltm@node-a '/data/envs/miniconda/bin/python /data/envs/nebulagrid_remote/monitor.py'
+sudo -u ddltm ssh ddltm@node-a '/home/ddltm/envs/miniconda3/bin/python /home/ddltm/envs/nebulagrid_remote/monitor.py'
 ```
 
 期望输出 JSON，例如：
@@ -535,27 +496,15 @@ After=network.target postgresql.service redis-server.service
 [Service]
 User=ddltm
 Group=ddltm
-WorkingDirectory=/opt/nebulagrid/current/backend
+WorkingDirectory=/home/ddltm/master/backend
 EnvironmentFile=/etc/nebulagrid/backend.env
-ExecStart=/data/envs/miniconda/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
+ExecStart=/home/ddltm/envs/miniconda3/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
-```
-
-如果代码部署在 `/home/ddltm/master`，把上面 service 文件中的：
-
-```text
-WorkingDirectory=/opt/nebulagrid/current/backend
-```
-
-改成：
-
-```text
-WorkingDirectory=/home/ddltm/master/backend
 ```
 
 ### 14.2 调度器
@@ -569,9 +518,9 @@ After=network.target postgresql.service redis-server.service nebulagrid-api.serv
 [Service]
 User=ddltm
 Group=ddltm
-WorkingDirectory=/opt/nebulagrid/current/backend
+WorkingDirectory=/home/ddltm/master/backend
 EnvironmentFile=/etc/nebulagrid/backend.env
-ExecStart=/data/envs/miniconda/bin/python -m app.workers.scheduler
+ExecStart=/home/ddltm/envs/miniconda3/bin/python -m app.workers.scheduler
 Restart=always
 RestartSec=3
 
@@ -591,9 +540,9 @@ After=network.target postgresql.service redis-server.service nebulagrid-api.serv
 [Service]
 User=ddltm
 Group=ddltm
-WorkingDirectory=/opt/nebulagrid/current/backend
+WorkingDirectory=/home/ddltm/master/backend
 EnvironmentFile=/etc/nebulagrid/backend.env
-ExecStart=/data/envs/miniconda/bin/python -m app.workers.node_monitor
+ExecStart=/home/ddltm/envs/miniconda3/bin/python -m app.workers.node_monitor
 Restart=always
 RestartSec=3
 
@@ -613,9 +562,9 @@ After=network.target postgresql.service redis-server.service nebulagrid-api.serv
 [Service]
 User=ddltm
 Group=ddltm
-WorkingDirectory=/opt/nebulagrid/current/backend
+WorkingDirectory=/home/ddltm/master/backend
 EnvironmentFile=/etc/nebulagrid/backend.env
-ExecStart=/data/envs/miniconda/bin/python -m app.workers.task_executor
+ExecStart=/home/ddltm/envs/miniconda3/bin/python -m app.workers.task_executor
 Restart=always
 RestartSec=3
 
@@ -635,9 +584,9 @@ After=network.target postgresql.service redis-server.service nebulagrid-api.serv
 [Service]
 User=ddltm
 Group=ddltm
-WorkingDirectory=/opt/nebulagrid/current/backend
+WorkingDirectory=/home/ddltm/master/backend
 EnvironmentFile=/etc/nebulagrid/backend.env
-ExecStart=/data/envs/miniconda/bin/python -m app.workers.runtime_guard
+ExecStart=/home/ddltm/envs/miniconda3/bin/python -m app.workers.runtime_guard
 Restart=always
 RestartSec=3
 
@@ -657,9 +606,9 @@ After=network.target postgresql.service redis-server.service nebulagrid-api.serv
 [Service]
 User=ddltm
 Group=ddltm
-WorkingDirectory=/opt/nebulagrid/current/backend
+WorkingDirectory=/home/ddltm/master/backend
 EnvironmentFile=/etc/nebulagrid/backend.env
-ExecStart=/data/envs/miniconda/bin/python -m app.workers.env_install_worker
+ExecStart=/home/ddltm/envs/miniconda3/bin/python -m app.workers.env_install_worker
 Restart=always
 RestartSec=3
 
@@ -702,26 +651,13 @@ journalctl -u nebulagrid-scheduler -f
 
 当前前端是零构建静态页面，不需要 Node.js、不需要 npm build。
 
-推荐放置位置：
-
-```text
-/opt/nebulagrid/current/frontend
-```
-
-如果使用主账户目录方式，前端位置是：
+前端位置：
 
 ```text
 /home/ddltm/master/frontend
 ```
 
 这个目录已经随代码一起放置。确认：
-
-```bash
-ls -la /opt/nebulagrid/current/frontend
-ls -la /opt/nebulagrid/current/frontend/src
-```
-
-主账户目录方式：
 
 ```bash
 ls -la /home/ddltm/master/frontend
@@ -749,7 +685,7 @@ server {
 
     client_max_body_size 1024m;
 
-    root /opt/nebulagrid/current/frontend;
+    root /home/ddltm/master/frontend;
     index index.html;
 
     location / {
@@ -768,13 +704,7 @@ server {
 EOF
 ```
 
-如果使用 `/home/ddltm/master`，把 Nginx 的 `root` 改成：
-
-```nginx
-root /home/ddltm/master/frontend;
-```
-
-并确保 Nginx 进程能读取主账户目录。Ubuntu 的 Nginx 默认以 `www-data` 运行，`/home/ddltm` 默认可能没有遍历权限。二选一：
+确保 Nginx 进程能读取主账户目录。Ubuntu 的 Nginx 默认以 `www-data` 运行，`/home/ddltm` 默认可能没有遍历权限。二选一：
 
 方案 A，给目录增加只读遍历权限：
 
@@ -915,7 +845,7 @@ journalctl -u nginx -n 100 --no-pager
 检查前端文件：
 
 ```bash
-ls -la /opt/nebulagrid/current/frontend/index.html
+ls -la /home/ddltm/master/frontend/index.html
 ```
 
 ### 19.2 前端能打开但登录失败
@@ -962,7 +892,8 @@ systemctl status nfs-kernel-server --no-pager
 
 ```bash
 showmount -e master
-sudo mount -v -t nfs master:/data /data
+sudo mount -v -t nfs master:/home/ddltm/data /home/ddltm/data
+sudo mount -v -t nfs master:/home/ddltm/envs /home/ddltm/envs
 ```
 
 ### 19.5 SSH 免密失败
@@ -1004,46 +935,36 @@ EOF
 重新安装：
 
 ```bash
-cd /opt/nebulagrid/current/backend
-sudo -u ddltm /data/envs/miniconda/bin/python -m pip install -e .
+cd /home/ddltm/master/backend
+/home/ddltm/envs/miniconda3/bin/python -m pip install -e .
 ```
 
 ## 20. 更新代码
 
-如果代码来自 git：
-
-```bash
-cd /opt/nebulagrid/current
-sudo -u ddltm git pull
-cd backend
-sudo -u ddltm /data/envs/miniconda/bin/python -m pip install -e .
-sudo systemctl restart nebulagrid-api nebulagrid-scheduler nebulagrid-node-monitor nebulagrid-task-executor nebulagrid-runtime-guard nebulagrid-env-install-worker
-sudo systemctl reload nginx
-```
-
-主账户目录方式：
+如果代码来自 git，以下命令以 `ddltm` 身份执行代码更新和依赖安装，再用 sudo 重启服务：
 
 ```bash
 cd /home/ddltm/master
 git pull
 cd backend
-/data/envs/miniconda/bin/python -m pip install -e .
+/home/ddltm/envs/miniconda3/bin/python -m pip install -e .
 sudo systemctl restart nebulagrid-api nebulagrid-scheduler nebulagrid-node-monitor nebulagrid-task-executor nebulagrid-runtime-guard nebulagrid-env-install-worker
 sudo systemctl reload nginx
 ```
 
 如果代码来自 rsync/scp，重新同步后执行同样的 pip install 和 systemctl restart。
 
-## 23. 最少 sudo 部署模式总结
+## 23. 主账户部署模式总结
 
-如果你希望把代码部署到 `/home/ddltm/master`，推荐把权限边界拆成两部分。
+代码根目录固定为 `/home/ddltm/master`，权限边界拆成两部分。
 
 管理员只需要做一次：
 
 - 安装 apt 包：`nginx`、`postgresql`、`redis-server`、`nfs-kernel-server`、`nfs-common` 等。
 - 创建 `ddltm` 用户，并保证所有节点 UID/GID 一致。
-- 创建 `/data` 并配置 NFS。
+- 创建 `/home/ddltm/data` 和 `/home/ddltm/envs` 并配置 NFS。
 - 创建 PostgreSQL 用户和数据库。
+- 初始化 InfluxDB org、bucket 和 token。
 - 创建 `/etc/nebulagrid/backend.env`。
 - 创建 systemd service 文件。
 - 配置 Nginx。
@@ -1053,7 +974,7 @@ sudo systemctl reload nginx
 - 更新 `/home/ddltm/master` 里的代码。
 - 在 miniconda base 环境里安装 Python 包。
 - 运行 `scripts/init_db.py`。
-- 同步远端脚本到 `/data/envs/nebulagrid_remote`。
+- 同步远端脚本到 `/home/ddltm/envs/nebulagrid_remote`。
 - 使用前端页面登记节点、提交任务、查看状态。
 
 仍然需要 sudo 的操作：
@@ -1095,18 +1016,21 @@ sudo systemctl reload nginx
 - 管理员可以登录。
 - 能通过页面登记计算节点。
 - 主节点可以 `sudo -u ddltm ssh ddltm@node-a 'nvidia-smi -L'`。
-- 计算节点可以看到 `/data/envs/nebulagrid_remote/monitor.py`。
+- 计算节点可以看到 `/home/ddltm/envs/nebulagrid_remote/monitor.py`。
 - PostgreSQL 中能看到 NebulaGrid 数据表。
+- InfluxDB 中能查询到 `node_metrics` / `gpu_metrics` 监控点。
 - systemd 中 API 和 worker 服务为 running。
 
 ## 22. 当前版本边界
 
 当前代码适合部署后开始真实机器联调。以下能力还需要继续开发完善：
 
-- API 服务从内存仓库完全切换到数据库 CRUD。
+- 任务、用户、环境等 API 服务从内存仓库完全切换到数据库 CRUD。
 - 调度器执行真实 GPU 选择和 allocation 事务。
 - 执行器通过 SSH 调用远端 runner 启动任务。
-- 节点监控 worker 通过 SSH 采集并写入 node/gpu metrics。
 - runtime guard 检查实际 PID/GPU 使用并处理 `alloc_error`。
 - env install worker 执行真实包安装、日志回收和状态更新。
 - Alembic 数据库迁移；当前初始化使用 ORM `create_all`，适合 MVP 部署和测试。
+
+
+

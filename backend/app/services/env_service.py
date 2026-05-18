@@ -1,5 +1,6 @@
 from itertools import count
 
+from app.core.config import get_settings
 from app.core.errors import forbidden, not_found, validation_error
 from app.core.path_resolver import resolve_user_visible_path
 from app.core.rbac import Role, require_permission
@@ -64,13 +65,14 @@ def upload_package(
     """登记环境包元数据，后续替换为真实文件上传、校验和落盘。"""
     env = get_env_for_user(user, env_id)
     require_env_owner_or_admin(user, env)
+    settings = get_settings()
     package = EnvPackageInfo(
         id=next(_PACKAGE_ID),
         env_id=env.id,
         owner_user_id=user.id,
         filename=payload.filename,
         package_type=payload.package_type,
-        file_path=f"/data/env_packages/{user.username}/{payload.filename}",
+        file_path=f"{settings.env_package_root}/{user.username}/{payload.filename}",
         size_bytes=payload.size_bytes,
         sha256=payload.sha256,
         status="uploaded",
@@ -101,7 +103,7 @@ def install_package(
         target_node_id=payload.target_node_id,
         visible_gpu_indices=payload.visible_gpu_indices,
         status="queued",
-        log_path=f"/data/logs/env_install_logs/job-{package.id}.log",
+        log_path=f"{get_settings().env_install_log_root}/job-{package.id}.log",
         created_by=user.id,
     )
     _JOBS.append(job)
@@ -163,4 +165,3 @@ def require_job(job_id: int) -> EnvInstallJobInfo:
     if job is None:
         raise not_found("install job not found")
     return job
-

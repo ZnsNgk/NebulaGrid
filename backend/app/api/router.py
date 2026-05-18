@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api import admin, auth, dashboard, envs, files, health, nodes, tasks, users
+from app.api import admin, auth, dashboard, envs, files, health, manual, nodes, tasks, users
 
 
 def get_api_router() -> APIRouter:
@@ -14,6 +14,7 @@ def get_api_router() -> APIRouter:
     router.include_router(files.router, prefix="/files", tags=["files"])
     router.include_router(envs.router, prefix="/envs", tags=["envs"])
     router.include_router(envs.jobs_router, prefix="/env-install-jobs", tags=["envs"])
+    router.include_router(manual.router, prefix="/manual", tags=["manual"])
     router.include_router(users.router, prefix="/users", tags=["users"])
     router.include_router(admin.router, prefix="/admin", tags=["admin"])
     return router

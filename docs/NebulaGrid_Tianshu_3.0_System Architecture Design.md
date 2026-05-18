@@ -1,8 +1,8 @@
-# NebulaGrid（天枢）3.0 系统架构设计书
+﻿# NebulaGrid（天枢）3.0 系统架构设计书
 
 > 项目全称：天枢 NebulaGrid 分布式 GPU 任务调度与资源管理平台  
 > 文档类型：系统架构设计书  
-> 推荐技术栈：Python + FastAPI + PostgreSQL + Redis + SQLAlchemy + Alembic  
+> 推荐技术栈：Python + FastAPI + PostgreSQL + InfluxDB + Redis + SQLAlchemy + Alembic  
 > 适用阶段：3.0 纯 B/S 重构设计、编码、联调与部署  
 > 版本：V1.0  
 > 日期：2026-05-18
@@ -64,7 +64,8 @@ NebulaGrid 3.0 需要满足以下架构目标：
 | ASGI 服务器 | Uvicorn + Gunicorn | 开发期用 Uvicorn，生产期用 Gunicorn 管理多个 Uvicorn worker。 |
 | ORM | SQLAlchemy 2.x | 支持 ORM/Core、事务、关系建模和异步使用。 |
 | 数据库迁移 | Alembic | 管理数据库结构演进。 |
-| 主数据库 | PostgreSQL | 用于任务队列、状态机、审计日志、权限数据、节点/GPU 模型。 |
+| 主数据库 | PostgreSQL | 用于任务队列、状态机、审计日志、权限数据、节点/GPU 清单和当前调度状态。 |
+| 时序数据库 | InfluxDB 2.x | 用于节点 CPU/GPU、内存/显存、上传/下载、GPU 调用进程数等历史监控指标。 |
 | 缓存/消息 | Redis | 用于短期缓存、WebSocket 广播、后台事件通知、可选轻量分布式锁。 |
 | SSH 执行 | AsyncSSH / Paramiko | 推荐新代码优先 AsyncSSH；若兼容性优先，可先使用 Paramiko。 |
 | 前端 | Vue 3 + Vite + TypeScript | 适合管理后台、仪表盘和大屏展示。若团队更熟 React，也可替换为 React。 |
@@ -86,16 +87,24 @@ NebulaGrid 3.0 需要大量结构化 API、权限校验、任务状态流和日�
 任务调度系统的关键是状态一致性。PostgreSQL 相比 SQLite/纯 JSON 文件更适合作为 3.0 主数据库：
 
 1. 支持事务和行级锁，便于保证任务领取和 GPU 分配的原子性；
-2. 支持 JSONB 字段，便于保存节点指标快照、任务扩展参数、审计详情；
+2. 支持 JSONB 字段，便于保存任务扩展参数、审计详情和少量结构化配置；
 3. 支持复杂查询、分页、索引和统计，适合历史任务、审计日志和管理员后台；
 4. 后续如果调度器需要多实例或高可靠，可以基于数据库锁继续演进。
 
-### 3.4 Redis 的定位
+### 3.4 为什么选择 InfluxDB
+
+节点监控属于持续写入的时间序列数据，和任务、用户、权限这类关系型状态不同。CPU/GPU 使用率、可用内存/显存、上传/下载速率、GPU 调用进程数等指标需要高频写入、按时间窗口查询和后续可视化，因此 3.0 将历史监控指标保存到 InfluxDB：
+
+1. PostgreSQL 只保存节点/GPU 清单、调度状态和业务事件，避免监控点持续写入拖慢事务表；
+2. InfluxDB 保存 `node_metrics` 和 `gpu_metrics` measurement，便于按节点、GPU、时间范围查询历史曲线；
+3. 后续可直接接入 Grafana 或自建大屏展示趋势、峰值和异常节点。
+
+### 3.5 Redis 的定位
 
 Redis 不作为主状态存储，只用于以下场景：
 
 1. WebSocket/SSE 状态广播；
-2. 节点指标短期缓存；
+2. 实时页面的短期状态缓存；
 3. 在线用户会话缓存；
 4. 调度器心跳；
 5. 轻量事件队列，例如“任务状态变化后通知日志页面刷新”。
@@ -167,18 +176,19 @@ flowchart TB
 ├── nebulagrid-envworker.service   # 环境包安装与编译安装作业器
 ├── postgresql.service             # 主数据库
 ├── redis.service                  # 实时事件与缓存
-├── /data/                         # NFS 共享：用户 home、任务日志、环境安装日志、运行时文件和环境目录
-├── /data/user/<user_id>/          # master 子账户 home，只在主节点创建对应 Linux 账户
-└── /data/envs/                    # miniconda、用户环境、节点监控/远端执行代码
+├── /home/ddltm/data/                         # NFS 共享：用户 home、任务日志、环境安装日志、运行时文件
+├── /home/ddltm/data/user/<user_id>/          # master 子账户 home，只在主节点创建对应 Linux 账户
+└── /home/ddltm/envs/                         # NFS 共享：miniconda、用户环境、节点监控/远端执行代码
 
 计算节点 node-01/node-02/...
 ├── SSH Server
 ├── NVIDIA Driver / CUDA runtime
 ├── ddltm                          # 与 master 同名、同密码、同 UID、同 GID 的主账户
-└── /data                          # 通过 NFS 挂载 master 的 /data，包含用户 home、日志、环境与 runner/monitor/env_installer
+├── /home/ddltm/data                          # 通过 NFS 挂载 master 的 /home/ddltm/data，包含用户 home、日志、运行时文件
+└── /home/ddltm/envs                          # 通过 NFS 挂载 master 的 /home/ddltm/envs，包含环境与 runner/monitor/env_installer
 ```
 
-部署约定：master 作为 NFS server，共享 `/data` 到所有计算节点。`/data/user/<user_id>` 是平台用户在 master 上的 home 目录；`/data/logs` 存放任务日志和环境安装日志；`/data/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台为用户创建的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/data/user/<user_id>` 下的文件执行必要的增删查改，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
+部署约定：master 作为 NFS server，共享 `/home/ddltm/data` 和 `/home/ddltm/envs` 到所有计算节点。`/home/ddltm/data/user/<user_id>` 是平台用户在 master 上的 home 目录；`/home/ddltm/data/logs` 存放任务日志和环境安装日志；`/home/ddltm/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台为用户创建的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/home/ddltm/data/user/<user_id>` 下的文件执行必要的增删查改，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
 
 中期可演进为：数据库独立部署，Redis 独立部署，API 多实例，Scheduler/Monitor/Executor 保持单实例或通过 leader election 控制。
 
@@ -278,7 +288,6 @@ erDiagram
     users ||--o{ audit_logs : acts
 
     nodes ||--o{ gpu_devices : contains
-    nodes ||--o{ node_metrics : reports
     nodes ||--o{ tasks : runs
     nodes ||--o{ env_install_jobs : compiles_on
 
@@ -307,7 +316,7 @@ erDiagram
 | supervisor1_id | fk users.id | 第一导师 |
 | supervisor2_id | fk users.id | 第二导师 |
 | avatar_path | varchar | 头像路径 |
-| home_path | varchar | 用户真实 home 路径，固定映射为 `/data/user/<user_id>`，仅管理员可见 |
+| home_path | varchar | 用户真实 home 路径，固定映射为 `/home/ddltm/data/user/<user_id>`，仅管理员可见 |
 | linux_account_name | varchar | master 上对应的 Linux 子账户名；该账户只在 master 创建，用于用户 SSH 登录 |
 | linux_uid | int nullable | master 子账户 UID；用于审计和排障，不要求同步到计算节点 |
 | linux_gid | int nullable | master 子账户 GID；用于审计和排障，不要求同步到计算节点 |
@@ -793,7 +802,7 @@ Executor 负责把已分配任务真正变成远端进程：
 不建议直接通过 `ssh.exec_command("source ... && python train.py")` 裸跑任务。推荐在计算节点放置受控 runner：
 
 ```text
-/data/envs/nebulagrid_remote/runner.py
+/home/ddltm/envs/nebulagrid_remote/runner.py
 ```
 
 runner 输入 JSON：
@@ -801,12 +810,12 @@ runner 输入 JSON：
 ```json
 {
   "task_id": "2026051809201250",
-  "env_activate": "source /data/envs/miniconda/bin/activate && conda activate torch201",
-  "workdir": "/data/user/xz/project1",
+  "env_activate": "source /home/ddltm/envs/miniconda3/bin/activate && conda activate torch201",
+  "workdir": "/home/ddltm/data/user/xz/project1",
   "command": "python train.py --config model.yaml",
   "cuda_visible_devices": "0,2",
-  "log_path": "/data/logs/task_logs/2026051809201250.log",
-  "pid_file": "/data/runtime/2026051809201250.pid"
+  "log_path": "/home/ddltm/data/logs/task_logs/2026051809201250.log",
+  "pid_file": "/home/ddltm/data/runtime/2026051809201250.pid"
 }
 ```
 
@@ -1038,7 +1047,7 @@ running install job exists -> reject new install job or queue it
 
 ```text
 /workspace/project/train.py
-/envs/torch201
+/home/ddltm/envs/user_envs/torch201
 /logs/2026051809201250.log
 ```
 
@@ -1122,10 +1131,11 @@ MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在
 | 日志类型 | 存储位置 | 用途 |
 |---|---|---|
 | 服务日志 | /var/log/nebulagrid/ | API、scheduler、monitor 等服务自身日志 |
-| 任务日志 | /data/logs/task_logs/<task_no>.log | 用户训练 stdout/stderr，master 与计算节点通过 NFS 共享 |
-| 环境安装日志 | /data/logs/env_install_logs/<job_no>.log | whl/源码包/编译安装日志 |
+| 任务日志 | /home/ddltm/data/logs/task_logs/<task_no>.log | 用户训练 stdout/stderr，master 与计算节点通过 NFS 共享 |
+| 环境安装日志 | /home/ddltm/data/logs/env_install_logs/<job_no>.log | whl/源码包/编译安装日志 |
 | 审计日志 | PostgreSQL audit_logs | 谁在何时做了什么 |
 | 任务事件 | PostgreSQL task_events | 任务状态机事件 |
+| 节点/GPU 历史指标 | InfluxDB node_metrics/gpu_metrics | CPU/GPU 使用率、内存/显存、上传/下载、GPU 调用进程数 |
 
 ### 15.2 日志读取策略
 
@@ -1226,7 +1236,7 @@ MVP 推荐 Session Cookie + CSRF 防护，原因是管理后台操作多，主�
 
 用户任务命令本身具有执行能力，不能完全当作普通文本处理。需要通过制度和技术边界共同控制：
 
-1. 用户只能在自己的工作目录运行，真实目录为 `/data/user/<user_id>`；
+1. 用户只能在自己的工作目录运行，真实目录为 `/home/ddltm/data/user/<user_id>`；
 2. 系统统一拼接环境激活和 CUDA 前缀；
 3. 任务命令保存原文和最终命令；
 4. 管理员可查看最终命令；
@@ -1278,23 +1288,33 @@ redis:
   url: redis://127.0.0.1:6379/0
 
 storage:
-  nfs_data_root: /data
-  user_home_root: /data/user
-  user_home_template: /data/user/{user_id}
-  task_log_root: /data/logs/task_logs
-  env_package_root: /data/env_packages
-  env_install_log_root: /data/logs/env_install_logs
-  runtime_root: /data/runtime
-  miniconda_root: /data/envs/miniconda
-  user_env_root: /data/envs/user_envs
-  remote_code_root: /data/envs/nebulagrid_remote
+  nfs_data_root: /home/ddltm/data
+  nfs_env_root: /home/ddltm/envs
+  user_home_root: /home/ddltm/data/user
+  user_home_template: /home/ddltm/data/user/{user_id}
+  task_log_root: /home/ddltm/data/logs/task_logs
+  env_package_root: /home/ddltm/envs/packages
+  env_install_log_root: /home/ddltm/data/logs/env_install_logs
+  runtime_root: /home/ddltm/data/runtime
+  miniconda_root: /home/ddltm/envs/miniconda3
+  user_env_root: /home/ddltm/envs/user_envs
+  remote_code_root: /home/ddltm/envs/nebulagrid_remote
+
+metrics:
+  backend: influxdb
+  url: http://127.0.0.1:8086
+  org: nebulagrid
+  bucket: nebulagrid_metrics
+  measurements:
+    - node_metrics
+    - gpu_metrics
 
 accounts:
   main_user: ddltm
   main_group: ddltm
   require_same_uid_gid_on_nodes: true
   create_child_accounts_on_master_only: true
-  child_home_template: /data/user/{user_id}
+  child_home_template: /home/ddltm/data/user/{user_id}
 
 scheduler:
   enabled: true
@@ -1308,7 +1328,7 @@ executor:
   ssh_connect_timeout_seconds: 10
   kill_grace_seconds: 10
   ssh_username: ddltm
-  remote_runner_path: /data/envs/nebulagrid_remote/runner.py
+  remote_runner_path: /home/ddltm/envs/nebulagrid_remote/runner.py
 
 monitor:
   interval_seconds: 5
@@ -1370,9 +1390,9 @@ Nginx 负责：
 4. 不在计算节点创建平台用户子账户；子账户只存在于 master，用于用户 SSH 到主节点；
 5. 安装 NVIDIA 驱动；
 6. `nvidia-smi` 可用；
-7. 通过 NFS 挂载 master 共享的 `/data`，用于访问用户 home、任务日志、环境安装日志、运行时文件、miniconda、用户环境和节点监控/远端执行代码；
-8. `/data` 在 master 和所有计算节点上的路径必须一致；
-9. `runner.py`、`monitor.py`、`env_installer.py` 由 master 统一维护在 `/data/envs/nebulagrid_remote/`，计算节点通过 NFS 读取并以主账户执行。
+7. 通过 NFS 挂载 master 共享的 `/home/ddltm/data`，用于访问用户 home、任务日志、环境安装日志、运行时文件、miniconda、用户环境和节点监控/远端执行代码；
+8. `/home/ddltm/data` 在 master 和所有计算节点上的路径必须一致；
+9. `runner.py`、`monitor.py`、`env_installer.py` 由 master 统一维护在 `/home/ddltm/envs/nebulagrid_remote/`，计算节点通过 NFS 读取并以主账户执行。
 
 ---
 
@@ -1501,7 +1521,7 @@ while True:
 
 ### 22.3 V1.2 阶段
 
-1. 历史指标图表；
+1. 基于 InfluxDB 的历史指标图表和 Grafana 大屏；
 2. 用户配额；
 3. 导师组资源策略；
 4. 任务模板；
@@ -1542,6 +1562,7 @@ NebulaGrid 3.0 应定位为一次完整重构，而不是对 DDLTM 2.0 的页面
 ```text
 FastAPI API Server
 + PostgreSQL 单一事实来源
++ InfluxDB 节点/GPU 历史监控
 + Redis 实时事件与缓存
 + Scheduler 单实例调度
 + Executor SSH 远程执行
@@ -1552,3 +1573,5 @@ FastAPI API Server
 ```
 
 该架构能够覆盖当前需求分析书中提出的角色管理、节点监控、任务调度、环境管理、文件管理、日志查看、用户状态、管理员后台、环境包安装和调度错误守护等需求，并为后续横向项目、软著、论文工程系统展示和实验室长期运维留下扩展空间。
+
+

@@ -23,7 +23,7 @@ def resolve_visible_path(path: str) -> Path:
 
 
 def resolve_user_visible_path(path: str, user_id: int) -> Path:
-    """解析用户可见路径，把 /workspace 安全映射到 /data/user/<user_id>。"""
+    """解析用户可见路径，把 /workspace 安全映射到配置的用户 home 根目录。"""
     settings = get_settings()
     normalized = normalize_virtual_path(path)
     alias = settings.user_workspace_alias.rstrip("/")

@@ -45,4 +45,3 @@ def init_database() -> None:
     create_schema()
     with Session(engine) as db:
         seed_defaults(db)
-

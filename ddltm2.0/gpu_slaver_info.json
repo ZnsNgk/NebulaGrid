@@ -1,0 +1,9 @@
+[
+    {
+        "name": "073-759-PC-7",
+        "ip": "192.168.77.2",
+        "user_name": "ddltm",
+        "gpu_count": 2,
+        "gpu_info": ["RTX4080", "RTX4080"]
+    }
+]

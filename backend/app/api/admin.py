@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.responses import api_success
+from app.db.session import get_db
 from app.schemas.admin import SettingsUpdateRequest
 from app.schemas.nodes import NodeCreateRequest
 from app.services.audit_service import list_audit_logs, list_settings, update_settings
@@ -16,9 +18,10 @@ def post_admin_node(
     payload: NodeCreateRequest,
     request: Request,
     current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """管理员新增计算节点。"""
-    node = create_node(current_user, payload)
+    node = create_node(current_user, payload, db)
     return api_success(data=node.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
@@ -27,9 +30,10 @@ def post_admin_node_reconnect(
     node_id: int,
     request: Request,
     current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """管理员触发节点重连。"""
-    node = reconnect_node(current_user, node_id)
+    node = reconnect_node(current_user, node_id, db)
     return api_success(data=node.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
@@ -38,9 +42,10 @@ def post_admin_node_force_offline(
     node_id: int,
     request: Request,
     current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """管理员强制节点下线并关闭调度。"""
-    node = force_offline_node(current_user, node_id)
+    node = force_offline_node(current_user, node_id, db)
     return api_success(data=node.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
@@ -73,4 +78,3 @@ def patch_admin_settings(
     """更新系统配置项并写入审计日志。"""
     settings = [item.model_dump() for item in update_settings(current_user, payload.values)]
     return api_success(data=settings, request_id=request.headers.get("x-request-id"))
-

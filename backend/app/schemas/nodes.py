@@ -10,6 +10,10 @@ class GpuInfo(BaseModel):
     total_vram_mb: int
     schedulable: bool = True
     remark: str | None = None
+    free_vram_mb: int | None = None
+    gpu_usage: int | None = None
+    process_count: int | None = None
+    metric_collected_at: str | None = None
 
 
 class NodeInfo(BaseModel):
@@ -26,6 +30,11 @@ class NodeInfo(BaseModel):
     state: str
     scheduling_enabled: bool
     gpus: list[GpuInfo] = []
+    cpu_usage: int | None = None
+    avail_ram_mb: int | None = None
+    upload_mbps: int | None = None
+    download_mbps: int | None = None
+    metric_collected_at: str | None = None
 
 
 class NodeCreateRequest(BaseModel):
@@ -37,4 +46,3 @@ class NodeCreateRequest(BaseModel):
     is_public: bool = True
     max_speed_mbps: int | None = Field(default=None, ge=1)
     gpu_models: list[str] = []
-

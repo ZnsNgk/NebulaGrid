@@ -7,10 +7,8 @@ from app.db.models.core import (
     EnvPackage,
     EnvPackageManifest,
     Gpu,
-    GpuMetric,
     LoginSession,
     Node,
-    NodeMetric,
     Setting,
     Task,
     TaskAllocation,
@@ -29,10 +27,8 @@ __all__ = [
     "EnvPackage",
     "EnvPackageManifest",
     "Gpu",
-    "GpuMetric",
     "LoginSession",
     "Node",
-    "NodeMetric",
     "Setting",
     "Task",
     "TaskAllocation",
@@ -43,4 +39,3 @@ __all__ = [
     "User",
     "UserSupervisor",
 ]
-
