@@ -167,17 +167,18 @@ flowchart TB
 ├── nebulagrid-envworker.service   # 环境包安装与编译安装作业器
 ├── postgresql.service             # 主数据库
 ├── redis.service                  # 实时事件与缓存
-├── ~/data/                        # NFS 共享：用户数据、任务日志、环境安装日志、运行时文件
-└── ~/envs/                        # NFS 共享：miniconda、用户环境、节点监控/远端执行代码
+├── /data/                         # NFS 共享：用户 home、任务日志、环境安装日志、运行时文件和环境目录
+├── /data/user/<user_id>/          # master 子账户 home，只在主节点创建对应 Linux 账户
+└── /data/envs/                    # miniconda、用户环境、节点监控/远端执行代码
 
 计算节点 node-01/node-02/...
 ├── SSH Server
 ├── NVIDIA Driver / CUDA runtime
-├── ~/data                         # 通过 NFS 挂载 master 的 ~/data
-└── ~/envs                         # 通过 NFS 挂载 master 的 ~/envs，包含 miniconda 与 runner/monitor/env_installer
+├── ddltm                          # 与 master 同名、同密码、同 UID、同 GID 的主账户
+└── /data                          # 通过 NFS 挂载 master 的 /data，包含用户 home、日志、环境与 runner/monitor/env_installer
 ```
 
-部署约定：master 作为 NFS server，共享 `~/data` 与 `~/envs` 到所有计算节点。`~/data` 存放所有用户数据、任务日志、环境安装日志、上传包、运行时 pid/pgid 文件和备份；`~/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与计算节点必须使用一致的挂载路径，避免任务工作目录、日志路径和环境路径在远端解析失败。
+部署约定：master 作为 NFS server，共享 `/data` 到所有计算节点。`/data/user/<user_id>` 是平台用户在 master 上的 home 目录；`/data/logs` 存放任务日志和环境安装日志；`/data/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台为用户创建的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/data/user/<user_id>` 下的文件执行必要的增删查改，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
 
 中期可演进为：数据库独立部署，Redis 独立部署，API 多实例，Scheduler/Monitor/Executor 保持单实例或通过 leader election 控制。
 
@@ -306,7 +307,10 @@ erDiagram
 | supervisor1_id | fk users.id | 第一导师 |
 | supervisor2_id | fk users.id | 第二导师 |
 | avatar_path | varchar | 头像路径 |
-| home_path | varchar | 用户真实根路径，仅管理员可见 |
+| home_path | varchar | 用户真实 home 路径，固定映射为 `/data/user/<user_id>`，仅管理员可见 |
+| linux_account_name | varchar | master 上对应的 Linux 子账户名；该账户只在 master 创建，用于用户 SSH 登录 |
+| linux_uid | int nullable | master 子账户 UID；用于审计和排障，不要求同步到计算节点 |
+| linux_gid | int nullable | master 子账户 GID；用于审计和排障，不要求同步到计算节点 |
 | state | enum | enabled/disabled |
 | created_at | timestamp | 创建时间 |
 | updated_at | timestamp | 更新时间 |
@@ -319,7 +323,9 @@ erDiagram
 | name | varchar unique | 节点显示名称 |
 | host | varchar | IP 或 hostname，仅管理员可见 |
 | ssh_port | int | 默认 22 |
-| ssh_username | varchar | master 登录该节点使用的账户 |
+| ssh_username | varchar | master 登录该节点使用的主账户，默认 `ddltm` |
+| ssh_uid | int | 该主账户在节点上的 UID，必须与 master 主账户一致 |
+| ssh_gid | int | 该主账户在节点上的 GID，必须与 master 主账户一致 |
 | ownership | enum | public/private |
 | owner_user_id | fk users.id | 私人节点所有人 |
 | open_to_group | bool | 私人节点是否开放给同导师组使用 |
@@ -787,7 +793,7 @@ Executor 负责把已分配任务真正变成远端进程：
 不建议直接通过 `ssh.exec_command("source ... && python train.py")` 裸跑任务。推荐在计算节点放置受控 runner：
 
 ```text
-~/envs/nebulagrid_remote/runner.py
+/data/envs/nebulagrid_remote/runner.py
 ```
 
 runner 输入 JSON：
@@ -795,12 +801,12 @@ runner 输入 JSON：
 ```json
 {
   "task_id": "2026051809201250",
-  "env_activate": "source ~/envs/miniconda/bin/activate && conda activate torch201",
-  "workdir": "~/data/users/xz/project1",
+  "env_activate": "source /data/envs/miniconda/bin/activate && conda activate torch201",
+  "workdir": "/data/user/xz/project1",
   "command": "python train.py --config model.yaml",
   "cuda_visible_devices": "0,2",
-  "log_path": "~/data/logs/task_logs/2026051809201250.log",
-  "pid_file": "~/data/runtime/2026051809201250.pid"
+  "log_path": "/data/logs/task_logs/2026051809201250.log",
+  "pid_file": "/data/runtime/2026051809201250.pid"
 }
 ```
 
@@ -1116,8 +1122,8 @@ MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在
 | 日志类型 | 存储位置 | 用途 |
 |---|---|---|
 | 服务日志 | /var/log/nebulagrid/ | API、scheduler、monitor 等服务自身日志 |
-| 任务日志 | ~/data/logs/task_logs/<task_no>.log | 用户训练 stdout/stderr，master 与计算节点通过 NFS 共享 |
-| 环境安装日志 | ~/data/logs/env_install_logs/<job_no>.log | whl/源码包/编译安装日志 |
+| 任务日志 | /data/logs/task_logs/<task_no>.log | 用户训练 stdout/stderr，master 与计算节点通过 NFS 共享 |
+| 环境安装日志 | /data/logs/env_install_logs/<job_no>.log | whl/源码包/编译安装日志 |
 | 审计日志 | PostgreSQL audit_logs | 谁在何时做了什么 |
 | 任务事件 | PostgreSQL task_events | 任务状态机事件 |
 
@@ -1220,13 +1226,14 @@ MVP 推荐 Session Cookie + CSRF 防护，原因是管理后台操作多，主�
 
 用户任务命令本身具有执行能力，不能完全当作普通文本处理。需要通过制度和技术边界共同控制：
 
-1. 用户只能在自己的工作目录运行；
+1. 用户只能在自己的工作目录运行，真实目录为 `/data/user/<user_id>`；
 2. 系统统一拼接环境激活和 CUDA 前缀；
 3. 任务命令保存原文和最终命令；
 4. 管理员可查看最终命令；
 5. 禁止前端传入真实系统路径绕过 PathResolver；
 6. 对危险命令可增加提示或黑名单，但不能依赖黑名单保证安全；
-7. 后续如需要强隔离，可引入容器、cgroup 或独立 Unix 用户。
+7. 计算节点上的任务以跨节点一致的主账户运行，不能把计算节点 Unix 账户当作用户隔离边界；
+8. 后续如需要强隔离，可引入容器、cgroup 或独立 Unix 用户。
 
 ### 17.3 文件安全
 
@@ -1271,16 +1278,23 @@ redis:
   url: redis://127.0.0.1:6379/0
 
 storage:
-  nfs_data_root: ~/data
-  nfs_env_root: ~/envs
-  users_root: ~/data/users
-  task_log_root: ~/data/logs/task_logs
-  env_package_root: ~/data/env_packages
-  env_install_log_root: ~/data/logs/env_install_logs
-  runtime_root: ~/data/runtime
-  miniconda_root: ~/envs/miniconda
-  user_env_root: ~/envs/user_envs
-  remote_code_root: ~/envs/nebulagrid_remote
+  nfs_data_root: /data
+  user_home_root: /data/user
+  user_home_template: /data/user/{user_id}
+  task_log_root: /data/logs/task_logs
+  env_package_root: /data/env_packages
+  env_install_log_root: /data/logs/env_install_logs
+  runtime_root: /data/runtime
+  miniconda_root: /data/envs/miniconda
+  user_env_root: /data/envs/user_envs
+  remote_code_root: /data/envs/nebulagrid_remote
+
+accounts:
+  main_user: ddltm
+  main_group: ddltm
+  require_same_uid_gid_on_nodes: true
+  create_child_accounts_on_master_only: true
+  child_home_template: /data/user/{user_id}
 
 scheduler:
   enabled: true
@@ -1293,7 +1307,8 @@ scheduler:
 executor:
   ssh_connect_timeout_seconds: 10
   kill_grace_seconds: 10
-  remote_runner_path: ~/envs/nebulagrid_remote/runner.py
+  ssh_username: ddltm
+  remote_runner_path: /data/envs/nebulagrid_remote/runner.py
 
 monitor:
   interval_seconds: 5
@@ -1350,13 +1365,14 @@ Nginx 负责：
 每个计算节点需要：
 
 1. 开启 SSH；
-2. master 可免密或密码登录；
-3. 安装 NVIDIA 驱动；
-4. `nvidia-smi` 可用；
-5. 通过 NFS 挂载 master 共享的 `~/data`，用于访问所有用户数据、任务日志、环境安装日志和运行时文件；
-6. 通过 NFS 挂载 master 共享的 `~/envs`，用于访问 miniconda、用户环境和节点监控/远端执行代码；
-7. `~/data` 与 `~/envs` 在 master 和所有计算节点上的路径必须一致；
-8. `runner.py`、`monitor.py`、`env_installer.py` 由 master 统一维护在 `~/envs/nebulagrid_remote/`，计算节点通过 NFS 读取并执行。
+2. 创建与 master 完全一致的主账户，例如 `ddltm`，要求用户名、密码、UID 和 GID 一致；
+3. master 可使用该主账户免密或密码登录；
+4. 不在计算节点创建平台用户子账户；子账户只存在于 master，用于用户 SSH 到主节点；
+5. 安装 NVIDIA 驱动；
+6. `nvidia-smi` 可用；
+7. 通过 NFS 挂载 master 共享的 `/data`，用于访问用户 home、任务日志、环境安装日志、运行时文件、miniconda、用户环境和节点监控/远端执行代码；
+8. `/data` 在 master 和所有计算节点上的路径必须一致；
+9. `runner.py`、`monitor.py`、`env_installer.py` 由 master 统一维护在 `/data/envs/nebulagrid_remote/`，计算节点通过 NFS 读取并以主账户执行。
 
 ---
 
