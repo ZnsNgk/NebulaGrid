@@ -1,0 +1,46 @@
+"""集中导出 ORM 模型，便于初始化数据库时一次性加载全部表定义。"""
+
+from app.db.models.core import (
+    AuditLog,
+    Env,
+    EnvInstallJob,
+    EnvPackage,
+    EnvPackageManifest,
+    Gpu,
+    GpuMetric,
+    LoginSession,
+    Node,
+    NodeMetric,
+    Setting,
+    Task,
+    TaskAllocation,
+    TaskDependency,
+    TaskEvent,
+    TaskRequirement,
+    TaskRuntimeGuard,
+    User,
+    UserSupervisor,
+)
+
+__all__ = [
+    "AuditLog",
+    "Env",
+    "EnvInstallJob",
+    "EnvPackage",
+    "EnvPackageManifest",
+    "Gpu",
+    "GpuMetric",
+    "LoginSession",
+    "Node",
+    "NodeMetric",
+    "Setting",
+    "Task",
+    "TaskAllocation",
+    "TaskDependency",
+    "TaskEvent",
+    "TaskRequirement",
+    "TaskRuntimeGuard",
+    "User",
+    "UserSupervisor",
+]
+
