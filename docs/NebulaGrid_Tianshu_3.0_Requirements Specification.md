@@ -276,18 +276,17 @@ nebulagrid/
 
 | **字段**              | **类型**       | **必填**      | **说明/约束**                                                                             |
 |-----------------------|----------------|---------------|-------------------------------------------------------------------------------------------|
-| id                    | string         | 学生必填      | 校园统一认证号。非学生账号可为空，但 username 必须唯一。                                  |
+| id                    | integer        | 必填          | 平台统一识别码；创建时可由管理员指定，未指定时由数据库递增生成。                          |
 | username/name         | string         | 必填          | 登录名。建议使用姓名首字母缩写或统一命名；系统内部推荐统一称 username。                   |
 | real_name             | string         | 学生/导师必填 | 真实姓名，用于导师关系、审计和展示。                                                      |
-| role                  | enum           | 必填          | student / supervisor / admin / visual。                                                   |
-| supervisor_ids        | array/relation | 学生可填      | 一个学生可关联 1 到 2 位导师，建议使用关系表而不是 supervisor1/supervisor2 两个固定字段。 |
-| avatar                | string         | 选填          | 头像文件路径或对象存储 key。                                                              |
+| role                  | enum           | 必填          | student / mentor / admin / viewer；早期 supervisor / visual 命名分别对应 mentor / viewer。 |
+| supervisor_ids        | array/relation | 学生可填      | 一个学生可关联 1 到 2 位导师，使用 user_supervisors 关系表保存，不在 users 主表固定 supervisor1/2 字段。 |
 | password_hash         | string         | 必填          | 不可保存明文密码。使用安全哈希和随机盐。                                                  |
 | home_path/root        | string         | 必填          | 用户工作根目录，固定映射为 `/home/ddltm/data/user/<user_name>`。仅管理员可见绝对路径，普通用户只看到虚拟路径。 |
 | linux_account_name    | string         | 必填          | master 上对应的 Linux 子账户名，用于用户 SSH 到主节点；该账户不在计算节点创建。            |
 | linux_uid/linux_gid   | int            | 可选          | master 子账户 UID/GID，用于审计和排障；计算节点只保证主账户 UID/GID 与 master 一致。       |
-| state                 | enum           | 必填          | active / disabled / archived。disabled 允许登录管理文件环境，但禁止提交新任务。           |
-| created_at/updated_at | datetime       | 必填          | 记录账号创建和修改时间。                                                                  |
+| state                 | enum           | 必填          | enabled / disabled。disabled 账号不可登录，已登录会话在鉴权时会被拒绝。                    |
+| created_at            | datetime       | 必填          | 记录账号创建时间。                                                                        |
 
 ## 4.4 登录与设备状态
 
@@ -295,9 +294,14 @@ nebulagrid/
 
 | **字段**                | **说明**                                                                    |
 |-------------------------|-----------------------------------------------------------------------------|
-| login_ip                | 历史登录 IP，可按时间排序展示。                                             |
+| token_hash              | 登录令牌摘要，禁止保存原始 token。                                          |
+| login_ip                | 历史登录 IP，数据库字段为 `ip`，可按时间排序展示。                           |
+| user_agent              | 原始浏览器 User-Agent，用于审计和设备识别。                                 |
 | login_device            | 历史登录设备，使用 User-Agent 与可选设备指纹生成。                          |
-| login_time/logout_time  | 每次登录与退出时间；异常关闭浏览器时 logout_time 可为空并通过会话过期补全。 |
+| device_id               | 前端持久化设备指纹，用于区分同一 NAT/IP 下的多台设备。                       |
+| login_time/logout_time  | 每次登录与退出时间；数据库中登录时间复用 `created_at`，退出时间为 `logout_at`。 |
+| last_seen_at            | 最近活跃时间，用于推断在线状态。                                            |
+| revoked_at              | 用户或管理员手动下线时间。                                                  |
 | current_client          | 当前有效会话数量。                                                          |
 | online_ip/online_device | 当前在线会话对应的 IP 与设备。                                              |
 | state                   | online/offline，由有效会话和心跳推断，不应只依赖前端主动退出。              |
@@ -454,9 +458,9 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 
 | **对象**              | **核心字段**                                                                                                                                      | **说明**                                                        |
 |-----------------------|---------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------|
-| users                 | id, username, real_name, role, password_hash, state, home_path, linux_account_name, linux_uid, linux_gid, avatar, created_at                      | 用户基础信息与 master 子账户映射。                              |
+| users                 | id, username, real_name, role, password_hash, state, home_path, linux_account_name, linux_uid, linux_gid, created_at                              | 用户基础信息与 master 子账户映射。                              |
 | user_supervisors      | student_id, supervisor_id                                                                                                                         | 学生与导师多对多关系，限制每名学生 1-2 位导师。                 |
-| login_sessions        | user_id, ip, user_agent, login_at, logout_at, expires_at, revoked                                                                                 | 登录设备与在线状态。                                            |
+| login_sessions        | user_id, token_hash, ip, user_agent, login_device, device_id, last_seen_at, logout_at, expires_at, revoked_at, created_at                        | 登录设备与在线状态；只保存 token 摘要，不保存原始令牌。         |
 | nodes                 | id, name, ip, ssh_user, owner_type, owner_user_id, is_public, max_speed_mbps, state, scheduling_enabled                                           | 计算节点。                                                      |
 | gpus                  | id, node_id, gpu_index, model, total_vram_mb, schedulable, remark                                                                                 | 节点 GPU 子资源。                                               |
 | node_metrics          | InfluxDB measurement：node_id, cpu_usage, avail_ram_mb, upload_mbps, download_mbps, collected_at                                                   | 节点监控快照和历史曲线，不再保存为 PostgreSQL 表。              |
@@ -1088,5 +1092,3 @@ offline --> [*]
 2. 权限不能只靠前端：所有 API 都必须按角色和资源归属做后端校验。
 
 3. 危险操作必须可追溯：节点下线、停止任务、删除文件、修改配置、停用用户都必须二次确认并写审计。
-
-

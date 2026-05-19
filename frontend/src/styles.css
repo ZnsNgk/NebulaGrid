@@ -1053,3 +1053,30 @@ td {
   padding-top: 14px;
   border-top: 1px solid var(--line);
 }
+
+.login-management-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+
+.login-management-grid h3 {
+  margin: 6px 0 10px;
+  font-size: 16px;
+}
+
+.sub-panel {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.panel-head.compact {
+  margin-bottom: 8px;
+}
+
+.panel-head.compact h3 {
+  margin: 0;
+}

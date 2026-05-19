@@ -281,7 +281,8 @@ nebulagrid/
 
 ```mermaid
 erDiagram
-    users ||--o{ user_sessions : has
+    users ||--o{ login_sessions : has
+    users ||--o{ user_supervisors : maps
     users ||--o{ tasks : submits
     users ||--o{ environments : owns
     users ||--o{ env_install_jobs : starts
@@ -307,24 +308,48 @@ erDiagram
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| id | bigint / uuid | 内部主键 |
-| campus_id | varchar | 校园统一认证号，管理员/展示者可为空 |
-| name | varchar unique | 登录名，一般为姓名首字母缩写 |
+| id | bigint / uuid | 内部主键，同时作为平台统一识别码；创建时可由管理员指定，未指定时由数据库递增生成 |
+| username | varchar unique | 登录名，一般为姓名首字母缩写；系统内部统一使用 username |
 | real_name | varchar | 真实姓名 |
-| role | enum | student/supervisor/admin/visual |
+| role | enum | student/mentor/admin/viewer；早期文档中的 supervisor、visual 分别对应 mentor、viewer |
 | password_hash | varchar | 密码哈希，禁止明文保存 |
-| supervisor1_id | fk users.id | 第一导师 |
-| supervisor2_id | fk users.id | 第二导师 |
-| avatar_path | varchar | 头像路径 |
 | home_path | varchar | 用户真实 home 路径，固定映射为 `/home/ddltm/data/user/<user_name>`，仅管理员可见 |
 | linux_account_name | varchar | master 上对应的 Linux 子账户名；该账户只在 master 创建，用于用户 SSH 登录 |
 | linux_uid | int nullable | master 子账户 UID；用于审计和排障，不要求同步到计算节点 |
 | linux_gid | int nullable | master 子账户 GID；用于审计和排障，不要求同步到计算节点 |
 | state | enum | enabled/disabled |
 | created_at | timestamp | 创建时间 |
-| updated_at | timestamp | 更新时间 |
 
-#### 6.2.2 nodes
+#### 6.2.2 user_supervisors
+
+学生与导师关系不再固化为 `supervisor1_id`、`supervisor2_id` 两个列，而是使用关系表保存。这样可以在服务层继续限制每名学生最多两名导师，同时避免后续关系模型扩展时修改 `users` 主表。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | bigint / uuid | 内部主键 |
+| student_id | fk users.id | 学生用户 ID |
+| supervisor_id | fk users.id | 导师用户 ID，当前实现中导师角色值为 `mentor` |
+
+#### 6.2.3 login_sessions
+
+登录设备与在线状态已经持久化到 PostgreSQL。数据库只保存 token 摘要，不保存原始登录令牌；在线状态由 `last_seen_at`、`logout_at`、`revoked_at` 和后端会话过期窗口共同推断。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | bigint / uuid | 会话流水主键 |
+| user_id | fk users.id | 登录用户 |
+| token_hash | varchar unique | 登录令牌摘要，禁止保存原始 token |
+| ip | varchar nullable | 登录 IP |
+| user_agent | varchar nullable | 浏览器 User-Agent |
+| login_device | varchar nullable | 后端从 User-Agent 归纳出的设备摘要 |
+| device_id | varchar nullable | 前端生成并持久化的设备指纹，用于区分同 IP 下的多台设备 |
+| last_seen_at | timestamp nullable | 最近活跃时间 |
+| logout_at | timestamp nullable | 主动退出时间 |
+| expires_at | timestamp nullable | 预留的服务端会话过期时间 |
+| revoked_at | timestamp nullable | 用户或管理员手动下线时间 |
+| created_at | timestamp | 登录时间 |
+
+#### 6.2.4 nodes
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -1573,5 +1598,4 @@ FastAPI API Server
 ```
 
 该架构能够覆盖当前需求分析书中提出的角色管理、节点监控、任务调度、环境管理、文件管理、日志查看、用户状态、管理员后台、环境包安装和调度错误守护等需求，并为后续横向项目、软著、论文工程系统展示和实验室长期运维留下扩展空间。
-
 

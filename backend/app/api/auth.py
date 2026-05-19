@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, Header, Request
 from app.api.deps import get_current_user
 from app.core.security import parse_authorization_header
 from app.core.responses import api_success
-from app.schemas.auth import AccountUpdateRequest, LoginRequest, PasswordChangeRequest
+from app.schemas.auth import AccountUpdateRequest, LoginRequest, PasswordChangeRequest, SessionOfflineRequest
 from app.services.audit_service import record_audit
 from app.services.auth_service import (
     authenticate_user,
@@ -34,20 +34,20 @@ def login(payload: LoginRequest, request: Request):
 
 @router.post("/logout")
 def logout(request: Request, authorization: str | None = Header(default=None)):
-    """提供退出登录占位接口，后续接入服务端会话或令牌吊销表。"""
+    """退出当前登录设备。"""
     if authorization:
         logout_session(parse_authorization_header(authorization))
     return api_success(data={"logged_out": True}, request_id=request.headers.get("x-request-id"))
 
 
-@router.get("/me")
+@router.post("/me")
 def me(request: Request, current_user: UserRecord = Depends(get_current_user)):
     """根据 Authorization 令牌返回当前用户资料和权限列表。"""
     return api_success(data=build_public_user(current_user).model_dump(), request_id=request.headers.get("x-request-id"))
 
 
-@router.patch("/me")
-def patch_me(
+@router.post("/me/update")
+def post_me_update(
     payload: AccountUpdateRequest,
     request: Request,
     current_user: UserRecord = Depends(get_current_user),
@@ -58,8 +58,8 @@ def patch_me(
     return api_success(data=build_public_user(user).model_dump(), request_id=request.headers.get("x-request-id"))
 
 
-@router.post("/me/password")
-def post_me_password(
+@router.post("/password/change")
+def post_password_change(
     payload: PasswordChangeRequest,
     request: Request,
     current_user: UserRecord = Depends(get_current_user),
@@ -70,8 +70,8 @@ def post_me_password(
     return api_success(data={"password_changed": True}, request_id=request.headers.get("x-request-id"))
 
 
-@router.get("/sessions")
-def get_sessions(
+@router.post("/sessions/list")
+def post_sessions_list(
     request: Request,
     authorization: str | None = Header(default=None),
     current_user: UserRecord = Depends(get_current_user),
@@ -82,17 +82,17 @@ def get_sessions(
     return api_success(data=sessions, request_id=request.headers.get("x-request-id"))
 
 
-@router.delete("/sessions/{session_id}")
-def delete_session(
-    session_id: int,
+@router.post("/sessions/offline")
+def post_session_offline(
+    payload: SessionOfflineRequest,
     request: Request,
     authorization: str | None = Header(default=None),
     current_user: UserRecord = Depends(get_current_user),
 ):
     """手动下线当前用户指定登录设备，会话归属由服务层校验。"""
     token = parse_authorization_header(authorization)
-    session = revoke_login_session(current_user, session_id, token)
-    record_audit(current_user.id, "auth.session.offline", "login_session", str(session_id), ip=get_request_ip(request))
+    session = revoke_login_session(current_user, payload.session_id, token)
+    record_audit(current_user.id, "auth.session.offline", "login_session", str(payload.session_id), ip=get_request_ip(request))
     return api_success(data=session.model_dump(), request_id=request.headers.get("x-request-id"))
 
 

@@ -9,7 +9,8 @@ const state = {
   toast: null,
   loginError: null,
   loading: false,
-  demo: localStorage.getItem("ng_demo_mode") === "1",
+  userFilters: { user_id: "", keyword: "", role: "", state: "" },
+  loginFilters: { user_id: "", keyword: "" },
   autoRefreshSeconds: Number(localStorage.getItem("ng_dashboard_refresh_seconds") || 5),
   autoRefreshTimer: null,
   autoRefreshBusy: false,
@@ -27,11 +28,14 @@ const state = {
     files: { path: "/workspace", items: [] },
     preview: null,
     users: [],
+    mentors: [],
     settings: [],
     auditLogs: { items: [], total: 0, page: 1, page_size: 20 },
     manual: null,
     envResult: null,
     sessions: [],
+    adminOnlineUsers: [],
+    adminUserSessions: [],
   },
 };
 
@@ -55,6 +59,18 @@ const errorMessageMap = {
   "current password is invalid": "当前密码错误",
   "last admin user cannot be deleted": "不能删除最后一个管理员账号",
   "last admin user cannot be disabled": "不能停用最后一个管理员账号",
+  "last admin user cannot be downgraded": "不能降级最后一个管理员账号",
+  "username already exists": "用户名已存在",
+  "user id already exists": "统一识别码已存在",
+  "user not found": "用户不存在",
+  "only admin can change usernames": "只有管理员可以修改用户名",
+  "student can have at most two supervisors": "每名学生最多只能选择两名导师",
+  "supervisor must be mentor user": "所选导师账号无效",
+  "mentor can only manage assigned student users": "导师只能管理自己名下的学生",
+  "mentor can only reset assigned student passwords": "导师只能重置自己名下学生的密码",
+  "permission required: admin:login:read": "只有管理员可以查看登录管理",
+  "permission required: admin:login:write": "只有管理员可以下线登录设备",
+  "session not found": "登录设备不存在或已失效",
 };
 
 const roleLabels = {
@@ -74,133 +90,6 @@ const pages = [
   { id: "students", label: "学生管理", icon: "ST", roles: ["mentor"], permission: "users:read" },
   { id: "admin", label: "管理员后台", icon: "AD", roles: ["admin"], permission: "admin:settings:read" },
 ];
-
-const demoManual = `# NebulaGrid（天枢）3.0 系统架构设计书
-
-> 当前演示模式使用架构书作为使用手册占位。真实部署时页面会从后端读取 docs 目录中的 Markdown。
-
-## 1. 使用入口
-
-左侧导航按用户角色展示。学生可以使用任务、文件、环境和手册；导师额外拥有学生管理；管理员额外拥有管理员后台。
-
-## 2. 节点监控
-
-总览页面展示计算节点、CPU/GPU 使用率、可用内存/显存、上传下载和 GPU 调用进程数。历史指标写入 InfluxDB。
-
-## 3. 任务与文件
-
-任务管理用于提交训练命令、查看状态和日志；文件管理用于浏览平台开放的工作目录并预览文本文件。
-
-## 4. 环境管理
-
-环境管理用于登记用户环境，并为后续包安装、编译安装和环境检测流程预留入口。
-`;
-
-const demoStore = {
-  token: "demo-token",
-  users: [
-    {
-      id: 1,
-      username: "admin",
-      real_name: "演示管理员",
-      role: "admin",
-      state: "enabled",
-      permissions: ["*"],
-      linux_account_name: "ddltm",
-      home_path: "/home/ddltm",
-      created_at: new Date().toISOString(),
-    },
-    {
-      id: 2,
-      username: "mentor",
-      real_name: "演示导师",
-      role: "mentor",
-      state: "enabled",
-      permissions: ["dashboard:read", "nodes:read", "tasks:read", "tasks:create", "files:read", "files:write", "envs:read", "envs:write", "users:read", "users:create_student"],
-      linux_account_name: "mentor",
-      home_path: "/home/ddltm/data/user/mentor",
-      created_at: new Date().toISOString(),
-    },
-    {
-      id: 3,
-      username: "student",
-      real_name: "演示学生",
-      role: "student",
-      state: "enabled",
-      permissions: ["dashboard:read", "nodes:read", "tasks:read", "tasks:create", "files:read", "files:write", "envs:read", "envs:write"],
-      linux_account_name: "student",
-      home_path: "/home/ddltm/data/user/student",
-      created_at: new Date().toISOString(),
-    },
-  ],
-  currentUser: null,
-  nodes: [
-    {
-      id: 1,
-      name: "node-a",
-      ip: "192.168.1.21",
-      ssh_user: "ddltm",
-      max_speed_mbps: 10000,
-      state: "online",
-      scheduling_enabled: true,
-      cpu_usage: 36,
-      avail_ram_mb: 118784,
-      network_bandwidth_mbps: 10000,
-      upload_mbps: 12,
-      download_mbps: 28,
-      metric_collected_at: new Date().toISOString(),
-      gpus: [
-        { id: 1, gpu_index: 0, model: "NVIDIA A100", total_vram_mb: 40960, free_vram_mb: 31500, gpu_usage: 22, process_count: 1, schedulable: true, scheduled_occupied: true },
-        { id: 2, gpu_index: 1, model: "NVIDIA A100", total_vram_mb: 40960, free_vram_mb: 40220, gpu_usage: 0, process_count: 0, schedulable: true, scheduled_occupied: false },
-      ],
-    },
-    {
-      id: 2,
-      name: "node-b",
-      ip: "192.168.1.22",
-      ssh_user: "ddltm",
-      max_speed_mbps: null,
-      state: "offline",
-      scheduling_enabled: false,
-      cpu_usage: null,
-      avail_ram_mb: null,
-      network_bandwidth_mbps: null,
-      upload_mbps: null,
-      download_mbps: null,
-      gpus: [
-        { id: 3, gpu_index: 0, model: "RTX 4090", total_vram_mb: 24576, free_vram_mb: null, gpu_usage: null, process_count: null, schedulable: false, scheduled_occupied: false },
-      ],
-    },
-  ],
-  tasks: [],
-  envs: [
-    {
-      id: 1,
-      owner_user_id: 1,
-      name: "torch-cu121",
-      path: "/home/ddltm/envs/miniconda3/envs/torch-cu121",
-      can_modify: true,
-      description: "PyTorch CUDA 12.1",
-      source_type: "registered",
-      state: "available",
-      python_version: "3.11",
-      size_bytes: 0,
-      created_at: new Date().toISOString(),
-    },
-  ],
-  files: [
-    { name: "project", path: "/workspace/project", type: "directory", size_bytes: 0, modified_at: new Date().toISOString() },
-    { name: "train.py", path: "/workspace/train.py", type: "file", size_bytes: 2048, modified_at: new Date().toISOString() },
-    { name: "configs", path: "/workspace/configs", type: "directory", size_bytes: 0, modified_at: new Date().toISOString() },
-  ],
-  settings: [
-    { key: "scheduler.enabled", value: "true", updated_by: null, updated_at: null },
-    { key: "monitor.interval_seconds", value: "5", updated_by: null, updated_at: null },
-    { key: "metrics.backend", value: "influxdb", updated_by: null, updated_at: null },
-  ],
-  auditLogs: [],
-  sessions: [],
-};
 
 function getOrCreateDeviceId() {
   const key = "ng_device_id";
@@ -269,7 +158,6 @@ async function run(action, successText) {
 }
 
 async function api(path, options = {}) {
-  if (state.demo) return demoApi(path, options);
   const headers = { ...(options.headers || {}) };
   if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
   headers["X-NG-Device-Id"] = state.deviceId;
@@ -278,9 +166,9 @@ async function api(path, options = {}) {
   const type = response.headers.get("content-type") || "";
   const payload = type.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    const rawMessage = typeof payload === "string" ? payload : payload.message;
+    const rawMessage = typeof payload === "string" ? payload : (payload.code === "VALIDATION_ERROR" ? extractValidationMessage(payload) : payload.message);
     const message = normalizeErrorMessage(rawMessage || `HTTP ${response.status}`);
-    if (response.status === 401 && path !== "/auth/login" && (state.token || state.demo)) {
+    if (response.status === 401 && path !== "/auth/login" && state.token) {
       forceLoginRedirect(message);
     }
     throw new Error(message);
@@ -293,6 +181,26 @@ function normalizeErrorMessage(message) {
   return errorMessageMap[text] || text;
 }
 
+function extractValidationMessage(payload) {
+  const errors = payload?.data?.errors || [];
+  if (!Array.isArray(errors) || !errors.length) return payload?.message || "request validation failed";
+  const first = errors[0];
+  const field = Array.isArray(first.loc) ? first.loc.filter((part) => part !== "body").join(".") : "";
+  const labelMap = {
+    user_id: "统一识别码",
+    username: "用户名",
+    real_name: "姓名",
+    role: "角色",
+    state: "状态",
+    password: "密码",
+    current_password: "当前密码",
+    new_password: "新密码",
+    session_id: "登录设备",
+  };
+  const label = labelMap[field] || field || "请求参数";
+  return `${label}格式不正确或不能为空`;
+}
+
 function isAuthExpiredMessage(message) {
   return authExpiredMessages.has(String(message || "").trim());
 }
@@ -300,12 +208,10 @@ function isAuthExpiredMessage(message) {
 function resetLocalLoginState(message = "") {
   state.token = "";
   state.user = null;
-  state.demo = false;
   state.data.sessions = [];
   state.drawer = null;
   if (message) state.loginError = message;
   localStorage.removeItem("ng_token");
-  localStorage.removeItem("ng_demo_mode");
   state.page = "dashboard";
   if (location.hash !== "#/dashboard") {
     history.replaceState(null, "", "#/dashboard");
@@ -318,346 +224,18 @@ function forceLoginRedirect(message = "登录状态已失效，请重新登录")
   render();
 }
 
-async function demoApi(path, options = {}) {
-  const method = options.method || "GET";
-  const body = options.body && !(options.body instanceof FormData) ? JSON.parse(options.body) : null;
-  await new Promise((resolve) => window.setTimeout(resolve, 120));
-  if (path === "/health") return ok({ service: "NebulaGrid", status: "ok", environment: "demo", version: "demo" });
-  if (path === "/auth/login") return ok(loginDemoUser(body?.identity || "admin"));
-  if (path === "/auth/logout" && method === "POST") return ok(logoutDemoUser());
-  if (path === "/auth/me" && method === "PATCH") return ok(updateDemoProfile(body));
-  if (path === "/auth/me/password" && method === "POST") return ok({ password_changed: true });
-  if (path === "/auth/sessions" && method === "GET") return ok(groupDemoSessions(demoStore.sessions.filter((session) => session.user_id === demoStore.currentUser?.id)));
-  if (path.startsWith("/auth/sessions/") && method === "DELETE") return ok(revokeDemoSession(path.split("/")[3]));
-  if (path === "/auth/me") return ok(demoStore.currentUser || demoStore.users[0]);
-  if (path === "/dashboard/summary") return ok(buildDemoSummary());
-  if (path === "/nodes") return ok(demoStore.nodes);
-  if (path === "/admin/nodes" && method === "POST") return ok(addDemoNode(body));
-  if (path.includes("/reconnect")) return ok(updateDemoNode(path.split("/")[3], "reconnecting"));
-  if (path.includes("/force-offline")) return ok(updateDemoNode(path.split("/")[3], "manual_offline"));
-  if (path.startsWith("/tasks") && method === "GET") {
-    const zone = new URLSearchParams(path.split("?")[1] || "").get("state");
-    const items = filterTasksByZone(demoStore.tasks, zone || "all");
-    return ok({ items, total: items.length, page: 1, page_size: 20 });
-  }
-  if (path === "/tasks" && method === "POST") return ok(addDemoTask(body));
-  if (path.includes("/cancel")) return ok(updateDemoTask(path.split("/")[2], "cancelled"));
-  if (path.includes("/resubmit")) return ok(resubmitDemoTask(path.split("/")[2]));
-  if (path.includes("/log")) return `[${path.split("/")[2]}] demo log\ntraining loss=0.024\ncompleted`;
-  if (path === "/envs") return ok(demoStore.envs);
-  if ((path === "/envs/upload-pack" || path === "/envs/register" || path === "/envs/import-conda-pack") && method === "POST") return ok(addDemoEnv(body));
-  if (path.startsWith("/envs/") && method === "DELETE") return ok(deleteDemoEnv(path.split("/")[2]));
-  if (path.endsWith("/test")) return ok({ status: "ok", message: "demo environment is ready", python: "3.11" });
-  if (path.startsWith("/files/list")) return ok({ path: state.data.files.path || "/workspace", items: demoStore.files });
-  if (path.startsWith("/files/preview")) return ok({ path: decodeURIComponent(path.split("path=")[1] || "/workspace/train.py"), content_type: "text/plain", content: "print('hello NebulaGrid')\n", truncated: false });
-  if (path === "/users" && method === "POST") return ok(addDemoUser(body));
-  if (path.startsWith("/users/") && path.endsWith("/password") && method === "POST") return ok(resetDemoUserPassword(path.split("/")[2], body));
-  if (path.startsWith("/users/") && method === "PATCH") return ok(updateDemoUser(path.split("/")[2], body));
-  if (path.startsWith("/users/") && method === "DELETE") return ok(deleteDemoUser(path.split("/")[2]));
-  if (path === "/users") return ok(demoStore.users);
-  if (path === "/admin/settings" && method === "GET") return ok(demoStore.settings);
-  if (path === "/admin/settings" && method === "PATCH") return ok(updateDemoSettings(body.values));
-  if (path === "/admin/audit-logs") return ok({ items: demoStore.auditLogs, total: demoStore.auditLogs.length, page: 1, page_size: 20 });
-  if (path === "/manual/current") return ok({ title: `${roleName(demoStore.currentUser?.role || "admin")}使用手册`, role: demoStore.currentUser?.role || "admin", source_path: "docs/NebulaGrid_Tianshu_3.0_System Architecture Design.md", content: demoManual });
-  return ok({});
-}
-
-function ok(data) {
-  return { ok: true, code: "OK", message: "success", data, request_id: `demo-${Date.now()}` };
-}
-
-function groupDemoSessions(sessions) {
-  const sorted = [...sessions].sort((a, b) => {
-    const aScore = (a.current ? 4 : 0) + (a.state === "online" ? 2 : 0);
-    const bScore = (b.current ? 4 : 0) + (b.state === "online" ? 2 : 0);
-    if (aScore !== bScore) return bScore - aScore;
-    return new Date(b.last_seen_at || b.login_time).getTime() - new Date(a.last_seen_at || a.login_time).getTime();
-  });
-  const grouped = [];
-  sorted.forEach((session) => {
-    if (!grouped.some((item) => isSameDemoDevice(item, session))) grouped.push(session);
-  });
-  return grouped;
-}
-
-function isSameDemoDevice(a, b) {
-  if (a.user_id !== b.user_id) return false;
-  if (a.device_id && b.device_id && a.device_id === b.device_id) return true;
-  return Boolean(a.login_ip && b.login_ip && a.login_ip === b.login_ip && a.user_agent && b.user_agent && a.user_agent === b.user_agent);
-}
-
-function loginDemoUser(identity) {
-  const lowered = String(identity || "admin").toLowerCase();
-  demoStore.currentUser = demoStore.users.find((user) => user.username === lowered || user.role === lowered) || demoStore.users[0];
-  const now = nowText();
-  demoStore.sessions.forEach((session) => {
-    if (session.user_id === demoStore.currentUser.id) session.current = false;
-  });
-  const reusable = demoStore.sessions.find((session) => session.user_id === demoStore.currentUser.id && session.device_id === state.deviceId && session.state === "online");
-  if (reusable) {
-    Object.assign(reusable, {
-      login_ip: "127.0.0.1",
-      login_device: "Demo Browser on Local",
-      user_agent: navigator.userAgent,
-      login_time: now,
-      last_seen_at: now,
-      logout_time: null,
-      revoked_at: null,
-      state: "online",
-      current: true,
-    });
-  } else {
-    demoStore.sessions.unshift({
-      id: Date.now(),
-      user_id: demoStore.currentUser.id,
-      login_ip: "127.0.0.1",
-      login_device: "Demo Browser on Local",
-      device_id: state.deviceId,
-      user_agent: navigator.userAgent,
-      login_time: now,
-      last_seen_at: now,
-      logout_time: null,
-      revoked_at: null,
-      state: "online",
-      current: true,
-    });
-  }
-  return { access_token: demoStore.token, token_type: "bearer", user: demoStore.currentUser };
-}
-
-function buildDemoSummary() {
-  const totalGpus = demoStore.nodes.reduce((sum, node) => sum + node.gpus.length, 0);
-  const freeGpus = demoStore.nodes.flatMap((node) => node.gpus).filter((gpu) => gpu.schedulable && !gpu.scheduled_occupied).length;
-  return {
-    nodes_total: demoStore.nodes.length,
-    nodes_online: demoStore.nodes.filter((node) => node.state === "online").length,
-    gpus_total: totalGpus,
-    gpus_available: freeGpus,
-    tasks_waiting: demoStore.tasks.filter((task) => ["wait", "on_hold"].includes(task.state)).length,
-    tasks_running: demoStore.tasks.filter((task) => task.state === "running").length,
-    tasks_finished_today: demoStore.tasks.filter((task) => ["succeeded", "failed", "cancelled"].includes(task.state)).length,
-    viewer_role: demoStore.currentUser?.role || "admin",
-  };
-}
-
-function addDemoNode(payload) {
-  const node = {
-    id: demoStore.nodes.length + 1,
-    name: payload.name,
-    ip: payload.ip,
-    ssh_user: payload.ssh_user || "ddltm",
-    max_speed_mbps: payload.max_speed_mbps ?? null,
-    state: "offline",
-    scheduling_enabled: false,
-    cpu_usage: null,
-    avail_ram_mb: null,
-    network_bandwidth_mbps: null,
-    upload_mbps: null,
-    download_mbps: null,
-    gpus: (payload.gpu_models || []).map((model, index) => ({ id: Date.now() + index, gpu_index: index, model, total_vram_mb: 0, schedulable: true, scheduled_occupied: false })),
-  };
-  demoStore.nodes.push(node);
-  pushAudit("node.create", "node", node.name);
-  return node;
-}
-
-function updateDemoNode(nodeId, nextState) {
-  const node = demoStore.nodes.find((item) => String(item.id) === String(nodeId));
-  if (node) {
-    node.state = nextState;
-    node.scheduling_enabled = nextState === "online";
-  }
-  pushAudit(`node.${nextState}`, "node", String(nodeId));
-  return node || {};
-}
-
-function addDemoTask(payload) {
-  const id = demoStore.tasks.length + 1;
-  const task = {
-    id,
-    task_id: `NG-${String(id).padStart(6, "0")}`,
-    user_id: demoStore.currentUser?.id || 1,
-    description: payload.description || "",
-    env_id: payload.env_id,
-    workdir: payload.workdir,
-    command: payload.command,
-    state: payload.on_hold ? "on_hold" : "wait",
-    priority: payload.priority || 0,
-    on_hold: Boolean(payload.on_hold),
-    created_at: nowText(),
-    requirement: payload.requirement,
-  };
-  demoStore.tasks.unshift(task);
-  pushAudit("task.create", "task", task.task_id);
-  return task;
-}
-
-function updateDemoTask(taskId, stateName) {
-  const task = demoStore.tasks.find((item) => item.task_id === taskId);
-  if (task) task.state = stateName;
-  pushAudit("task.cancel", "task", taskId);
-  return task || {};
-}
-
-function resubmitDemoTask(taskId) {
-  const task = demoStore.tasks.find((item) => item.task_id === taskId);
-  if (!task) return {};
-  return addDemoTask({ ...task, on_hold: false });
-}
-
-function filterTasksByZone(tasks, zone) {
-  if (!zone || zone === "all") return tasks;
-  const normalized = String(zone).toLowerCase();
-  if (["wait", "waiting", "queue"].includes(normalized)) return tasks.filter((task) => ["wait", "on_hold"].includes(task.state));
-  if (["running", "exec"].includes(normalized)) return tasks.filter((task) => ["running", "preparing", "dispatching"].includes(task.state));
-  if (["history", "hist", "finished"].includes(normalized)) return tasks.filter((task) => ["succeeded", "failed", "cancelled", "alloc_error", "offline_error", "node_lost"].includes(task.state));
-  return tasks.filter((task) => task.state === normalized);
-}
-
-function addDemoEnv(payload) {
-  const env = {
-    id: demoStore.envs.length + 1,
-    owner_user_id: demoStore.currentUser?.id || 1,
-    name: payload.name,
-    path: `/home/ddltm/envs/miniconda3/envs/${payload.name}`,
-    can_modify: true,
-    description: payload.description || "",
-    source_type: "registered",
-    state: "registered",
-    python_version: payload.python_version,
-    size_bytes: 0,
-    created_at: nowText(),
-  };
-  demoStore.envs.push(env);
-  pushAudit("env.create", "env", String(env.id));
-  return env;
-}
-
-function deleteDemoEnv(envId) {
-  const index = demoStore.envs.findIndex((item) => String(item.id) === String(envId));
-  if (index < 0) return {};
-  const [env] = demoStore.envs.splice(index, 1);
-  pushAudit("env.delete", "env", String(env.id));
-  return env;
-}
-
-function addDemoUser(payload) {
-  const user = {
-    id: Math.max(...demoStore.users.map((item) => item.id)) + 1,
-    username: payload.username,
-    real_name: payload.real_name,
-    role: payload.role,
-    state: payload.state,
-    permissions: payload.role === "student" ? demoStore.users.find((item) => item.role === "student").permissions : [],
-    linux_account_name: payload.role === "admin" ? "ddltm" : payload.username,
-    home_path: payload.role === "admin" ? "/home/ddltm" : `/home/ddltm/data/user/${payload.username}`,
-    created_at: nowText(),
-  };
-  demoStore.users.push(user);
-  pushAudit("user.create", "user", user.username);
-  return user;
-}
-
-function updateDemoUser(userId, payload) {
-  const user = demoStore.users.find((item) => String(item.id) === String(userId));
-  if (!user) return {};
-  if (payload.real_name) user.real_name = payload.real_name;
-  if (payload.role) {
-    user.role = payload.role;
-    user.permissions = payload.role === "student"
-      ? demoStore.users.find((item) => item.role === "student")?.permissions || []
-      : payload.role === "admin" ? ["*"] : user.permissions || [];
-    user.linux_account_name = payload.role === "admin" ? "ddltm" : user.username;
-    user.home_path = payload.role === "admin" ? "/home/ddltm" : `/home/ddltm/data/user/${user.username}`;
-  }
-  if (payload.state) user.state = payload.state;
-  pushAudit("user.update", "user", String(user.id));
-  return user;
-}
-
-function resetDemoUserPassword(userId) {
-  const user = demoStore.users.find((item) => String(item.id) === String(userId));
-  if (user) pushAudit("user.password.reset", "user", String(user.id));
-  return user || {};
-}
-
-function updateDemoProfile(payload) {
-  if (!demoStore.currentUser) demoStore.currentUser = demoStore.users[0];
-  demoStore.currentUser.real_name = payload.real_name;
-  const user = demoStore.users.find((item) => item.id === demoStore.currentUser.id);
-  if (user) user.real_name = demoStore.currentUser.real_name;
-  pushAudit("user.profile.update", "user", String(demoStore.currentUser.id));
-  return demoStore.currentUser;
-}
-
-function logoutDemoUser() {
-  const session = demoStore.sessions.find((item) => item.current && item.state === "online");
-  if (session) {
-    session.state = "offline";
-    session.logout_time = nowText();
-    session.current = false;
-  }
-  return { logged_out: true };
-}
-
-function revokeDemoSession(sessionId) {
-  const session = demoStore.sessions.find((item) => String(item.id) === String(sessionId));
-  if (session) {
-    const now = nowText();
-    demoStore.sessions.forEach((item) => {
-      if (!isSameDemoDevice(item, session)) return;
-      item.state = "offline";
-      item.revoked_at = item.revoked_at || now;
-      item.logout_time = item.logout_time || now;
-    });
-  }
-  pushAudit("auth.session.offline", "login_session", String(sessionId));
-  return session || {};
-}
-
-function deleteDemoUser(userId) {
-  const index = demoStore.users.findIndex((item) => String(item.id) === String(userId));
-  if (index < 0) return {};
-  const target = demoStore.users[index];
-  if (target.role === "admin" && demoStore.users.filter((item) => item.role === "admin").length <= 1) {
-    throw new Error("last admin user cannot be deleted");
-  }
-  demoStore.users.splice(index, 1);
-  pushAudit("user.delete", "user", String(userId));
-  return target;
-}
-
-function updateDemoSettings(values) {
-  Object.entries(values).forEach(([key, value]) => {
-    const item = demoStore.settings.find((setting) => setting.key === key);
-    if (item) {
-      item.value = value;
-      item.updated_by = demoStore.currentUser?.id || 1;
-      item.updated_at = nowText();
-    } else {
-      demoStore.settings.push({ key, value, updated_by: demoStore.currentUser?.id || 1, updated_at: nowText() });
-    }
-  });
-  pushAudit("settings.update", "settings", Object.keys(values).join(","));
-  return demoStore.settings;
-}
-
-function pushAudit(action, targetType, targetId) {
-  demoStore.auditLogs.unshift({
-    id: demoStore.auditLogs.length + 1,
-    actor_user_id: demoStore.currentUser?.id || 1,
-    action,
-    target_type: targetType,
-    target_id: targetId,
-    ip: "demo",
-    result: "success",
-    created_at: nowText(),
-    detail_json: {},
-  });
-}
-
 function formValue(form, name) {
   return String(new FormData(form).get(name) || "").trim();
+}
+
+function cleanObject(values) {
+  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== "" && value !== null && value !== undefined));
+}
+
+function cleanUserFilters(filters) {
+  const body = cleanObject(filters || {});
+  if (body.user_id) body.user_id = Number(body.user_id);
+  return body;
 }
 
 function parseList(value) {
@@ -693,21 +271,9 @@ function navigateAfterLogin() {
   }
 }
 
-async function enterDemo(role = "admin") {
-  state.demo = true;
-  localStorage.setItem("ng_demo_mode", "1");
-  const payload = await demoApi("/auth/login", { method: "POST", body: JSON.stringify({ identity: role, password: "demo" }) });
-  state.token = payload.data.access_token;
-  state.user = payload.data.user;
-  state.loginError = null;
-  navigateAfterLogin();
-  await refreshPage();
-  updateRealtimeTimers();
-}
-
 async function logout() {
   try {
-    if (state.token || state.demo) await api("/auth/logout", { method: "POST" });
+    if (state.token) await api("/auth/logout", { method: "POST" });
   } catch (error) {
     console.warn("logout request failed", error);
   }
@@ -716,8 +282,8 @@ async function logout() {
 }
 
 async function loadMe() {
-  if (!state.token && !state.demo) return;
-  const payload = await api("/auth/me");
+  if (!state.token) return;
+  const payload = await api("/auth/me", { method: "POST" });
   state.user = payload.data;
   ensureVisiblePage();
 }
@@ -745,14 +311,21 @@ async function refreshPage() {
       state.data.manual = (await api("/manual/current")).data;
     },
     account: async () => {
-      state.data.sessions = (await api("/auth/sessions")).data;
+      state.data.sessions = (await api("/auth/sessions/list", { method: "POST" })).data;
     },
     students: async () => {
-      state.data.users = (await api("/users")).data;
+      const filters = cleanUserFilters({ ...state.userFilters, role: "student" });
+      state.data.users = (await api("/users/list", { method: "POST", body: JSON.stringify(filters) })).data;
     },
     admin: async () => {
       state.data.nodes = (await api("/nodes")).data;
-      state.data.users = (await api("/users")).data;
+      state.data.users = (await api("/users/list", { method: "POST", body: JSON.stringify(cleanUserFilters(state.userFilters)) })).data;
+      state.data.mentors = (await api("/users/list", { method: "POST", body: JSON.stringify({ role: "mentor" }) })).data;
+      state.data.adminOnlineUsers = (await api("/admin/login-management/online-users", { method: "POST", body: JSON.stringify({}) })).data;
+      const loginQuery = cleanObject(state.loginFilters);
+      state.data.adminUserSessions = Object.keys(loginQuery).length
+        ? (await api("/admin/login-management/user-sessions", { method: "POST", body: JSON.stringify(loginQuery) })).data
+        : [];
       state.data.settings = (await api("/admin/settings")).data;
       state.data.auditLogs = (await api("/admin/audit-logs")).data;
     },
@@ -761,7 +334,11 @@ async function refreshPage() {
 }
 
 function navigate(page) {
+  const previousPage = state.page;
   state.page = page;
+  if (page !== previousPage && ["admin", "students"].includes(page)) {
+    state.userFilters = { user_id: "", keyword: "", role: "", state: "" };
+  }
   location.hash = `/${page}`;
   state.drawer = null;
   updateRealtimeTimers();
@@ -805,11 +382,16 @@ async function autoRefreshDashboard() {
 }
 
 async function refreshSessionsLive() {
-  if (!state.user || state.page !== "account" || state.sessionRefreshBusy) return;
+  if (!state.user || state.sessionRefreshBusy) return;
   state.sessionRefreshBusy = true;
   try {
-    state.data.sessions = (await api("/auth/sessions")).data;
-    renderSessionPanelOnly();
+    if (state.page === "account") {
+      state.data.sessions = (await api("/auth/sessions/list", { method: "POST" })).data;
+      renderSessionPanelOnly();
+    } else if (state.page === "admin" && state.adminMenu === "logins") {
+      await refreshAdminLoginManagementData();
+      renderAdminLoginManagementOnly();
+    }
   } catch (error) {
     if (!isAuthExpiredMessage(error.message)) {
       console.warn("login device refresh failed", error);
@@ -824,7 +406,8 @@ function updateSessionRefreshTimer() {
     window.clearInterval(state.sessionRefreshTimer);
     state.sessionRefreshTimer = null;
   }
-  if (!state.user || state.page !== "account") return;
+  const needsSessionRefresh = state.user && (state.page === "account" || (state.page === "admin" && state.adminMenu === "logins"));
+  if (!needsSessionRefresh) return;
   state.sessionRefreshTimer = window.setInterval(refreshSessionsLive, LOGIN_DEVICE_REFRESH_MS);
 }
 
@@ -832,7 +415,7 @@ async function watchCurrentSession() {
   if (!state.user || state.authWatchBusy) return;
   state.authWatchBusy = true;
   try {
-    const payload = await api("/auth/me");
+    const payload = await api("/auth/me", { method: "POST" });
     state.user = payload.data;
   } catch (error) {
     if (!isAuthExpiredMessage(error.message)) {
@@ -957,16 +540,17 @@ async function previewFile(path) {
 async function submitUser(event, fixedRole = null) {
   event.preventDefault();
   const form = event.currentTarget;
-  await api("/users", {
-    method: "POST",
-    body: JSON.stringify({
-      username: formValue(form, "username"),
-      real_name: formValue(form, "real_name"),
-      role: fixedRole || formValue(form, "role"),
-      state: formValue(form, "state") || "enabled",
-      password: formValue(form, "password"),
-    }),
-  });
+  const role = fixedRole || formValue(form, "role");
+  const body = {
+    ...(formValue(form, "user_id") ? { user_id: Number(formValue(form, "user_id")) } : {}),
+    username: formValue(form, "username"),
+    real_name: formValue(form, "real_name"),
+    role,
+    state: formValue(form, "state") || "enabled",
+    password: formValue(form, "password"),
+  };
+  if (role === "student") body.supervisor_ids = selectedSupervisorIds(form);
+  await api("/users/create", { method: "POST", body: JSON.stringify(body) });
   form.reset();
   await refreshPage();
 }
@@ -974,8 +558,8 @@ async function submitUser(event, fixedRole = null) {
 async function submitProfile(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  const payload = await api("/auth/me", {
-    method: "PATCH",
+  const payload = await api("/auth/me/update", {
+    method: "POST",
     body: JSON.stringify({ real_name: formValue(form, "real_name") }),
   });
   state.user = payload.data;
@@ -985,7 +569,7 @@ async function submitProfile(event) {
 async function changePassword(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  await api("/auth/me/password", {
+  await api("/auth/password/change", {
     method: "POST",
     body: JSON.stringify({
       current_password: formValue(form, "current_password"),
@@ -1000,14 +584,17 @@ async function submitUserUpdate(event) {
   const form = event.currentTarget;
   const userId = formValue(form, "user_id");
   if (!userId) throw new Error("请先填写或选择用户 ID");
-  const body = {};
+  const body = { user_id: Number(userId) };
+  const username = formValue(form, "username");
   const realName = formValue(form, "real_name");
   const role = formValue(form, "role");
   const userState = formValue(form, "state");
+  if (username) body.username = username;
   if (realName) body.real_name = realName;
   if (role) body.role = role;
   if (userState) body.state = userState;
-  await api(`/users/${userId}`, { method: "PATCH", body: JSON.stringify(body) });
+  if (form.elements.supervisor_ids) body.supervisor_ids = selectedSupervisorIds(form);
+  await api("/users/update", { method: "POST", body: JSON.stringify(body) });
   await refreshPage();
 }
 
@@ -1017,7 +604,7 @@ async function resetUserPassword(event) {
   const userId = formValue(form, "user_id");
   const password = formValue(form, "password");
   if (!userId) throw new Error("请先填写或选择用户 ID");
-  await api(`/users/${userId}/password`, { method: "POST", body: JSON.stringify({ password }) });
+  await api("/users/password/reset", { method: "POST", body: JSON.stringify({ user_id: Number(userId), password }) });
   form.reset();
   await refreshPage();
 }
@@ -1027,9 +614,16 @@ function fillUserEditForm(userId) {
   const form = document.querySelector("#userEditForm");
   if (!user || !form) return;
   form.elements.user_id.value = user.id;
+  if (form.elements.username) form.elements.username.value = user.username || "";
   form.elements.real_name.value = user.real_name || "";
   form.elements.role.value = user.role || "student";
   form.elements.state.value = user.state || "enabled";
+  if (form.elements.supervisor_ids) {
+    const selected = new Set((user.supervisor_ids || []).map(String));
+    Array.from(form.elements.supervisor_ids.options).forEach((option) => {
+      option.selected = selected.has(String(option.value));
+    });
+  }
 }
 
 function fillPasswordResetForm(userId) {
@@ -1037,6 +631,20 @@ function fillPasswordResetForm(userId) {
   if (!form) return;
   form.elements.user_id.value = userId;
   form.elements.password.focus();
+}
+
+function selectedSupervisorIds(form) {
+  const field = form.elements.supervisor_ids;
+  if (!field) return [];
+  const values = Array.from(field.selectedOptions || []).map((option) => Number(option.value)).filter(Boolean);
+  return values.slice(0, 2);
+}
+
+function enforceSupervisorLimit(select) {
+  const selected = Array.from(select.selectedOptions || []);
+  if (selected.length <= 2) return;
+  selected.slice(2).forEach((option) => { option.selected = false; });
+  showToast("每名学生最多只能选择两名导师", "error");
 }
 
 function switchTaskZone(zone) {
@@ -1048,17 +656,95 @@ function switchTaskZone(zone) {
 function switchAdminMenu(menu) {
   state.adminMenu = menu;
   localStorage.setItem("ng_admin_menu", menu);
+  updateRealtimeTimers();
   render();
 }
 
+function updateUserFilters(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  state.userFilters = {
+    user_id: formValue(form, "user_id"),
+    keyword: formValue(form, "keyword"),
+    role: formValue(form, "role"),
+    state: formValue(form, "state"),
+  };
+  run(refreshPage, "已查询");
+}
+
+function resetUserFilters() {
+  state.userFilters = { user_id: "", keyword: "", role: "", state: "" };
+  run(refreshPage, "已重置查询");
+}
+
 async function deleteUser(userId) {
-  await api(`/users/${userId}`, { method: "DELETE" });
+  await api("/users/delete", { method: "POST", body: JSON.stringify({ user_id: Number(userId) }) });
   await refreshPage();
+}
+
+async function toggleUserState(userId, nextState) {
+  await api("/users/update", { method: "POST", body: JSON.stringify({ user_id: Number(userId), state: nextState }) });
+  await refreshPage();
+}
+
+async function refreshAdminLoginManagementData() {
+  state.data.adminOnlineUsers = (await api("/admin/login-management/online-users", { method: "POST", body: JSON.stringify({}) })).data;
+  const query = cleanObject(state.loginFilters);
+  state.data.adminUserSessions = Object.keys(query).length
+    ? (await api("/admin/login-management/user-sessions", { method: "POST", body: JSON.stringify(query) })).data
+    : [];
+}
+
+function updateLoginFilters(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  state.loginFilters = {
+    user_id: formValue(form, "user_id"),
+    keyword: formValue(form, "keyword"),
+  };
+  run(async () => {
+    await refreshAdminLoginManagementData();
+    render();
+  }, "已查询登录情况");
+}
+
+function resetLoginFilters() {
+  state.loginFilters = { user_id: "", keyword: "" };
+  run(async () => {
+    await refreshAdminLoginManagementData();
+    render();
+  }, "已重置查询");
+}
+
+function viewUserLoginSessions(userId) {
+  state.loginFilters = { user_id: String(userId), keyword: "" };
+  run(async () => {
+    await refreshAdminLoginManagementData();
+    render();
+  }, "已载入用户上线情况");
+}
+
+async function offlineAdminSession(sessionId) {
+  const session = findAdminSession(sessionId);
+  await api("/admin/login-management/offline-session", { method: "POST", body: JSON.stringify({ session_id: Number(sessionId) }) });
+  if (session?.current) {
+    forceLoginRedirect("当前登录设备已下线，请重新登录");
+    return;
+  }
+  await refreshAdminLoginManagementData();
+}
+
+function findAdminSession(sessionId) {
+  for (const item of state.data.adminUserSessions || []) {
+    const found = (item.sessions || []).find((session) => String(session.id) === String(sessionId));
+    if (found) return found;
+  }
+  return null;
 }
 
 async function offlineSession(sessionId) {
   const session = (state.data.sessions || []).find((item) => String(item.id) === String(sessionId));
-  await api(`/auth/sessions/${sessionId}`, { method: "DELETE" });
+  await api("/auth/sessions/offline", { method: "POST", body: JSON.stringify({ session_id: Number(sessionId) }) });
   if (session?.current) {
     forceLoginRedirect("当前登录设备已下线，请重新登录");
     return;
@@ -1104,11 +790,10 @@ function shell(content) {
       <main class="workspace">
         <header class="topbar">
           <div>
-            <p>${state.demo ? "演示模式" : "在线模式"} · ${escapeHtml(state.apiBase)}</p>
+            <p>在线控制台</p>
             <h1>${meta.label}</h1>
           </div>
           <div class="top-actions">
-            ${state.demo ? renderDemoRoleButtons() : ""}
             <button class="secondary" data-action="refresh">刷新</button>
           </div>
         </header>
@@ -1117,16 +802,6 @@ function shell(content) {
       ${state.drawer ? renderDrawer() : ""}
       ${state.toast ? `<div class="toast ${state.toast.type}">${escapeHtml(state.toast.text)}</div>` : ""}
       ${state.loading ? `<div class="loading">正在处理...</div>` : ""}
-    </div>
-  `;
-}
-
-function renderDemoRoleButtons() {
-  return `
-    <div class="segmented" aria-label="演示角色">
-      ${["student", "mentor", "admin"].map((role) => `
-        <button class="${state.user?.role === role ? "active" : ""}" data-demo-role="${role}">${roleName(role)}</button>
-      `).join("")}
     </div>
   `;
 }
@@ -1147,11 +822,10 @@ function renderLogin() {
       <section class="login-card">
         <h2>登录控制台</h2>
         ${state.loginError ? `<div class="login-error">${escapeHtml(state.loginError)}</div>` : ""}
-        <form id="loginForm" class="form-stack">
-          <label>账号<input name="identity" autocomplete="username" value="admin" required></label>
-          <label>密码<input name="password" type="password" autocomplete="current-password" value="admin123" required></label>
+        <form method="post" id="loginForm" class="form-stack">
+          <label>账号<input name="identity" autocomplete="username" required></label>
+          <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
           <button type="submit">登录</button>
-          <button type="button" class="secondary" data-action="demo">进入演示模式</button>
         </form>
       </section>
     </main>
@@ -1237,7 +911,7 @@ function renderTasks() {
   return shell(`
     <section class="panel">
       <div class="panel-head"><div><h2>提交训练任务</h2><span>沿用 2.0 的任务入口，但按 3.0 API 保存为结构化任务。</span></div></div>
-      <form id="taskForm" class="form-grid task-form">
+      <form method="post" id="taskForm" class="form-grid task-form">
         <label class="wide">任务描述<input name="description" placeholder="ResNet 训练 / 参数搜索 / 数据预处理"></label>
         <label>运行环境<select name="env_id"><option value="">不指定</option>${envOptions}</select></label>
         <label>优先级<input name="priority" type="number" min="0" max="100" value="0"></label>
@@ -1254,7 +928,6 @@ function renderTasks() {
       <div class="panel-head">
         <div>
           <h2>任务管理</h2>
-          <span>仿照 2.0 分为等待区、运行区和历史区；切换分区会重新请求对应任务。</span>
         </div>
         <div class="task-tabs">
           ${zones.map(([id, label]) => `<button class="secondary ${state.taskZone === id ? "active" : ""}" data-task-zone="${id}">${label}</button>`).join("")}
@@ -1281,7 +954,7 @@ function renderFiles() {
   return shell(`
     <section class="panel">
       <div class="panel-head"><div><h2>工作区文件</h2><span>文件接口会限制在后端允许开放的路径内。</span></div></div>
-      <form id="fileForm" class="path-bar">
+      <form method="post" id="fileForm" class="path-bar">
         <input name="path" value="${escapeAttr(state.data.files.path || "/workspace")}">
         <button type="submit">打开路径</button>
       </form>
@@ -1303,7 +976,7 @@ function renderEnvs() {
   return shell(`
     <section class="panel">
       <div class="panel-head"><div><h2>登记环境</h2><span>当前表单登记已有 conda 环境，后续环境包安装会接入同一页面。</span></div></div>
-      <form id="envForm" class="form-grid">
+      <form method="post" id="envForm" class="form-grid">
         <label>环境名称<input name="name" placeholder="torch-cu121" required></label>
         <label>Python 版本<input name="python_version" placeholder="3.11"></label>
         <label class="full-row">说明<input name="description" placeholder="PyTorch CUDA 12.1"></label>
@@ -1361,14 +1034,14 @@ function renderAccount() {
     <section class="split">
       <article class="panel">
         <div class="panel-head"><div><h2>修改资料</h2><span>用户名、角色和状态由管理员后台维护。</span></div></div>
-        <form id="profileForm" class="form-grid compact-form">
+        <form method="post" id="profileForm" class="form-grid compact-form">
           <label>姓名<input name="real_name" value="${escapeAttr(state.user?.real_name || "")}" required></label>
           <div class="form-actions"><button type="submit">保存资料</button></div>
         </form>
       </article>
       <article class="panel">
         <div class="panel-head"><div><h2>重设密码</h2><span>修改密码需要先输入当前密码。</span></div></div>
-        <form id="passwordForm" class="form-grid compact-form">
+        <form method="post" id="passwordForm" class="form-grid compact-form">
           <label>当前密码<input name="current_password" type="password" required></label>
           <label>新密码<input name="new_password" type="password" minlength="8" required></label>
           <div class="form-actions"><button type="submit">更新密码</button></div>
@@ -1382,38 +1055,43 @@ function renderAccount() {
 function renderStudents() {
   const students = (state.data.users || []).filter((user) => user.role === "student");
   return shell(`
-    <section class="panel">
-      <div class="panel-head"><div><h2>创建学生账号</h2><span>导师账号只能创建学生，不能创建导师或管理员。</span></div></div>
-      <form id="studentForm" class="form-grid">
-        <label>用户名<input name="username" required></label>
-        <label>姓名<input name="real_name" required></label>
-        <label>初始密码<input name="password" type="password" minlength="8" required></label>
-        <input type="hidden" name="state" value="enabled">
-        <div class="form-actions"><button type="submit">创建学生</button></div>
-      </form>
-    </section>
-    <section class="split">
-      <article class="panel">
-        <div class="panel-head"><div><h2>编辑学生</h2><span>可从列表点“编辑”自动填入。</span></div></div>
-        <form id="userEditForm" class="form-grid compact-form">
-          <label>用户 ID<input name="user_id" type="number" min="1" required></label>
+    <section class="admin-grid">
+      <article class="panel admin-card">
+        <div class="panel-head"><div><h2>创建学生账号</h2><span>创建后会自动绑定到当前导师名下。</span></div></div>
+        <form method="post" id="studentForm" class="form-grid compact-form">
+          <label>统一识别码<input name="user_id" type="number" min="1" placeholder="留空自动分配"></label>
+          <label>用户名<input name="username" required></label>
+          <label>姓名<input name="real_name" required></label>
+          <label>状态<select name="state"><option value="enabled">启用</option><option value="disabled">停用</option></select></label>
+          <label>初始密码<input name="password" type="password" minlength="8" required></label>
+          <div class="form-actions"><button type="submit">创建学生</button></div>
+        </form>
+      </article>
+      <article class="panel admin-card">
+        <div class="panel-head"><div><h2>编辑学生</h2><span>可从列表点“编辑”自动填入，导师只能管理自己名下学生。</span></div></div>
+        <form method="post" id="userEditForm" class="form-grid compact-form">
+          <label>统一识别码<input name="user_id" type="number" min="1" required></label>
           <label>姓名<input name="real_name" placeholder="留空则不改"></label>
-          <label>状态<select name="state"><option value="">不修改</option><option value="enabled">启用</option><option value="disabled">禁用</option></select></label>
+          <label>状态<select name="state"><option value="">不修改</option><option value="enabled">启用</option><option value="disabled">停用</option></select></label>
           <input type="hidden" name="role" value="">
           <div class="form-actions"><button type="submit">保存修改</button></div>
         </form>
-      </article>
-      <article class="panel">
-        <div class="panel-head"><div><h2>重置学生密码</h2><span>重置后请提醒学生尽快自行修改密码。</span></div></div>
-        <form id="passwordResetForm" class="form-grid compact-form">
-          <label>用户 ID<input name="user_id" type="number" min="1" required></label>
+        <form method="post" id="passwordResetForm" class="form-grid compact-form reset-form">
+          <label>统一识别码<input name="user_id" type="number" min="1" required></label>
           <label>新密码<input name="password" type="password" minlength="8" required></label>
           <div class="form-actions"><button type="submit" class="secondary">重置密码</button></div>
         </form>
       </article>
     </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>学生列表</h2><span>后续可在这里接入导师-学生绑定关系。</span></div></div>
+    <section class="panel admin-card">
+      <div class="panel-head"><div><h2>学生列表</h2><span>支持按统一识别码、用户名、姓名和状态查询，布局与管理员用户管理保持一致。</span></div></div>
+      <form method="post" id="userSearchForm" class="form-grid compact-form search-form">
+        <label>统一识别码<input name="user_id" type="number" min="1" value="${escapeAttr(state.userFilters.user_id || "")}" placeholder="精确查询用户 ID"></label>
+        <label>关键词<input name="keyword" value="${escapeAttr(state.userFilters.keyword || "")}" placeholder="用户名 / 姓名"></label>
+        <label>状态<select name="state">${renderSelectOptions([["", "全部状态"], ["enabled", "启用"], ["disabled", "停用"]], state.userFilters.state)}</select></label>
+        <input type="hidden" name="role" value="student">
+        <div class="form-actions"><button type="submit">查询</button><button type="button" class="secondary" data-action="reset-user-filters">重置</button></div>
+      </form>
       ${students.length ? renderUserTable(students) : renderEmpty("暂无学生账号")}
     </section>
   `);
@@ -1430,15 +1108,12 @@ function renderAdmin() {
     ["overview", "总览"],
     ["nodes", "节点管理"],
     ["users", "用户管理"],
+    ["logins", "登录管理"],
     ["settings", "系统设置"],
     ["audit", "审计日志"],
   ];
   return shell(`
     <section class="admin-head">
-      <div>
-        <h2>管理员后台</h2>
-        <p>仅管理员账号可访问 · ${escapeHtml(state.user?.username || "-")} · 仿照 2.0 后台使用菜单切换内容区</p>
-      </div>
       <div class="admin-actions">
         <button class="secondary" data-nav="dashboard">返回控制台</button>
         <button data-action="refresh">刷新后台数据</button>
@@ -1449,18 +1124,20 @@ function renderAdmin() {
     </section>
     <section class="admin-stats">
       ${renderAdminStat("Web 用户", users.length)}
+      ${renderAdminStat("在线用户", (state.data.adminOnlineUsers || []).length)}
       ${renderAdminStat("配置节点", nodes.length)}
       ${renderAdminStat("在线节点", onlineNodes)}
       ${renderAdminStat("下线节点", offlineNodes)}
     </section>
-    ${renderAdminMenuContent(state.adminMenu, { nodes, users, settings, auditItems })}
+    ${renderAdminMenuContent(state.adminMenu, { nodes, users, settings, auditItems, onlineUsers: state.data.adminOnlineUsers || [], userSessions: state.data.adminUserSessions || [] })}
   `);
 }
 
 function renderAdminMenuContent(menu, data) {
-  const selected = ["overview", "nodes", "users", "settings", "audit"].includes(menu) ? menu : "overview";
+  const selected = ["overview", "nodes", "users", "logins", "settings", "audit"].includes(menu) ? menu : "overview";
   if (selected === "nodes") return renderAdminNodes(data.nodes);
   if (selected === "users") return renderAdminUsers(data.users);
+  if (selected === "logins") return renderAdminLoginManagement(data.onlineUsers, data.userSessions);
   if (selected === "settings") return renderAdminSettings(data.settings);
   if (selected === "audit") return renderAdminAudit(data.auditItems);
   return renderAdminOverview(data);
@@ -1474,6 +1151,7 @@ function renderAdminOverview({ nodes, users, auditItems }) {
         <div class="panel-head"><div><h2>运行状态</h2><span>汇总当前后台可管理对象。</span></div></div>
         <dl class="kv">
           <dt>用户</dt><dd>${users.length} 个</dd>
+          <dt>在线用户</dt><dd>${(state.data.adminOnlineUsers || []).length} 个</dd>
           <dt>节点</dt><dd>${nodes.length} 个</dd>
           <dt>在线节点</dt><dd>${nodes.filter((node) => node.state === "online").length} 个</dd>
           <dt>审计记录</dt><dd>${auditItems.length} 条</dd>
@@ -1495,7 +1173,7 @@ function renderAdminNodes(nodes) {
   return `
     <section class="panel admin-card">
       <div class="panel-head"><div><h2>节点管理</h2><span>登记计算节点，重连或下线会写入审计日志。</span></div></div>
-      <form id="nodeForm" class="form-grid">
+      <form method="post" id="nodeForm" class="form-grid">
         <label>节点名称<input name="name" placeholder="node-a" required></label>
         <label>IP 地址<input name="ip" placeholder="192.168.1.21" required></label>
         <label>SSH 用户<input name="ssh_user" value="ddltm"></label>
@@ -1518,43 +1196,125 @@ function renderAdminUsers(users) {
     <section class="admin-grid">
       <article class="panel admin-card">
         <div class="panel-head"><div><h2>创建账号</h2><span>管理员用 ddltm SSH，学生和导师创建独立账户。</span></div></div>
-        <form id="userForm" class="form-grid compact-form">
+        <form method="post" id="userForm" class="form-grid compact-form">
+          <label>统一识别码<input name="user_id" type="number" min="1" placeholder="留空自动分配"></label>
           <label>用户名<input name="username" required></label>
           <label>姓名<input name="real_name" required></label>
           <label>角色<select name="role"><option value="student">学生</option><option value="mentor">导师</option><option value="admin">管理员</option><option value="viewer">展示用户</option></select></label>
-          <label>状态<select name="state"><option value="enabled">启用</option><option value="disabled">禁用</option></select></label>
+          <label>导师（学生角色有效，最多两名）<select name="supervisor_ids" multiple size="3">${renderSupervisorOptions()}</select></label>
+          <label>状态<select name="state"><option value="enabled">启用</option><option value="disabled">停用</option></select></label>
           <label>初始密码<input name="password" type="password" minlength="8" required></label>
           <div class="form-actions"><button type="submit">创建账号</button></div>
         </form>
       </article>
       <article class="panel admin-card">
         <div class="panel-head"><div><h2>编辑账号</h2><span>可从用户列表点“编辑”自动填入。</span></div></div>
-        <form id="userEditForm" class="form-grid compact-form">
-          <label>用户 ID<input name="user_id" type="number" min="1" required></label>
+        <form method="post" id="userEditForm" class="form-grid compact-form">
+          <label>统一识别码<input name="user_id" type="number" min="1" required></label>
+          <label>用户名<input name="username" placeholder="留空则不改"></label>
           <label>姓名<input name="real_name" placeholder="留空则不改"></label>
           <label>角色<select name="role"><option value="">不修改</option><option value="student">学生</option><option value="mentor">导师</option><option value="admin">管理员</option><option value="viewer">展示用户</option></select></label>
-          <label>状态<select name="state"><option value="">不修改</option><option value="enabled">启用</option><option value="disabled">禁用</option></select></label>
+          <label>导师（学生角色有效，最多两名）<select name="supervisor_ids" multiple size="3">${renderSupervisorOptions()}</select></label>
+          <label>状态<select name="state"><option value="">不修改</option><option value="enabled">启用</option><option value="disabled">停用</option></select></label>
           <div class="form-actions"><button type="submit">保存修改</button></div>
         </form>
-        <form id="passwordResetForm" class="form-grid compact-form reset-form">
-          <label>用户 ID<input name="user_id" type="number" min="1" required></label>
+        <form method="post" id="passwordResetForm" class="form-grid compact-form reset-form">
+          <label>统一识别码<input name="user_id" type="number" min="1" required></label>
           <label>新密码<input name="password" type="password" minlength="8" required></label>
           <div class="form-actions"><button type="submit" class="secondary">重置密码</button></div>
         </form>
       </article>
     </section>
     <section class="panel admin-card">
-      <div class="panel-head"><div><h2>用户列表</h2><span>支持创建、启停、改角色、重置密码和删除。</span></div></div>
+      <div class="panel-head"><div><h2>用户列表</h2><span>支持按统一识别码、用户名、姓名、角色和状态查询。</span></div></div>
+      <form method="post" id="userSearchForm" class="form-grid compact-form search-form">
+        <label>统一识别码<input name="user_id" type="number" min="1" value="${escapeAttr(state.userFilters.user_id || "")}" placeholder="精确查询用户 ID"></label>
+        <label>关键词<input name="keyword" value="${escapeAttr(state.userFilters.keyword || "")}" placeholder="用户名 / 姓名"></label>
+        <label>角色<select name="role">${renderSelectOptions([["", "全部角色"], ["student", "学生"], ["mentor", "导师"], ["admin", "管理员"], ["viewer", "展示用户"]], state.userFilters.role)}</select></label>
+        <label>状态<select name="state">${renderSelectOptions([["", "全部状态"], ["enabled", "启用"], ["disabled", "停用"]], state.userFilters.state)}</select></label>
+        <div class="form-actions"><button type="submit">查询</button><button type="button" class="secondary" data-action="reset-user-filters">重置</button></div>
+      </form>
       ${users.length ? renderUserTable(users) : renderEmpty("暂无账号")}
     </section>
   `;
+}
+
+function renderAdminLoginManagement(onlineUsers = [], userSessions = []) {
+  return `
+    <section class="panel admin-card" id="adminLoginManagementPanel">
+      <div class="panel-head"><div><h2>登录管理</h2><span>查看当前在线用户，按用户查询上线 IP、设备、浏览器和最后活跃时间；本面板每 3 秒局部刷新。</span></div></div>
+      <div class="login-management-grid">
+        <article>
+          <h3>当前在线用户</h3>
+          <div id="adminOnlineUsersBlock">${renderAdminOnlineUsersBlock(onlineUsers)}</div>
+        </article>
+        <article>
+          <h3>查询用户上线情况</h3>
+          <form method="post" id="loginSearchForm" class="form-grid compact-form search-form">
+            <label>统一识别码<input name="user_id" type="number" min="1" value="${escapeAttr(state.loginFilters.user_id || "")}" placeholder="精确查询用户 ID"></label>
+            <label>关键词<input name="keyword" value="${escapeAttr(state.loginFilters.keyword || "")}" placeholder="用户名 / 姓名"></label>
+            <div class="form-actions"><button type="submit">查询</button><button type="button" class="secondary" data-action="reset-login-filters">重置</button></div>
+          </form>
+          <div id="adminUserSessionsBlock">${renderAdminUserSessions(userSessions)}</div>
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function renderAdminOnlineUsersBlock(onlineUsers = []) {
+  return onlineUsers.length ? renderOnlineUsersTable(onlineUsers) : renderEmpty("暂无在线用户");
+}
+
+function renderOnlineUsersTable(onlineUsers) {
+  return renderTable(["用户", "角色", "在线设备", "IP / 设备", "最后活跃", "操作"], onlineUsers.map((user) => [
+    `<strong>#${escapeHtml(user.id)} ${escapeHtml(user.real_name)}</strong><br><span class="muted">${escapeHtml(user.username)} · ${stateText(user.state)}</span>`,
+    roleName(user.role),
+    `${escapeHtml(user.online_sessions || 0)} 台`,
+    `<span class="muted">IP：${escapeHtml((user.login_ips || []).join("、") || "-")}</span><br><span class="muted">设备：${escapeHtml((user.login_devices || []).join("、") || "-")}</span>`,
+    formatDate(user.last_seen_at),
+    `<button class="small secondary" data-view-login-user="${user.id}">查看上线情况</button>`,
+  ]));
+}
+
+function renderAdminUserSessions(items = []) {
+  if (!state.loginFilters.user_id && !state.loginFilters.keyword) {
+    return renderEmpty("请选择在线用户或输入统一识别码 / 关键词后查询");
+  }
+  if (!items.length) return renderEmpty("未找到匹配用户或该用户暂无登录记录");
+  return items.map((item) => `
+    <section class="sub-panel">
+      <div class="panel-head compact"><div><h3>#${escapeHtml(item.id)} ${escapeHtml(item.real_name)}</h3><span>${escapeHtml(item.username)} · ${roleName(item.role)} · ${stateText(item.state)}</span></div></div>
+      ${(item.sessions || []).length ? renderAdminSessionTable(item.sessions) : renderEmpty("该用户暂无登录记录")}
+    </section>
+  `).join("");
+}
+
+function renderAdminSessionTable(sessions) {
+  return renderTable(["设备", "IP", "登录时间", "最后活跃", "状态", "操作"], sessions.map((session) => [
+    `<strong>${escapeHtml(session.login_device || "unknown device")}</strong><br><span class="muted">${escapeHtml(session.user_agent || "-")}</span>`,
+    escapeHtml(session.login_ip || "-"),
+    formatDate(session.login_time),
+    formatDate(session.last_seen_at),
+    `<span class="status ${session.state === "online" ? "online" : "offline"}">${session.current ? "当前会话 · " : ""}${stateText(session.state)}</span>`,
+    session.state === "online" ? `<button class="small danger" data-admin-offline-session="${session.id}">下线</button>` : "-",
+  ]));
+}
+
+function renderAdminLoginManagementOnly() {
+  if (state.page !== "admin" || state.adminMenu !== "logins") return;
+  const onlineBlock = document.querySelector("#adminOnlineUsersBlock");
+  if (onlineBlock) onlineBlock.innerHTML = renderAdminOnlineUsersBlock(state.data.adminOnlineUsers || []);
+  const sessionsBlock = document.querySelector("#adminUserSessionsBlock");
+  if (sessionsBlock) sessionsBlock.innerHTML = renderAdminUserSessions(state.data.adminUserSessions || []);
+  bindAdminLoginEvents();
 }
 
 function renderAdminSettings(settings) {
   return `
     <section class="panel admin-card">
       <div class="panel-head"><div><h2>系统设置</h2><span>保存后立即写入后端设置存储。</span></div></div>
-      <form id="settingForm" class="form-grid compact-form">
+      <form method="post" id="settingForm" class="form-grid compact-form">
         <label>键<input name="key" placeholder="scheduler.enabled" required></label>
         <label>值<input name="value" placeholder="true" required></label>
         <div class="form-actions"><button type="submit">保存</button></div>
@@ -1578,15 +1338,29 @@ function renderAdminAudit(auditItems) {
 }
 
 function renderUserTable(users) {
-  return renderTable(["账号", "角色", "状态", "Linux", "Home", "操作"], users.map((user) => [
-    `<strong>${escapeHtml(user.real_name)}</strong><br><span class="muted">#${user.id} · ${escapeHtml(user.username)}</span>`,
-    roleName(user.role),
-    stateText(user.state),
-    `<code>${escapeHtml(user.linux_account_name || "-")}</code>`,
-    `<code>${escapeHtml(user.home_path || "-")}</code>`,
-    `${can("users:read") ? `<button class="small secondary" data-edit-user="${user.id}">编辑</button><button class="small secondary" data-reset-user="${user.id}">重置密码</button>` : ""}${can("users:delete") ? `<button class="small danger" data-delete-user="${user.id}">删除</button>` : "-"}`,
-  ]));
+  return renderTable(["统一识别码", "账号", "角色", "状态", "导师", "Linux", "Home", "操作"], users.map((user) => {
+    const nextState = user.state === "enabled" ? "disabled" : "enabled";
+    const toggleText = user.state === "enabled" ? "停用" : "启用";
+    const supervisorText = user.role === "student" ? ((user.supervisor_names || []).length ? user.supervisor_names.map(escapeHtml).join("、") : "未绑定") : "-";
+    const actions = [
+      can("users:read") ? `<button class="small secondary" data-edit-user="${user.id}">编辑</button>` : "",
+      can("users:read") ? `<button class="small secondary" data-reset-user="${user.id}">重置密码</button>` : "",
+      can("users:read") ? `<button class="small ${user.state === "enabled" ? "danger" : "secondary"}" data-toggle-user="${user.id}" data-next-state="${nextState}">${toggleText}</button>` : "",
+      can("users:delete") ? `<button class="small danger" data-delete-user="${user.id}">删除</button>` : "",
+    ].filter(Boolean).join("");
+    return [
+      `<strong>#${escapeHtml(user.id)}</strong>`,
+      `<strong>${escapeHtml(user.real_name)}</strong><br><span class="muted">${escapeHtml(user.username)}</span>`,
+      roleName(user.role),
+      stateText(user.state),
+      supervisorText,
+      `<code>${escapeHtml(user.linux_account_name || "-")}</code>`,
+      `<code>${escapeHtml(user.home_path || "-")}</code>`,
+      actions || "-",
+    ];
+  }));
 }
+
 
 function renderSessionTable(sessions) {
   return renderTable(["设备", "IP", "登录时间", "最后活跃", "状态", "操作"], sessions.map((session) => [
@@ -1613,6 +1387,18 @@ function renderSessionPanelOnly() {
   if (!panel || state.page !== "account") return;
   panel.outerHTML = renderSessionPanel(state.data.sessions || []);
   bindSessionEvents();
+}
+
+function renderSupervisorOptions(selected = []) {
+  const selectedSet = new Set((selected || []).map(String));
+  const mentors = (state.data.mentors || []).filter((user) => user.role === "mentor");
+  return mentors.length
+    ? mentors.map((mentor) => `<option value="${escapeAttr(mentor.id)}" ${selectedSet.has(String(mentor.id)) ? "selected" : ""}>#${escapeHtml(mentor.id)} ${escapeHtml(mentor.real_name)}（${escapeHtml(mentor.username)}）</option>`).join("")
+    : `<option disabled>暂无导师账号</option>`;
+}
+
+function renderSelectOptions(options, selected) {
+  return options.map(([value, label]) => `<option value="${escapeAttr(value)}" ${String(value) === String(selected || "") ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
 }
 
 function renderTable(headers, rows) {
@@ -1806,7 +1592,7 @@ function stateText(value) {
     available: "可用",
     registered: "已登记",
     enabled: "启用",
-    disabled: "禁用",
+    disabled: "停用",
   };
   return map[value] || value || "-";
 }
@@ -1884,11 +1670,16 @@ function bindEvents() {
   document.querySelector("#nodeForm")?.addEventListener("submit", (event) => run(() => submitNode(event), "节点已登记"));
   document.querySelector("#taskForm")?.addEventListener("submit", (event) => run(() => submitTask(event), "任务已提交"));
   document.querySelector("#envForm")?.addEventListener("submit", (event) => run(() => submitEnv(event), "环境已登记"));
+  document.querySelector("#profileForm")?.addEventListener("submit", (event) => run(() => submitProfile(event), "资料已保存"));
+  document.querySelector("#passwordForm")?.addEventListener("submit", (event) => run(() => changePassword(event), "密码已更新"));
   document.querySelector("#userForm")?.addEventListener("submit", (event) => run(() => submitUser(event), "账号已创建"));
   document.querySelector("#studentForm")?.addEventListener("submit", (event) => run(() => submitUser(event, "student"), "学生已创建"));
   document.querySelector("#settingForm")?.addEventListener("submit", (event) => run(() => updateSetting(event), "设置已保存"));
   document.querySelector("#userEditForm")?.addEventListener("submit", (event) => run(() => submitUserUpdate(event), "账号已更新"));
   document.querySelector("#passwordResetForm")?.addEventListener("submit", (event) => run(() => resetUserPassword(event), "密码已重置"));
+  document.querySelector("#userSearchForm")?.addEventListener("submit", (event) => updateUserFilters(event));
+  document.querySelector("[data-action='reset-user-filters']")?.addEventListener("click", () => resetUserFilters());
+  bindAdminLoginEvents();
   document.querySelector("#fileForm")?.addEventListener("submit", (event) => {
     event.preventDefault();
     run(() => openPath(formValue(event.currentTarget, "path")));
@@ -1897,12 +1688,10 @@ function bindEvents() {
   document.querySelector("[data-action='logout']")?.addEventListener("click", () => run(logout));
   document.querySelectorAll("[data-action='refresh']").forEach((button) => button.addEventListener("click", () => run(refreshPage, "已刷新")));
   document.querySelector("[name='dashboard_refresh_seconds']")?.addEventListener("change", (event) => setDashboardRefreshSeconds(event.currentTarget.value));
-  document.querySelector("[data-action='demo']")?.addEventListener("click", () => run(() => enterDemo("admin"), "已进入演示模式"));
   document.querySelector("[data-action='close-drawer']")?.addEventListener("click", () => {
     state.drawer = null;
     render();
   });
-  document.querySelectorAll("[data-demo-role]").forEach((button) => button.addEventListener("click", () => run(() => enterDemo(button.dataset.demoRole), `已切换为${roleName(button.dataset.demoRole)}`)));
   document.querySelectorAll("[data-task-zone]").forEach((button) => button.addEventListener("click", () => switchTaskZone(button.dataset.taskZone)));
   document.querySelectorAll("[data-admin-menu]").forEach((button) => button.addEventListener("click", () => switchAdminMenu(button.dataset.adminMenu)));
   document.querySelectorAll("[data-cancel]").forEach((button) => button.addEventListener("click", () => run(() => cancelTask(button.dataset.cancel), "任务已取消")));
@@ -1915,9 +1704,18 @@ function bindEvents() {
   document.querySelectorAll("[data-edit-user]").forEach((button) => button.addEventListener("click", () => fillUserEditForm(button.dataset.editUser)));
   document.querySelectorAll("[data-reset-user]").forEach((button) => button.addEventListener("click", () => fillPasswordResetForm(button.dataset.resetUser)));
   document.querySelectorAll("[data-delete-user]").forEach((button) => button.addEventListener("click", () => run(() => deleteUser(button.dataset.deleteUser), "账号已删除")));
+  document.querySelectorAll("[data-toggle-user]").forEach((button) => button.addEventListener("click", () => run(() => toggleUserState(button.dataset.toggleUser, button.dataset.nextState), button.dataset.nextState === "enabled" ? "账号已启用" : "账号已停用")));
+  document.querySelectorAll("select[name='supervisor_ids']").forEach((select) => select.addEventListener("change", () => enforceSupervisorLimit(select)));
   bindSessionEvents();
   document.querySelectorAll("[data-reconnect-node]").forEach((button) => button.addEventListener("click", () => run(() => reconnectNode(button.dataset.reconnectNode), "已提交重连")));
   document.querySelectorAll("[data-offline-node]").forEach((button) => button.addEventListener("click", () => run(() => forceOfflineNode(button.dataset.offlineNode), "已强制下线")));
+}
+
+function bindAdminLoginEvents() {
+  document.querySelector("#loginSearchForm")?.addEventListener("submit", (event) => updateLoginFilters(event));
+  document.querySelector("[data-action='reset-login-filters']")?.addEventListener("click", () => resetLoginFilters());
+  document.querySelectorAll("[data-view-login-user]").forEach((button) => button.addEventListener("click", () => viewUserLoginSessions(button.dataset.viewLoginUser)));
+  document.querySelectorAll("[data-admin-offline-session]").forEach((button) => button.addEventListener("click", () => run(() => offlineAdminSession(button.dataset.adminOfflineSession), "设备已下线")));
 }
 
 function bindSessionEvents() {
@@ -1932,11 +1730,6 @@ window.addEventListener("hashchange", () => {
     run(refreshPage);
   }
 });
-
-if (state.demo && !demoStore.currentUser) {
-  demoStore.currentUser = demoStore.users[0];
-  state.user = demoStore.currentUser;
-}
 
 loadMe().then(refreshPage).catch(() => null).finally(() => {
   updateRealtimeTimers();

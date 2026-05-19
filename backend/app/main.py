@@ -7,6 +7,7 @@ from app.api.router import get_api_router
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.responses import api_error
+from app.db.init_db import init_database
 
 
 def create_app() -> FastAPI:
@@ -28,7 +29,22 @@ def create_app() -> FastAPI:
     )
     app.include_router(get_api_router(), prefix="/api")
     register_exception_handlers(app)
+    register_startup_tasks(app)
     return app
+
+
+def register_startup_tasks(app: FastAPI) -> None:
+    """启动时确保用户登录依赖的数据库表和默认管理员已存在。
+
+    用户管理已从内存数据切换到 PostgreSQL，因此登录接口不再自带演示账号兜底。
+    这里复用幂等的初始化逻辑，只创建缺失表和缺失默认数据，避免本地联调或新部署时忘记
+    执行 scripts/init_db.py 导致 /api/auth/login 直接抛数据库异常。
+    """
+
+    @app.on_event("startup")
+    def initialize_database_on_startup() -> None:
+        """执行幂等数据库初始化；连接失败时让启动失败，便于运维尽早看到真实配置问题。"""
+        init_database()
 
 
 def register_exception_handlers(app: FastAPI) -> None:

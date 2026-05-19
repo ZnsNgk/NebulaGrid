@@ -1,13 +1,20 @@
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Header, Query, Request
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.responses import api_success
+from app.core.security import parse_authorization_header
 from app.db.session import get_db
 from app.schemas.admin import SettingsUpdateRequest
+from app.schemas.auth import AdminLoginSessionOfflineRequest, AdminLoginSessionQuery
 from app.schemas.nodes import NodeCreateRequest
 from app.services.audit_service import list_audit_logs, list_settings, update_settings
-from app.services.auth_service import UserRecord
+from app.services.auth_service import (
+    UserRecord,
+    list_admin_online_users,
+    list_admin_user_login_sessions,
+    offline_login_session_as_admin,
+)
 from app.services.node_service import create_node, force_offline_node, reconnect_node
 
 router = APIRouter()
@@ -47,6 +54,53 @@ def post_admin_node_force_offline(
     """管理员强制节点下线并关闭调度。"""
     node = force_offline_node(current_user, node_id, db)
     return api_success(data=node.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+
+
+@router.post("/login-management/online-users")
+def post_admin_online_users(
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """登录管理：查看当前在线用户。"""
+    users = [item.model_dump() for item in list_admin_online_users(current_user)]
+    return api_success(data=users, request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/login-management/user-sessions")
+def post_admin_user_login_sessions(
+    request: Request,
+    payload: AdminLoginSessionQuery | None = Body(default=None),
+    authorization: str | None = Header(default=None),
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """登录管理：查看某个用户的上线设备、IP 和在线状态。"""
+    payload = payload or AdminLoginSessionQuery()
+    token = parse_authorization_header(authorization) if authorization else None
+    items = [
+        item.model_dump()
+        for item in list_admin_user_login_sessions(
+            current_user,
+            user_id=payload.user_id,
+            keyword=payload.keyword,
+            current_token=token,
+        )
+    ]
+    return api_success(data=items, request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/login-management/offline-session")
+def post_admin_offline_login_session(
+    payload: AdminLoginSessionOfflineRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """登录管理：管理员手动下线任意用户的某个登录设备。"""
+    token = parse_authorization_header(authorization) if authorization else None
+    session = offline_login_session_as_admin(current_user, payload.session_id, token)
+    return api_success(data=session.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
 @router.get("/audit-logs")

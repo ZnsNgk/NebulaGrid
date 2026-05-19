@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field
+from typing import Any
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -40,6 +42,12 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=256)
 
 
+class SessionOfflineRequest(BaseModel):
+    """手动下线登录设备请求。"""
+
+    session_id: int = Field(ge=1)
+
+
 class LoginSessionInfo(BaseModel):
     """登录设备和 IP 响应模型，用于用户自查当前在线会话和历史登录记录。"""
 
@@ -53,3 +61,48 @@ class LoginSessionInfo(BaseModel):
     revoked_at: str | None = None
     state: str
     current: bool = False
+
+class AdminLoginSessionQuery(BaseModel):
+    """管理员登录管理查询请求；统一使用 POST，避免用户标识出现在 URL 中。"""
+
+    user_id: int | None = Field(default=None, ge=1)
+    keyword: str | None = Field(default=None, max_length=128)
+
+    @field_validator("user_id", "keyword", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, value: Any) -> Any:
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
+
+class AdminLoginSessionOfflineRequest(BaseModel):
+    """管理员手动下线任意用户登录设备请求。"""
+
+    session_id: int = Field(ge=1)
+
+
+class AdminOnlineUserInfo(BaseModel):
+    """管理员登录管理中的在线用户摘要。"""
+
+    id: int
+    username: str
+    real_name: str
+    role: str
+    state: str
+    online_sessions: int
+    login_ips: list[str] = Field(default_factory=list)
+    login_devices: list[str] = Field(default_factory=list)
+    last_seen_at: str | None = None
+
+
+class AdminUserLoginSessions(BaseModel):
+    """管理员查看某一用户上线情况的响应项。"""
+
+    id: int
+    username: str
+    real_name: str
+    role: str
+    state: str
+    sessions: list[LoginSessionInfo] = Field(default_factory=list)
+
