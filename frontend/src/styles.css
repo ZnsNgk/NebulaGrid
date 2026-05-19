@@ -205,6 +205,18 @@ pre {
   margin: 0 0 18px;
 }
 
+
+.login-error {
+  margin: -4px 0 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(248, 113, 113, 0.38);
+  background: rgba(127, 29, 29, 0.28);
+  color: #fecaca;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .form-stack {
   display: grid;
   gap: 14px;
@@ -720,6 +732,9 @@ nav {
 .status.offline,
 .status.failed,
 .status.cancelled,
+.status.alloc_error,
+.status.offline_error,
+.status.node_lost,
 .status.manual_offline,
 .status.disabled {
   background: rgba(239, 68, 68, 0.12);
@@ -729,6 +744,8 @@ nav {
 
 .status.wait,
 .status.on_hold,
+.status.preparing,
+.status.dispatching,
 .status.reconnecting,
 .status.registered {
   background: rgba(245, 158, 11, 0.12);
@@ -1008,4 +1025,31 @@ td {
   .full-row {
     grid-column: auto;
   }
+}
+
+.task-tabs,
+.admin-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.task-tabs button.active,
+.admin-tabs button.active {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.68), rgba(6, 182, 212, 0.34));
+  color: #fff;
+  border-color: rgba(34, 211, 238, 0.48);
+}
+
+.zone-help {
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.reset-form {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
 }

@@ -22,7 +22,13 @@ router = APIRouter()
 @router.post("/login")
 def login(payload: LoginRequest, request: Request):
     """校验账号密码并签发临时令牌，MVP 阶段先使用内存用户便于前端联调。"""
-    login_result = authenticate_user(payload.identity, payload.password, get_request_ip(request), request.headers.get("user-agent", ""))
+    login_result = authenticate_user(
+        payload.identity,
+        payload.password,
+        get_request_ip(request),
+        request.headers.get("user-agent", ""),
+        get_request_device_id(request),
+    )
     return api_success(data=login_result.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
@@ -47,7 +53,7 @@ def patch_me(
     current_user: UserRecord = Depends(get_current_user),
 ):
     """允许用户更新自己的资料字段，用户名、角色和状态仍由管理端维护。"""
-    user = update_current_user_profile(current_user, payload.real_name, payload.avatar)
+    user = update_current_user_profile(current_user, payload.real_name)
     record_audit(user.id, "user.profile.update", "user", str(user.id), ip=get_request_ip(request))
     return api_success(data=build_public_user(user).model_dump(), request_id=request.headers.get("x-request-id"))
 
@@ -83,10 +89,10 @@ def delete_session(
     authorization: str | None = Header(default=None),
     current_user: UserRecord = Depends(get_current_user),
 ):
-    """撤销当前用户指定登录设备，会话归属由服务层校验。"""
+    """手动下线当前用户指定登录设备，会话归属由服务层校验。"""
     token = parse_authorization_header(authorization)
     session = revoke_login_session(current_user, session_id, token)
-    record_audit(current_user.id, "auth.session.revoke", "login_session", str(session_id), ip=get_request_ip(request))
+    record_audit(current_user.id, "auth.session.offline", "login_session", str(session_id), ip=get_request_ip(request))
     return api_success(data=session.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
@@ -96,3 +102,8 @@ def get_request_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",", 1)[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def get_request_device_id(request: Request) -> str:
+    """读取前端生成并持久化的设备 ID，用于区分同 IP 下的多台设备。"""
+    return request.headers.get("x-ng-device-id", "")

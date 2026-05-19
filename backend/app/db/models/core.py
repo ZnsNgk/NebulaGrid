@@ -29,7 +29,6 @@ class User(Base, TimestampMixin):
     linux_account_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     linux_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     linux_gid: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    avatar: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
 
 class UserSupervisor(Base):
@@ -53,6 +52,10 @@ class LoginSession(Base, TimestampMixin):
     token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
     ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    login_device: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    device_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    logout_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

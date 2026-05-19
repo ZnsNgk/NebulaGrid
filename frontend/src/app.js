@@ -1,14 +1,22 @@
 const state = {
   apiBase: localStorage.getItem("ng_api_base") || `${location.origin}/api`,
   token: localStorage.getItem("ng_token") || "",
+  deviceId: getOrCreateDeviceId(),
   user: null,
   page: location.hash.replace("#/", "") || "dashboard",
+  taskZone: localStorage.getItem("ng_task_zone") || "wait",
+  adminMenu: localStorage.getItem("ng_admin_menu") || "overview",
   toast: null,
+  loginError: null,
   loading: false,
   demo: localStorage.getItem("ng_demo_mode") === "1",
   autoRefreshSeconds: Number(localStorage.getItem("ng_dashboard_refresh_seconds") || 5),
   autoRefreshTimer: null,
   autoRefreshBusy: false,
+  sessionRefreshTimer: null,
+  sessionRefreshBusy: false,
+  authWatchTimer: null,
+  authWatchBusy: false,
   lastDashboardRefreshAt: null,
   drawer: null,
   data: {
@@ -25,6 +33,28 @@ const state = {
     envResult: null,
     sessions: [],
   },
+};
+
+const LOGIN_DEVICE_REFRESH_MS = 3000;
+const AUTH_WATCH_MS = 3000;
+
+const authExpiredMessages = new Set([
+  "invalid token",
+  "session offline",
+  "unauthorized",
+  "登录状态已失效，请重新登录",
+  "当前登录设备已下线，请重新登录",
+  "账号已停用，请重新登录",
+]);
+
+const errorMessageMap = {
+  "invalid token": "登录状态已失效，请重新登录",
+  "session offline": "当前登录设备已下线，请重新登录",
+  unauthorized: "登录状态已失效，请重新登录",
+  "invalid identity or password": "账号或密码错误",
+  "current password is invalid": "当前密码错误",
+  "last admin user cannot be deleted": "不能删除最后一个管理员账号",
+  "last admin user cannot be disabled": "不能停用最后一个管理员账号",
 };
 
 const roleLabels = {
@@ -172,6 +202,17 @@ const demoStore = {
   sessions: [],
 };
 
+function getOrCreateDeviceId() {
+  const key = "ng_device_id";
+  let value = localStorage.getItem(key);
+  if (!value) {
+    const random = window.crypto?.randomUUID ? window.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    value = `web-${random}`;
+    localStorage.setItem(key, value);
+  }
+  return value;
+}
+
 function can(permission) {
   if (!permission) return true;
   if (!state.user) return false;
@@ -205,11 +246,10 @@ function nowText() {
 
 function showToast(text, type = "info") {
   state.toast = { text, type };
-  render();
   window.setTimeout(() => {
     if (state.toast?.text === text) {
       state.toast = null;
-      render();
+      document.querySelector(".toast")?.remove();
     }
   }, 2800);
 }
@@ -232,15 +272,50 @@ async function api(path, options = {}) {
   if (state.demo) return demoApi(path, options);
   const headers = { ...(options.headers || {}) };
   if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
+  headers["X-NG-Device-Id"] = state.deviceId;
   if (state.token) headers.Authorization = `Bearer ${state.token}`;
   const response = await fetch(`${state.apiBase.replace(/\/$/, "")}${path}`, { ...options, headers });
   const type = response.headers.get("content-type") || "";
   const payload = type.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    const message = typeof payload === "string" ? payload : payload.message;
-    throw new Error(message || `HTTP ${response.status}`);
+    const rawMessage = typeof payload === "string" ? payload : payload.message;
+    const message = normalizeErrorMessage(rawMessage || `HTTP ${response.status}`);
+    if (response.status === 401 && path !== "/auth/login" && (state.token || state.demo)) {
+      forceLoginRedirect(message);
+    }
+    throw new Error(message);
   }
   return payload;
+}
+
+function normalizeErrorMessage(message) {
+  const text = String(message || "操作失败").trim();
+  return errorMessageMap[text] || text;
+}
+
+function isAuthExpiredMessage(message) {
+  return authExpiredMessages.has(String(message || "").trim());
+}
+
+function resetLocalLoginState(message = "") {
+  state.token = "";
+  state.user = null;
+  state.demo = false;
+  state.data.sessions = [];
+  state.drawer = null;
+  if (message) state.loginError = message;
+  localStorage.removeItem("ng_token");
+  localStorage.removeItem("ng_demo_mode");
+  state.page = "dashboard";
+  if (location.hash !== "#/dashboard") {
+    history.replaceState(null, "", "#/dashboard");
+  }
+  updateRealtimeTimers();
+}
+
+function forceLoginRedirect(message = "登录状态已失效，请重新登录") {
+  resetLocalLoginState(message);
+  render();
 }
 
 async function demoApi(path, options = {}) {
@@ -249,9 +324,10 @@ async function demoApi(path, options = {}) {
   await new Promise((resolve) => window.setTimeout(resolve, 120));
   if (path === "/health") return ok({ service: "NebulaGrid", status: "ok", environment: "demo", version: "demo" });
   if (path === "/auth/login") return ok(loginDemoUser(body?.identity || "admin"));
+  if (path === "/auth/logout" && method === "POST") return ok(logoutDemoUser());
   if (path === "/auth/me" && method === "PATCH") return ok(updateDemoProfile(body));
   if (path === "/auth/me/password" && method === "POST") return ok({ password_changed: true });
-  if (path === "/auth/sessions" && method === "GET") return ok(demoStore.sessions);
+  if (path === "/auth/sessions" && method === "GET") return ok(groupDemoSessions(demoStore.sessions.filter((session) => session.user_id === demoStore.currentUser?.id)));
   if (path.startsWith("/auth/sessions/") && method === "DELETE") return ok(revokeDemoSession(path.split("/")[3]));
   if (path === "/auth/me") return ok(demoStore.currentUser || demoStore.users[0]);
   if (path === "/dashboard/summary") return ok(buildDemoSummary());
@@ -259,7 +335,11 @@ async function demoApi(path, options = {}) {
   if (path === "/admin/nodes" && method === "POST") return ok(addDemoNode(body));
   if (path.includes("/reconnect")) return ok(updateDemoNode(path.split("/")[3], "reconnecting"));
   if (path.includes("/force-offline")) return ok(updateDemoNode(path.split("/")[3], "manual_offline"));
-  if (path === "/tasks" && method === "GET") return ok({ items: demoStore.tasks, total: demoStore.tasks.length, page: 1, page_size: 20 });
+  if (path.startsWith("/tasks") && method === "GET") {
+    const zone = new URLSearchParams(path.split("?")[1] || "").get("state");
+    const items = filterTasksByZone(demoStore.tasks, zone || "all");
+    return ok({ items, total: items.length, page: 1, page_size: 20 });
+  }
   if (path === "/tasks" && method === "POST") return ok(addDemoTask(body));
   if (path.includes("/cancel")) return ok(updateDemoTask(path.split("/")[2], "cancelled"));
   if (path.includes("/resubmit")) return ok(resubmitDemoTask(path.split("/")[2]));
@@ -271,6 +351,8 @@ async function demoApi(path, options = {}) {
   if (path.startsWith("/files/list")) return ok({ path: state.data.files.path || "/workspace", items: demoStore.files });
   if (path.startsWith("/files/preview")) return ok({ path: decodeURIComponent(path.split("path=")[1] || "/workspace/train.py"), content_type: "text/plain", content: "print('hello NebulaGrid')\n", truncated: false });
   if (path === "/users" && method === "POST") return ok(addDemoUser(body));
+  if (path.startsWith("/users/") && path.endsWith("/password") && method === "POST") return ok(resetDemoUserPassword(path.split("/")[2], body));
+  if (path.startsWith("/users/") && method === "PATCH") return ok(updateDemoUser(path.split("/")[2], body));
   if (path.startsWith("/users/") && method === "DELETE") return ok(deleteDemoUser(path.split("/")[2]));
   if (path === "/users") return ok(demoStore.users);
   if (path === "/admin/settings" && method === "GET") return ok(demoStore.settings);
@@ -284,21 +366,62 @@ function ok(data) {
   return { ok: true, code: "OK", message: "success", data, request_id: `demo-${Date.now()}` };
 }
 
+function groupDemoSessions(sessions) {
+  const sorted = [...sessions].sort((a, b) => {
+    const aScore = (a.current ? 4 : 0) + (a.state === "online" ? 2 : 0);
+    const bScore = (b.current ? 4 : 0) + (b.state === "online" ? 2 : 0);
+    if (aScore !== bScore) return bScore - aScore;
+    return new Date(b.last_seen_at || b.login_time).getTime() - new Date(a.last_seen_at || a.login_time).getTime();
+  });
+  const grouped = [];
+  sorted.forEach((session) => {
+    if (!grouped.some((item) => isSameDemoDevice(item, session))) grouped.push(session);
+  });
+  return grouped;
+}
+
+function isSameDemoDevice(a, b) {
+  if (a.user_id !== b.user_id) return false;
+  if (a.device_id && b.device_id && a.device_id === b.device_id) return true;
+  return Boolean(a.login_ip && b.login_ip && a.login_ip === b.login_ip && a.user_agent && b.user_agent && a.user_agent === b.user_agent);
+}
+
 function loginDemoUser(identity) {
   const lowered = String(identity || "admin").toLowerCase();
   demoStore.currentUser = demoStore.users.find((user) => user.username === lowered || user.role === lowered) || demoStore.users[0];
-  demoStore.sessions.unshift({
-    id: Date.now(),
-    login_ip: "127.0.0.1",
-    login_device: "Demo Browser on Local",
-    user_agent: navigator.userAgent,
-    login_time: nowText(),
-    last_seen_at: nowText(),
-    logout_time: null,
-    revoked_at: null,
-    state: "online",
-    current: true,
+  const now = nowText();
+  demoStore.sessions.forEach((session) => {
+    if (session.user_id === demoStore.currentUser.id) session.current = false;
   });
+  const reusable = demoStore.sessions.find((session) => session.user_id === demoStore.currentUser.id && session.device_id === state.deviceId && session.state === "online");
+  if (reusable) {
+    Object.assign(reusable, {
+      login_ip: "127.0.0.1",
+      login_device: "Demo Browser on Local",
+      user_agent: navigator.userAgent,
+      login_time: now,
+      last_seen_at: now,
+      logout_time: null,
+      revoked_at: null,
+      state: "online",
+      current: true,
+    });
+  } else {
+    demoStore.sessions.unshift({
+      id: Date.now(),
+      user_id: demoStore.currentUser.id,
+      login_ip: "127.0.0.1",
+      login_device: "Demo Browser on Local",
+      device_id: state.deviceId,
+      user_agent: navigator.userAgent,
+      login_time: now,
+      last_seen_at: now,
+      logout_time: null,
+      revoked_at: null,
+      state: "online",
+      current: true,
+    });
+  }
   return { access_token: demoStore.token, token_type: "bearer", user: demoStore.currentUser };
 }
 
@@ -382,6 +505,15 @@ function resubmitDemoTask(taskId) {
   return addDemoTask({ ...task, on_hold: false });
 }
 
+function filterTasksByZone(tasks, zone) {
+  if (!zone || zone === "all") return tasks;
+  const normalized = String(zone).toLowerCase();
+  if (["wait", "waiting", "queue"].includes(normalized)) return tasks.filter((task) => ["wait", "on_hold"].includes(task.state));
+  if (["running", "exec"].includes(normalized)) return tasks.filter((task) => ["running", "preparing", "dispatching"].includes(task.state));
+  if (["history", "hist", "finished"].includes(normalized)) return tasks.filter((task) => ["succeeded", "failed", "cancelled", "alloc_error", "offline_error", "node_lost"].includes(task.state));
+  return tasks.filter((task) => task.state === normalized);
+}
+
 function addDemoEnv(payload) {
   const env = {
     id: demoStore.envs.length + 1,
@@ -426,27 +558,60 @@ function addDemoUser(payload) {
   return user;
 }
 
+function updateDemoUser(userId, payload) {
+  const user = demoStore.users.find((item) => String(item.id) === String(userId));
+  if (!user) return {};
+  if (payload.real_name) user.real_name = payload.real_name;
+  if (payload.role) {
+    user.role = payload.role;
+    user.permissions = payload.role === "student"
+      ? demoStore.users.find((item) => item.role === "student")?.permissions || []
+      : payload.role === "admin" ? ["*"] : user.permissions || [];
+    user.linux_account_name = payload.role === "admin" ? "ddltm" : user.username;
+    user.home_path = payload.role === "admin" ? "/home/ddltm" : `/home/ddltm/data/user/${user.username}`;
+  }
+  if (payload.state) user.state = payload.state;
+  pushAudit("user.update", "user", String(user.id));
+  return user;
+}
+
+function resetDemoUserPassword(userId) {
+  const user = demoStore.users.find((item) => String(item.id) === String(userId));
+  if (user) pushAudit("user.password.reset", "user", String(user.id));
+  return user || {};
+}
+
 function updateDemoProfile(payload) {
   if (!demoStore.currentUser) demoStore.currentUser = demoStore.users[0];
   demoStore.currentUser.real_name = payload.real_name;
-  demoStore.currentUser.avatar = payload.avatar || null;
   const user = demoStore.users.find((item) => item.id === demoStore.currentUser.id);
-  if (user) {
-    user.real_name = demoStore.currentUser.real_name;
-    user.avatar = demoStore.currentUser.avatar;
-  }
+  if (user) user.real_name = demoStore.currentUser.real_name;
   pushAudit("user.profile.update", "user", String(demoStore.currentUser.id));
   return demoStore.currentUser;
+}
+
+function logoutDemoUser() {
+  const session = demoStore.sessions.find((item) => item.current && item.state === "online");
+  if (session) {
+    session.state = "offline";
+    session.logout_time = nowText();
+    session.current = false;
+  }
+  return { logged_out: true };
 }
 
 function revokeDemoSession(sessionId) {
   const session = demoStore.sessions.find((item) => String(item.id) === String(sessionId));
   if (session) {
-    session.state = "offline";
-    session.revoked_at = nowText();
-    session.logout_time = session.logout_time || session.revoked_at;
+    const now = nowText();
+    demoStore.sessions.forEach((item) => {
+      if (!isSameDemoDevice(item, session)) return;
+      item.state = "offline";
+      item.revoked_at = item.revoked_at || now;
+      item.logout_time = item.logout_time || now;
+    });
   }
-  pushAudit("auth.session.revoke", "login_session", String(sessionId));
+  pushAudit("auth.session.offline", "login_session", String(sessionId));
   return session || {};
 }
 
@@ -502,17 +667,30 @@ function parseList(value) {
 async function login(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  state.apiBase = formValue(form, "apiBase").replace(/\/$/, "");
-  localStorage.setItem("ng_api_base", state.apiBase);
-  const payload = await api("/auth/login", {
-    method: "POST",
-    body: JSON.stringify({ identity: formValue(form, "identity"), password: formValue(form, "password") }),
-  });
-  state.token = payload.data.access_token;
-  state.user = payload.data.user;
-  localStorage.setItem("ng_token", state.token);
-  await refreshPage();
-  updateAutoRefreshTimer();
+  state.loginError = null;
+  try {
+    const payload = await api("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ identity: formValue(form, "identity"), password: formValue(form, "password") }),
+    });
+    state.token = payload.data.access_token;
+    state.user = payload.data.user;
+    localStorage.setItem("ng_token", state.token);
+    navigateAfterLogin();
+    await refreshPage();
+    updateRealtimeTimers();
+  } catch (error) {
+    state.loginError = normalizeErrorMessage(error.message);
+    throw error;
+  }
+}
+
+function navigateAfterLogin() {
+  state.page = "dashboard";
+  state.drawer = null;
+  if (location.hash !== "#/dashboard") {
+    history.replaceState(null, "", "#/dashboard");
+  }
 }
 
 async function enterDemo(role = "admin") {
@@ -521,17 +699,19 @@ async function enterDemo(role = "admin") {
   const payload = await demoApi("/auth/login", { method: "POST", body: JSON.stringify({ identity: role, password: "demo" }) });
   state.token = payload.data.access_token;
   state.user = payload.data.user;
+  state.loginError = null;
+  navigateAfterLogin();
   await refreshPage();
-  updateAutoRefreshTimer();
+  updateRealtimeTimers();
 }
 
 async function logout() {
-  state.token = "";
-  state.user = null;
-  state.demo = false;
-  localStorage.removeItem("ng_token");
-  localStorage.removeItem("ng_demo_mode");
-  updateAutoRefreshTimer();
+  try {
+    if (state.token || state.demo) await api("/auth/logout", { method: "POST" });
+  } catch (error) {
+    console.warn("logout request failed", error);
+  }
+  resetLocalLoginState();
   render();
 }
 
@@ -552,7 +732,7 @@ async function refreshPage() {
       state.lastDashboardRefreshAt = new Date();
     },
     tasks: async () => {
-      state.data.tasks = (await api("/tasks")).data;
+      state.data.tasks = (await api(`/tasks?state=${encodeURIComponent(state.taskZone)}`)).data;
       if (can("envs:read")) state.data.envs = (await api("/envs")).data;
     },
     files: async () => {
@@ -584,7 +764,7 @@ function navigate(page) {
   state.page = page;
   location.hash = `/${page}`;
   state.drawer = null;
-  updateAutoRefreshTimer();
+  updateRealtimeTimers();
   run(refreshPage);
 }
 
@@ -592,8 +772,14 @@ function setDashboardRefreshSeconds(value) {
   const seconds = Math.max(0, Math.min(3600, Number(value) || 0));
   state.autoRefreshSeconds = seconds;
   localStorage.setItem("ng_dashboard_refresh_seconds", String(seconds));
-  updateAutoRefreshTimer();
+  updateRealtimeTimers();
   render();
+}
+
+function updateRealtimeTimers() {
+  updateAutoRefreshTimer();
+  updateSessionRefreshTimer();
+  updateAuthWatchTimer();
 }
 
 function updateAutoRefreshTimer() {
@@ -616,6 +802,54 @@ async function autoRefreshDashboard() {
   } finally {
     state.autoRefreshBusy = false;
   }
+}
+
+async function refreshSessionsLive() {
+  if (!state.user || state.page !== "account" || state.sessionRefreshBusy) return;
+  state.sessionRefreshBusy = true;
+  try {
+    state.data.sessions = (await api("/auth/sessions")).data;
+    renderSessionPanelOnly();
+  } catch (error) {
+    if (!isAuthExpiredMessage(error.message)) {
+      console.warn("login device refresh failed", error);
+    }
+  } finally {
+    state.sessionRefreshBusy = false;
+  }
+}
+
+function updateSessionRefreshTimer() {
+  if (state.sessionRefreshTimer) {
+    window.clearInterval(state.sessionRefreshTimer);
+    state.sessionRefreshTimer = null;
+  }
+  if (!state.user || state.page !== "account") return;
+  state.sessionRefreshTimer = window.setInterval(refreshSessionsLive, LOGIN_DEVICE_REFRESH_MS);
+}
+
+async function watchCurrentSession() {
+  if (!state.user || state.authWatchBusy) return;
+  state.authWatchBusy = true;
+  try {
+    const payload = await api("/auth/me");
+    state.user = payload.data;
+  } catch (error) {
+    if (!isAuthExpiredMessage(error.message)) {
+      console.warn("auth watch failed", error);
+    }
+  } finally {
+    state.authWatchBusy = false;
+  }
+}
+
+function updateAuthWatchTimer() {
+  if (state.authWatchTimer) {
+    window.clearInterval(state.authWatchTimer);
+    state.authWatchTimer = null;
+  }
+  if (!state.user) return;
+  state.authWatchTimer = window.setInterval(watchCurrentSession, AUTH_WATCH_MS);
 }
 
 async function submitNode(event) {
@@ -742,10 +976,7 @@ async function submitProfile(event) {
   const form = event.currentTarget;
   const payload = await api("/auth/me", {
     method: "PATCH",
-    body: JSON.stringify({
-      real_name: formValue(form, "real_name"),
-      avatar: formValue(form, "avatar") || null,
-    }),
+    body: JSON.stringify({ real_name: formValue(form, "real_name") }),
   });
   state.user = payload.data;
   await refreshPage();
@@ -764,13 +995,74 @@ async function changePassword(event) {
   form.reset();
 }
 
+async function submitUserUpdate(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const userId = formValue(form, "user_id");
+  if (!userId) throw new Error("请先填写或选择用户 ID");
+  const body = {};
+  const realName = formValue(form, "real_name");
+  const role = formValue(form, "role");
+  const userState = formValue(form, "state");
+  if (realName) body.real_name = realName;
+  if (role) body.role = role;
+  if (userState) body.state = userState;
+  await api(`/users/${userId}`, { method: "PATCH", body: JSON.stringify(body) });
+  await refreshPage();
+}
+
+async function resetUserPassword(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const userId = formValue(form, "user_id");
+  const password = formValue(form, "password");
+  if (!userId) throw new Error("请先填写或选择用户 ID");
+  await api(`/users/${userId}/password`, { method: "POST", body: JSON.stringify({ password }) });
+  form.reset();
+  await refreshPage();
+}
+
+function fillUserEditForm(userId) {
+  const user = (state.data.users || []).find((item) => String(item.id) === String(userId));
+  const form = document.querySelector("#userEditForm");
+  if (!user || !form) return;
+  form.elements.user_id.value = user.id;
+  form.elements.real_name.value = user.real_name || "";
+  form.elements.role.value = user.role || "student";
+  form.elements.state.value = user.state || "enabled";
+}
+
+function fillPasswordResetForm(userId) {
+  const form = document.querySelector("#passwordResetForm");
+  if (!form) return;
+  form.elements.user_id.value = userId;
+  form.elements.password.focus();
+}
+
+function switchTaskZone(zone) {
+  state.taskZone = zone;
+  localStorage.setItem("ng_task_zone", zone);
+  run(refreshPage);
+}
+
+function switchAdminMenu(menu) {
+  state.adminMenu = menu;
+  localStorage.setItem("ng_admin_menu", menu);
+  render();
+}
+
 async function deleteUser(userId) {
   await api(`/users/${userId}`, { method: "DELETE" });
   await refreshPage();
 }
 
-async function revokeSession(sessionId) {
+async function offlineSession(sessionId) {
+  const session = (state.data.sessions || []).find((item) => String(item.id) === String(sessionId));
   await api(`/auth/sessions/${sessionId}`, { method: "DELETE" });
+  if (session?.current) {
+    forceLoginRedirect("当前登录设备已下线，请重新登录");
+    return;
+  }
   await refreshPage();
 }
 
@@ -854,10 +1146,10 @@ function renderLogin() {
       </section>
       <section class="login-card">
         <h2>登录控制台</h2>
+        ${state.loginError ? `<div class="login-error">${escapeHtml(state.loginError)}</div>` : ""}
         <form id="loginForm" class="form-stack">
-          <label>API 地址<input name="apiBase" value="${escapeAttr(state.apiBase)}"></label>
-          <label>账号<input name="identity" autocomplete="username" value="admin"></label>
-          <label>密码<input name="password" type="password" autocomplete="current-password" value="admin123"></label>
+          <label>账号<input name="identity" autocomplete="username" value="admin" required></label>
+          <label>密码<input name="password" type="password" autocomplete="current-password" value="admin123" required></label>
           <button type="submit">登录</button>
           <button type="button" class="secondary" data-action="demo">进入演示模式</button>
         </form>
@@ -937,6 +1229,11 @@ function renderNodeCard(node) {
 function renderTasks() {
   const tasks = state.data.tasks.items || [];
   const envOptions = state.data.envs.map((env) => `<option value="${env.id}">${escapeHtml(env.name)}</option>`).join("");
+  const zones = [
+    ["wait", "等待区", "已提交但尚未执行的任务"],
+    ["running", "运行区", "正在执行或准备执行的任务"],
+    ["history", "历史区", "已完成、失败、取消或调度错误的任务"],
+  ];
   return shell(`
     <section class="panel">
       <div class="panel-head"><div><h2>提交训练任务</h2><span>沿用 2.0 的任务入口，但按 3.0 API 保存为结构化任务。</span></div></div>
@@ -953,17 +1250,30 @@ function renderTasks() {
         <div class="form-actions"><button type="submit">提交任务</button></div>
       </form>
     </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>任务列表</h2><span>等待、运行和历史任务统一展示。</span></div></div>
-      ${tasks.length ? renderTable(["任务", "状态", "资源", "命令", "操作"], tasks.map((task) => [
-        `<strong>${escapeHtml(task.task_id)}</strong><br><span class="muted">${escapeHtml(task.description || "无描述")}</span>`,
-        `<span class="status ${task.state}">${stateText(task.state)}</span><br><span class="muted">${formatDate(task.created_at)}</span>`,
-        `GPU ${task.requirement?.need_gpus ?? 0}<br><span class="muted">${escapeHtml((task.requirement?.gpu_types || []).join(", ") || "不限型号")}</span>`,
-        `<code>${escapeHtml(task.command)}</code>`,
-        `<button class="small secondary" data-log="${escapeAttr(task.task_id)}">日志</button><button class="small secondary" data-resubmit="${escapeAttr(task.task_id)}">重提</button><button class="small danger" data-cancel="${escapeAttr(task.task_id)}">取消</button>`,
-      ])) : renderEmpty("暂无任务")}
+    <section class="panel task-board">
+      <div class="panel-head">
+        <div>
+          <h2>任务管理</h2>
+          <span>仿照 2.0 分为等待区、运行区和历史区；切换分区会重新请求对应任务。</span>
+        </div>
+        <div class="task-tabs">
+          ${zones.map(([id, label]) => `<button class="secondary ${state.taskZone === id ? "active" : ""}" data-task-zone="${id}">${label}</button>`).join("")}
+        </div>
+      </div>
+      <div class="zone-help">${escapeHtml(zones.find(([id]) => id === state.taskZone)?.[2] || "")}</div>
+      ${tasks.length ? renderTaskZoneTable(tasks) : renderEmpty(`${zones.find(([id]) => id === state.taskZone)?.[1] || "当前分区"}暂无任务`)}
     </section>
   `);
+}
+
+function renderTaskZoneTable(tasks) {
+  return renderTable(["任务", "状态", "资源", "命令", "操作"], tasks.map((task) => [
+    `<strong>${escapeHtml(task.task_id)}</strong><br><span class="muted">${escapeHtml(task.description || "无描述")}</span>`,
+    `<span class="status ${task.state}">${stateText(task.state)}</span><br><span class="muted">${formatDate(task.created_at)}</span>`,
+    `GPU ${task.requirement?.need_gpus ?? 0}<br><span class="muted">${escapeHtml((task.requirement?.gpu_types || []).join(", ") || "不限型号")}</span>`,
+    `<code>${escapeHtml(task.command)}</code>`,
+    `<button class="small secondary" data-log="${escapeAttr(task.task_id)}">日志</button><button class="small secondary" data-resubmit="${escapeAttr(task.task_id)}">重提</button>${["succeeded", "failed", "cancelled", "alloc_error", "offline_error", "node_lost"].includes(task.state) ? "" : `<button class="small danger" data-cancel="${escapeAttr(task.task_id)}">取消</button>`}`,
+  ]));
 }
 
 function renderFiles() {
@@ -1053,7 +1363,6 @@ function renderAccount() {
         <div class="panel-head"><div><h2>修改资料</h2><span>用户名、角色和状态由管理员后台维护。</span></div></div>
         <form id="profileForm" class="form-grid compact-form">
           <label>姓名<input name="real_name" value="${escapeAttr(state.user?.real_name || "")}" required></label>
-          <label class="wide">头像地址<input name="avatar" value="${escapeAttr(state.user?.avatar || "")}" placeholder="/avatars/me.png"></label>
           <div class="form-actions"><button type="submit">保存资料</button></div>
         </form>
       </article>
@@ -1066,10 +1375,7 @@ function renderAccount() {
         </form>
       </article>
     </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>登录设备</h2><span>查看登录 IP、设备和在线状态，发现异常可撤销会话。</span></div></div>
-      ${sessions.length ? renderSessionTable(sessions) : renderEmpty("暂无登录记录")}
-    </section>
+    ${renderSessionPanel(sessions)}
   `);
 }
 
@@ -1086,6 +1392,26 @@ function renderStudents() {
         <div class="form-actions"><button type="submit">创建学生</button></div>
       </form>
     </section>
+    <section class="split">
+      <article class="panel">
+        <div class="panel-head"><div><h2>编辑学生</h2><span>可从列表点“编辑”自动填入。</span></div></div>
+        <form id="userEditForm" class="form-grid compact-form">
+          <label>用户 ID<input name="user_id" type="number" min="1" required></label>
+          <label>姓名<input name="real_name" placeholder="留空则不改"></label>
+          <label>状态<select name="state"><option value="">不修改</option><option value="enabled">启用</option><option value="disabled">禁用</option></select></label>
+          <input type="hidden" name="role" value="">
+          <div class="form-actions"><button type="submit">保存修改</button></div>
+        </form>
+      </article>
+      <article class="panel">
+        <div class="panel-head"><div><h2>重置学生密码</h2><span>重置后请提醒学生尽快自行修改密码。</span></div></div>
+        <form id="passwordResetForm" class="form-grid compact-form">
+          <label>用户 ID<input name="user_id" type="number" min="1" required></label>
+          <label>新密码<input name="password" type="password" minlength="8" required></label>
+          <div class="form-actions"><button type="submit" class="secondary">重置密码</button></div>
+        </form>
+      </article>
+    </section>
     <section class="panel">
       <div class="panel-head"><div><h2>学生列表</h2><span>后续可在这里接入导师-学生绑定关系。</span></div></div>
       ${students.length ? renderUserTable(students) : renderEmpty("暂无学生账号")}
@@ -1100,11 +1426,18 @@ function renderAdmin() {
   const auditItems = state.data.auditLogs.items || [];
   const onlineNodes = nodes.filter((node) => node.state === "online").length;
   const offlineNodes = nodes.filter((node) => ["offline", "manual_offline"].includes(node.state)).length;
+  const menus = [
+    ["overview", "总览"],
+    ["nodes", "节点管理"],
+    ["users", "用户管理"],
+    ["settings", "系统设置"],
+    ["audit", "审计日志"],
+  ];
   return shell(`
     <section class="admin-head">
       <div>
         <h2>管理员后台</h2>
-        <p>仅管理员账号可访问 · ${escapeHtml(state.user?.username || "-")}</p>
+        <p>仅管理员账号可访问 · ${escapeHtml(state.user?.username || "-")} · 仿照 2.0 后台使用菜单切换内容区</p>
       </div>
       <div class="admin-actions">
         <button class="secondary" data-nav="dashboard">返回控制台</button>
@@ -1112,11 +1445,7 @@ function renderAdmin() {
       </div>
     </section>
     <section class="admin-tabs">
-      <span>总览</span>
-      <span>节点管理</span>
-      <span>用户管理</span>
-      <span>系统设置</span>
-      <span>审计日志</span>
+      ${menus.map(([id, label]) => `<button class="secondary ${state.adminMenu === id ? "active" : ""}" data-admin-menu="${id}">${label}</button>`).join("")}
     </section>
     <section class="admin-stats">
       ${renderAdminStat("Web 用户", users.length)}
@@ -1124,27 +1453,72 @@ function renderAdmin() {
       ${renderAdminStat("在线节点", onlineNodes)}
       ${renderAdminStat("下线节点", offlineNodes)}
     </section>
+    ${renderAdminMenuContent(state.adminMenu, { nodes, users, settings, auditItems })}
+  `);
+}
+
+function renderAdminMenuContent(menu, data) {
+  const selected = ["overview", "nodes", "users", "settings", "audit"].includes(menu) ? menu : "overview";
+  if (selected === "nodes") return renderAdminNodes(data.nodes);
+  if (selected === "users") return renderAdminUsers(data.users);
+  if (selected === "settings") return renderAdminSettings(data.settings);
+  if (selected === "audit") return renderAdminAudit(data.auditItems);
+  return renderAdminOverview(data);
+}
+
+function renderAdminOverview({ nodes, users, auditItems }) {
+  const recentAudits = auditItems.slice(0, 6);
+  return `
     <section class="admin-grid">
       <article class="panel admin-card">
-        <div class="panel-head"><div><h2>节点管理</h2><span>登记计算节点，重连或下线会写入审计日志。</span></div></div>
-        <form id="nodeForm" class="form-grid">
-          <label>节点名称<input name="name" placeholder="node-a" required></label>
-          <label>IP 地址<input name="ip" placeholder="192.168.1.21" required></label>
-          <label>SSH 用户<input name="ssh_user" value="ddltm"></label>
-          <label>网络带宽 Mbps<input name="max_speed_mbps" type="number" min="1" placeholder="10000"></label>
-          <label class="wide">GPU 型号列表<input name="gpu_models" placeholder="A100,A100"></label>
-          <div class="form-actions"><button type="submit">登记节点</button></div>
-        </form>
-        ${nodes.length ? renderTable(["节点", "状态", "资源", "操作"], nodes.map((node) => [
-          `<strong>${escapeHtml(node.name)}</strong><br><span class="muted">${escapeHtml(node.ip)}</span>`,
-          `<span class="status ${node.state}">${stateText(node.state)}</span>`,
-          `${(node.gpus || []).length} GPU<br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
-          `<button class="small secondary" data-reconnect-node="${node.id}">重连</button><button class="small danger" data-offline-node="${node.id}">下线</button>`,
-        ])) : renderEmpty("暂无节点")}
+        <div class="panel-head"><div><h2>运行状态</h2><span>汇总当前后台可管理对象。</span></div></div>
+        <dl class="kv">
+          <dt>用户</dt><dd>${users.length} 个</dd>
+          <dt>节点</dt><dd>${nodes.length} 个</dd>
+          <dt>在线节点</dt><dd>${nodes.filter((node) => node.state === "online").length} 个</dd>
+          <dt>审计记录</dt><dd>${auditItems.length} 条</dd>
+        </dl>
       </article>
       <article class="panel admin-card">
-        <div class="panel-head"><div><h2>用户管理</h2><span>管理员用 ddltm SSH，学生和导师创建独立账户。</span></div></div>
-        <form id="userForm" class="form-grid">
+        <div class="panel-head"><div><h2>最近审计</h2><span>关键管理动作留痕。</span></div></div>
+        ${recentAudits.length ? renderTable(["动作", "对象", "时间"], recentAudits.map((item) => [
+          escapeHtml(item.action),
+          `${escapeHtml(item.target_type)} #${escapeHtml(item.target_id)}`,
+          formatDate(item.created_at),
+        ])) : renderEmpty("暂无审计日志")}
+      </article>
+    </section>
+  `;
+}
+
+function renderAdminNodes(nodes) {
+  return `
+    <section class="panel admin-card">
+      <div class="panel-head"><div><h2>节点管理</h2><span>登记计算节点，重连或下线会写入审计日志。</span></div></div>
+      <form id="nodeForm" class="form-grid">
+        <label>节点名称<input name="name" placeholder="node-a" required></label>
+        <label>IP 地址<input name="ip" placeholder="192.168.1.21" required></label>
+        <label>SSH 用户<input name="ssh_user" value="ddltm"></label>
+        <label>网络带宽 Mbps<input name="max_speed_mbps" type="number" min="1" placeholder="10000"></label>
+        <label class="wide">GPU 型号列表<input name="gpu_models" placeholder="A100,A100"></label>
+        <div class="form-actions"><button type="submit">登记节点</button></div>
+      </form>
+      ${nodes.length ? renderTable(["节点", "状态", "资源", "操作"], nodes.map((node) => [
+        `<strong>${escapeHtml(node.name)}</strong><br><span class="muted">${escapeHtml(node.ip)}</span>`,
+        `<span class="status ${node.state}">${stateText(node.state)}</span>`,
+        `${(node.gpus || []).length} GPU<br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
+        `<button class="small secondary" data-reconnect-node="${node.id}">重连</button><button class="small danger" data-offline-node="${node.id}">下线</button>`,
+      ])) : renderEmpty("暂无节点")}
+    </section>
+  `;
+}
+
+function renderAdminUsers(users) {
+  return `
+    <section class="admin-grid">
+      <article class="panel admin-card">
+        <div class="panel-head"><div><h2>创建账号</h2><span>管理员用 ddltm SSH，学生和导师创建独立账户。</span></div></div>
+        <form id="userForm" class="form-grid compact-form">
           <label>用户名<input name="username" required></label>
           <label>姓名<input name="real_name" required></label>
           <label>角色<select name="role"><option value="student">学生</option><option value="mentor">导师</option><option value="admin">管理员</option><option value="viewer">展示用户</option></select></label>
@@ -1152,37 +1526,65 @@ function renderAdmin() {
           <label>初始密码<input name="password" type="password" minlength="8" required></label>
           <div class="form-actions"><button type="submit">创建账号</button></div>
         </form>
-        ${users.length ? renderUserTable(users) : renderEmpty("暂无账号")}
       </article>
       <article class="panel admin-card">
-        <div class="panel-head"><div><h2>系统设置</h2><span>保存后立即写入后端设置存储。</span></div></div>
-        <form id="settingForm" class="form-grid compact-form">
-          <label>键<input name="key" placeholder="scheduler.enabled" required></label>
-          <label>值<input name="value" placeholder="true" required></label>
-          <div class="form-actions"><button type="submit">保存</button></div>
+        <div class="panel-head"><div><h2>编辑账号</h2><span>可从用户列表点“编辑”自动填入。</span></div></div>
+        <form id="userEditForm" class="form-grid compact-form">
+          <label>用户 ID<input name="user_id" type="number" min="1" required></label>
+          <label>姓名<input name="real_name" placeholder="留空则不改"></label>
+          <label>角色<select name="role"><option value="">不修改</option><option value="student">学生</option><option value="mentor">导师</option><option value="admin">管理员</option><option value="viewer">展示用户</option></select></label>
+          <label>状态<select name="state"><option value="">不修改</option><option value="enabled">启用</option><option value="disabled">禁用</option></select></label>
+          <div class="form-actions"><button type="submit">保存修改</button></div>
         </form>
-        ${settings.length ? renderTable(["键", "值"], settings.map((item) => [escapeHtml(item.key), `<code>${escapeHtml(item.value)}</code>`])) : renderEmpty("暂无设置")}
-      </article>
-      <article class="panel admin-card">
-        <div class="panel-head"><div><h2>审计日志</h2><span>关键管理动作会留痕。</span></div></div>
-        ${auditItems.length ? renderTable(["动作", "对象", "时间"], auditItems.map((item) => [
-          escapeHtml(item.action),
-          `${escapeHtml(item.target_type)} #${escapeHtml(item.target_id)}`,
-          formatDate(item.created_at),
-        ])) : renderEmpty("暂无审计日志")}
+        <form id="passwordResetForm" class="form-grid compact-form reset-form">
+          <label>用户 ID<input name="user_id" type="number" min="1" required></label>
+          <label>新密码<input name="password" type="password" minlength="8" required></label>
+          <div class="form-actions"><button type="submit" class="secondary">重置密码</button></div>
+        </form>
       </article>
     </section>
-  `);
+    <section class="panel admin-card">
+      <div class="panel-head"><div><h2>用户列表</h2><span>支持创建、启停、改角色、重置密码和删除。</span></div></div>
+      ${users.length ? renderUserTable(users) : renderEmpty("暂无账号")}
+    </section>
+  `;
+}
+
+function renderAdminSettings(settings) {
+  return `
+    <section class="panel admin-card">
+      <div class="panel-head"><div><h2>系统设置</h2><span>保存后立即写入后端设置存储。</span></div></div>
+      <form id="settingForm" class="form-grid compact-form">
+        <label>键<input name="key" placeholder="scheduler.enabled" required></label>
+        <label>值<input name="value" placeholder="true" required></label>
+        <div class="form-actions"><button type="submit">保存</button></div>
+      </form>
+      ${settings.length ? renderTable(["键", "值"], settings.map((item) => [escapeHtml(item.key), `<code>${escapeHtml(item.value)}</code>`])) : renderEmpty("暂无设置")}
+    </section>
+  `;
+}
+
+function renderAdminAudit(auditItems) {
+  return `
+    <section class="panel admin-card">
+      <div class="panel-head"><div><h2>审计日志</h2><span>关键管理动作会留痕。</span></div></div>
+      ${auditItems.length ? renderTable(["动作", "对象", "时间"], auditItems.map((item) => [
+        escapeHtml(item.action),
+        `${escapeHtml(item.target_type)} #${escapeHtml(item.target_id)}`,
+        formatDate(item.created_at),
+      ])) : renderEmpty("暂无审计日志")}
+    </section>
+  `;
 }
 
 function renderUserTable(users) {
   return renderTable(["账号", "角色", "状态", "Linux", "Home", "操作"], users.map((user) => [
-    `<strong>${escapeHtml(user.real_name)}</strong><br><span class="muted">${escapeHtml(user.username)}</span>`,
+    `<strong>${escapeHtml(user.real_name)}</strong><br><span class="muted">#${user.id} · ${escapeHtml(user.username)}</span>`,
     roleName(user.role),
     stateText(user.state),
     `<code>${escapeHtml(user.linux_account_name || "-")}</code>`,
     `<code>${escapeHtml(user.home_path || "-")}</code>`,
-    can("users:delete") ? `<button class="small danger" data-delete-user="${user.id}">删除</button>` : "-",
+    `${can("users:read") ? `<button class="small secondary" data-edit-user="${user.id}">编辑</button><button class="small secondary" data-reset-user="${user.id}">重置密码</button>` : ""}${can("users:delete") ? `<button class="small danger" data-delete-user="${user.id}">删除</button>` : "-"}`,
   ]));
 }
 
@@ -1193,8 +1595,24 @@ function renderSessionTable(sessions) {
     formatDate(session.login_time),
     formatDate(session.last_seen_at),
     `<span class="status ${session.state === "online" ? "online" : "offline"}">${session.current ? "当前会话 · " : ""}${stateText(session.state)}</span>`,
-    session.state === "online" ? `<button class="small danger" data-revoke-session="${session.id}">撤销</button>` : "-",
+    session.state === "online" ? `<button class="small danger" data-offline-session="${session.id}">下线</button>` : "-",
   ]));
+}
+
+function renderSessionPanel(sessions = []) {
+  return `
+    <section class="panel" id="loginSessionsPanel">
+      <div class="panel-head"><div><h2>登录设备</h2><span>按设备/IP/浏览器合并显示登录状态，每 3 秒自动刷新；发现异常设备时可手动下线。</span></div></div>
+      ${sessions.length ? renderSessionTable(sessions) : renderEmpty("暂无登录记录")}
+    </section>
+  `;
+}
+
+function renderSessionPanelOnly() {
+  const panel = document.querySelector("#loginSessionsPanel");
+  if (!panel || state.page !== "account") return;
+  panel.outerHTML = renderSessionPanel(state.data.sessions || []);
+  bindSessionEvents();
 }
 
 function renderTable(headers, rows) {
@@ -1380,6 +1798,11 @@ function stateText(value) {
     succeeded: "完成",
     failed: "失败",
     cancelled: "已取消",
+    alloc_error: "调度错误",
+    offline_error: "节点掉线",
+    node_lost: "节点丢失",
+    preparing: "准备中",
+    dispatching: "派发中",
     available: "可用",
     registered: "已登记",
     enabled: "启用",
@@ -1464,6 +1887,8 @@ function bindEvents() {
   document.querySelector("#userForm")?.addEventListener("submit", (event) => run(() => submitUser(event), "账号已创建"));
   document.querySelector("#studentForm")?.addEventListener("submit", (event) => run(() => submitUser(event, "student"), "学生已创建"));
   document.querySelector("#settingForm")?.addEventListener("submit", (event) => run(() => updateSetting(event), "设置已保存"));
+  document.querySelector("#userEditForm")?.addEventListener("submit", (event) => run(() => submitUserUpdate(event), "账号已更新"));
+  document.querySelector("#passwordResetForm")?.addEventListener("submit", (event) => run(() => resetUserPassword(event), "密码已重置"));
   document.querySelector("#fileForm")?.addEventListener("submit", (event) => {
     event.preventDefault();
     run(() => openPath(formValue(event.currentTarget, "path")));
@@ -1478,6 +1903,8 @@ function bindEvents() {
     render();
   });
   document.querySelectorAll("[data-demo-role]").forEach((button) => button.addEventListener("click", () => run(() => enterDemo(button.dataset.demoRole), `已切换为${roleName(button.dataset.demoRole)}`)));
+  document.querySelectorAll("[data-task-zone]").forEach((button) => button.addEventListener("click", () => switchTaskZone(button.dataset.taskZone)));
+  document.querySelectorAll("[data-admin-menu]").forEach((button) => button.addEventListener("click", () => switchAdminMenu(button.dataset.adminMenu)));
   document.querySelectorAll("[data-cancel]").forEach((button) => button.addEventListener("click", () => run(() => cancelTask(button.dataset.cancel), "任务已取消")));
   document.querySelectorAll("[data-resubmit]").forEach((button) => button.addEventListener("click", () => run(() => resubmitTask(button.dataset.resubmit), "任务已重新提交")));
   document.querySelectorAll("[data-log]").forEach((button) => button.addEventListener("click", () => run(() => showTaskLog(button.dataset.log))));
@@ -1485,16 +1912,23 @@ function bindEvents() {
   document.querySelectorAll("[data-preview]").forEach((button) => button.addEventListener("click", () => run(() => previewFile(button.dataset.preview))));
   document.querySelectorAll("[data-test-env]").forEach((button) => button.addEventListener("click", () => run(() => testEnv(button.dataset.testEnv))));
   document.querySelectorAll("[data-delete-env]").forEach((button) => button.addEventListener("click", () => run(() => deleteEnv(button.dataset.deleteEnv), "环境已删除")));
+  document.querySelectorAll("[data-edit-user]").forEach((button) => button.addEventListener("click", () => fillUserEditForm(button.dataset.editUser)));
+  document.querySelectorAll("[data-reset-user]").forEach((button) => button.addEventListener("click", () => fillPasswordResetForm(button.dataset.resetUser)));
   document.querySelectorAll("[data-delete-user]").forEach((button) => button.addEventListener("click", () => run(() => deleteUser(button.dataset.deleteUser), "账号已删除")));
+  bindSessionEvents();
   document.querySelectorAll("[data-reconnect-node]").forEach((button) => button.addEventListener("click", () => run(() => reconnectNode(button.dataset.reconnectNode), "已提交重连")));
   document.querySelectorAll("[data-offline-node]").forEach((button) => button.addEventListener("click", () => run(() => forceOfflineNode(button.dataset.offlineNode), "已强制下线")));
+}
+
+function bindSessionEvents() {
+  document.querySelectorAll("[data-offline-session]").forEach((button) => button.addEventListener("click", () => run(() => offlineSession(button.dataset.offlineSession), "设备已下线")));
 }
 
 window.addEventListener("hashchange", () => {
   const page = location.hash.replace("#/", "") || "dashboard";
   if (pages.some((item) => item.id === page)) {
     state.page = page;
-    updateAutoRefreshTimer();
+    updateRealtimeTimers();
     run(refreshPage);
   }
 });
@@ -1505,6 +1939,6 @@ if (state.demo && !demoStore.currentUser) {
 }
 
 loadMe().then(refreshPage).catch(() => null).finally(() => {
-  updateAutoRefreshTimer();
+  updateRealtimeTimers();
   render();
 });

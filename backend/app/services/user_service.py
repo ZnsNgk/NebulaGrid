@@ -4,9 +4,9 @@ from app.core.config import get_settings
 from app.core.errors import forbidden, not_found, validation_error
 from app.core.rbac import Role, require_permission
 from app.core.security import hash_password
-from app.schemas.users import UserCreateRequest, UserInfo
+from app.schemas.users import UserCreateRequest, UserInfo, UserUpdateRequest, UserPasswordResetRequest
 from app.services.audit_service import record_audit, utc_now
-from app.services.auth_service import DEMO_USERS, UserRecord, register_user_record, remove_user_record
+from app.services.auth_service import DEMO_USERS, UserRecord, register_user_record, remove_user_record, update_user_record
 from app.services.linux_account_service import (
     create_child_account,
     delete_child_account,
@@ -59,6 +59,46 @@ def create_user(user: UserRecord, payload: UserCreateRequest) -> UserInfo:
     return to_user_info(record)
 
 
+def update_user(user: UserRecord, user_id: int, payload: UserUpdateRequest) -> UserInfo:
+    """更新平台用户基础资料、角色和启停状态；管理员可改任意用户，导师只能改学生。"""
+    require_permission(user.role, "users:read")
+    target = next((record for record in DEMO_USERS if record.id == user_id), None)
+    if target is None:
+        raise not_found("user not found")
+    if user.role == Role.MENTOR and target.role != Role.STUDENT:
+        raise forbidden("mentor can only manage student users")
+    if user.role != Role.ADMIN and user.id != target.id and target.role != Role.STUDENT:
+        raise forbidden("user update not allowed")
+    data = payload.model_dump(exclude_unset=True)
+    if "role" in data and data["role"] is not None:
+        next_role = Role(data["role"])
+        if user.role != Role.ADMIN:
+            raise forbidden("only admin can change roles")
+        if target.role == Role.ADMIN and next_role != Role.ADMIN and count_admin_users() <= 1:
+            raise forbidden("last admin user cannot be downgraded")
+        data["role"] = next_role
+    if "state" in data and data["state"] is not None and target.role == Role.ADMIN and data["state"] != "enabled" and count_admin_users() <= 1:
+        raise forbidden("last admin user cannot be disabled")
+    updated = update_user_record(target, **data)
+    record_audit(user.id, "user.update", "user", str(updated.id), detail_json={k: str(v) for k, v in data.items()})
+    return to_user_info(updated)
+
+
+def reset_user_password(user: UserRecord, user_id: int, payload: UserPasswordResetRequest) -> UserInfo:
+    """管理员重置任意账号密码；导师可重置自己学生账号密码。"""
+    require_permission(user.role, "users:read")
+    target = next((record for record in DEMO_USERS if record.id == user_id), None)
+    if target is None:
+        raise not_found("user not found")
+    if user.role == Role.MENTOR and target.role != Role.STUDENT:
+        raise forbidden("mentor can only reset student passwords")
+    if user.role not in {Role.ADMIN, Role.MENTOR}:
+        raise forbidden("password reset not allowed")
+    updated = update_user_record(target, password_hash=hash_password(payload.password))
+    record_audit(user.id, "user.password.reset", "user", str(updated.id))
+    return to_user_info(updated)
+
+
 def delete_user(user: UserRecord, user_id: int) -> UserInfo:
     """删除平台用户并同步删除其 Linux 子账户，最后一个管理员受到保护。"""
     require_permission(user.role, "users:delete")
@@ -101,6 +141,5 @@ def to_user_info(record: UserRecord) -> UserInfo:
         state=record.state,
         home_path=home_path_for_user(record.username, role, settings),
         linux_account_name=linux_account_for_role(record.username, role, settings),
-        avatar=record.avatar,
         created_at=utc_now(),
     )

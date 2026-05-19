@@ -13,7 +13,6 @@ class UserInfo(BaseModel):
     linux_account_name: str | None = None
     linux_uid: int | None = None
     linux_gid: int | None = None
-    avatar: str | None = None
     created_at: str
 
 
@@ -25,3 +24,17 @@ class UserCreateRequest(BaseModel):
     role: str = Field(default="student", pattern="^(student|mentor|admin|viewer)$")
     password: str = Field(min_length=8, max_length=256)
     state: str = Field(default="enabled", pattern="^(enabled|disabled)$")
+
+
+class UserUpdateRequest(BaseModel):
+    """管理员/导师更新用户资料。"""
+
+    real_name: str | None = Field(default=None, min_length=1, max_length=128)
+    role: str | None = Field(default=None, pattern="^(student|mentor|admin|viewer)$")
+    state: str | None = Field(default=None, pattern="^(enabled|disabled)$")
+
+
+class UserPasswordResetRequest(BaseModel):
+    """管理端重置用户密码请求。"""
+
+    password: str = Field(min_length=8, max_length=256)

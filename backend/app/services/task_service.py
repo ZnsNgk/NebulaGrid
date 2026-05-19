@@ -23,7 +23,7 @@ def list_tasks(
     require_permission(user.role, "tasks:read")
     items = [task for task in _TASKS if can_view_task(user, task)]
     if state:
-        items = [task for task in items if task.state == state]
+        items = [task for task in items if task_in_state_zone(task, state)]
     if search:
         lowered = search.lower()
         items = [
@@ -164,3 +164,15 @@ def require_task_owner_or_admin(user: UserRecord, task: TaskInfo) -> None:
     """断言用户是任务所有者或管理员，失败时返回 403。"""
     if user.role != Role.ADMIN and task.user_id != user.id:
         raise forbidden("task owner or admin required")
+
+
+def task_in_state_zone(task: TaskInfo, state: str) -> bool:
+    """支持 2.0 风格等待区、运行区、历史区筛选，也兼容精确状态筛选。"""
+    zone = state.lower()
+    if zone in {"wait", "waiting", "queue"}:
+        return task.state in {"wait", "on_hold"}
+    if zone in {"running", "exec"}:
+        return task.state in {"running", "preparing", "dispatching"}
+    if zone in {"history", "hist", "finished"}:
+        return task.state in {"succeeded", "failed", "cancelled", "alloc_error", "offline_error", "node_lost"}
+    return task.state == state

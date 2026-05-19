@@ -17,7 +17,6 @@ class PublicUser(BaseModel):
     role: str
     state: str
     permissions: list[str]
-    avatar: str | None = None
 
 
 class LoginResult(BaseModel):
@@ -32,7 +31,6 @@ class AccountUpdateRequest(BaseModel):
     """用户自助更新资料请求；用户名和角色等敏感字段仍由管理员管理。"""
 
     real_name: str = Field(min_length=1, max_length=128)
-    avatar: str | None = Field(default=None, max_length=1024)
 
 
 class PasswordChangeRequest(BaseModel):

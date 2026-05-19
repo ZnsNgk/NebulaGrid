@@ -2,9 +2,9 @@ from fastapi import APIRouter, Depends, Request
 
 from app.api.deps import get_current_user
 from app.core.responses import api_success
-from app.schemas.users import UserCreateRequest
+from app.schemas.users import UserCreateRequest, UserUpdateRequest, UserPasswordResetRequest
 from app.services.auth_service import UserRecord
-from app.services.user_service import create_user, delete_user, list_users
+from app.services.user_service import create_user, delete_user, list_users, reset_user_password, update_user
 
 router = APIRouter()
 
@@ -24,6 +24,30 @@ def post_user(
 ):
     """创建用户账号，导师和管理员权限边界由服务层校验。"""
     user = create_user(current_user, payload)
+    return api_success(data=user.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.patch("/{user_id}")
+def patch_user_account(
+    user_id: int,
+    payload: UserUpdateRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """更新平台用户资料、角色或状态。"""
+    user = update_user(current_user, user_id, payload)
+    return api_success(data=user.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/{user_id}/password")
+def post_user_password(
+    user_id: int,
+    payload: UserPasswordResetRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """由管理端重置指定用户密码。"""
+    user = reset_user_password(current_user, user_id, payload)
     return api_success(data=user.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
