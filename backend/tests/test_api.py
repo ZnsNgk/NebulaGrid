@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
+from app.core.config import get_settings
 from app.main import create_app
 
 
@@ -45,7 +48,7 @@ def test_task_lifecycle_smoke() -> None:
     create_response = client.post(
         "/api/tasks",
         headers=headers,
-        json={"command": "python train.py", "workdir": "/workspace"},
+        json={"command": "python train.py", "workdir": "/"},
     )
     task_id = create_response.json()["data"]["task_id"]
     detail_response = client.get(f"/api/tasks/{task_id}", headers=headers)
@@ -119,7 +122,7 @@ def test_envs_are_globally_usable_but_owner_modified() -> None:
     task_response = client.post(
         "/api/tasks",
         headers=student_headers,
-        json={"command": "python train.py", "workdir": "/workspace", "env_id": env["id"]},
+        json={"command": "python train.py", "workdir": "/", "env_id": env["id"]},
     )
     forbidden_upload = client.post(
         f"/api/envs/{env['id']}/packages/upload",
@@ -198,3 +201,70 @@ def login_user(client: TestClient, identity: str, password: str) -> str:
         json={"identity": identity, "password": password},
     )
     return response.json()["data"]["access_token"]
+
+
+def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) -> None:
+    """验证文件管理接口在虚拟根目录 / 内完成新建、预览、保存、复制、重命名和删除。"""
+    user_home_root = tmp_path / "user"
+    monkeypatch.setenv("NEBULAGRID_USER_HOME_ROOT", str(user_home_root))
+    monkeypatch.setenv("NEBULAGRID_VISIBLE_ROOTS", str(user_home_root))
+    get_settings.cache_clear()
+    try:
+        client = make_client()
+        admin_token = login_as_admin(client)
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        client.post(
+            "/api/users",
+            headers=admin_headers,
+            json={
+                "username": "file-student",
+                "real_name": "File Student",
+                "role": "student",
+                "state": "enabled",
+                "password": "student123",
+            },
+        )
+        user_root = user_home_root / "file-student"
+        student_token = login_user(client, "file-student", "student123")
+        headers = {"Authorization": f"Bearer {student_token}"}
+
+        mkdir_response = client.post("/api/files/mkdir", headers=headers, json={"path": "/project"})
+        create_response = client.post(
+            "/api/files/create",
+            headers=headers,
+            json={"path": "/project/note.txt", "content": "hello"},
+        )
+        save_response = client.post(
+            "/api/files/save",
+            headers=headers,
+            json={"path": "/project/note.txt", "content": "updated"},
+        )
+        copy_response = client.post(
+            "/api/files/copy",
+            headers=headers,
+            json={"path": "/project/note.txt", "target_path": "/project/copy.txt"},
+        )
+        rename_response = client.post(
+            "/api/files/rename",
+            headers=headers,
+            json={"path": "/project/copy.txt", "target_path": "/project/renamed.txt"},
+        )
+        preview_response = client.get("/api/files/preview?path=/project/renamed.txt", headers=headers)
+        download_response = client.get("/api/files/download?path=/project/renamed.txt", headers=headers)
+        delete_response = client.delete("/api/files?path=/project/renamed.txt", headers=headers)
+        root_delete_response = client.delete("/api/files?path=/", headers=headers)
+
+        assert mkdir_response.status_code == 200
+        assert create_response.status_code == 200
+        assert save_response.status_code == 200
+        assert copy_response.status_code == 200
+        assert rename_response.status_code == 200
+        assert preview_response.json()["data"]["content"] == "updated"
+        assert download_response.text == "updated"
+        assert delete_response.status_code == 200
+        assert root_delete_response.status_code == 422
+        assert user_root.is_dir()
+        assert (user_root / "project" / "note.txt").read_text(encoding="utf-8") == "updated"
+        assert not (user_root / "project" / "renamed.txt").exists()
+    finally:
+        get_settings.cache_clear()

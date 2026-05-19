@@ -12,7 +12,6 @@ class Settings:
     environment: str = "development"
     data_root: str = "/home/ddltm/data"
     user_home_root: str = "/home/ddltm/data/user"
-    user_workspace_alias: str = "/workspace"
     visible_roots: tuple[str, ...] = (
         "/home/ddltm/data/user",
         "/home/ddltm/envs/miniconda3",
@@ -58,7 +57,6 @@ def get_settings() -> Settings:
         environment=os.getenv("NEBULAGRID_ENV", "development"),
         data_root=os.getenv("NEBULAGRID_DATA_ROOT", "/home/ddltm/data"),
         user_home_root=os.getenv("NEBULAGRID_USER_HOME_ROOT", "/home/ddltm/data/user"),
-        user_workspace_alias=os.getenv("NEBULAGRID_WORKSPACE_ALIAS", "/workspace"),
         visible_roots=tuple(root.strip() for root in visible_roots.split(",") if root.strip()),
         database_url=os.getenv(
             "NEBULAGRID_DATABASE_URL",

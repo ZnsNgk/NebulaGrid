@@ -6,6 +6,10 @@ const state = {
   page: location.hash.replace("#/", "") || "dashboard",
   taskZone: localStorage.getItem("ng_task_zone") || "wait",
   adminMenu: localStorage.getItem("ng_admin_menu") || "overview",
+  auditCategory: localStorage.getItem("ng_audit_category") || "all",
+  auditPage: 1,
+  auditPageSize: Number(localStorage.getItem("ng_audit_page_size") || 20),
+  auditFilters: { keyword: "", action: "", start_time: "", end_time: "" },
   toast: null,
   loginError: null,
   loading: false,
@@ -16,17 +20,22 @@ const state = {
   autoRefreshBusy: false,
   sessionRefreshTimer: null,
   sessionRefreshBusy: false,
+  fileJobRefreshTimer: null,
+  fileJobRefreshBusy: false,
   authWatchTimer: null,
   authWatchBusy: false,
   lastDashboardRefreshAt: null,
   drawer: null,
+  fileTargetPicker: null,
   data: {
     dashboard: null,
     nodes: [],
     tasks: { items: [], total: 0, page: 1, page_size: 20 },
     envs: [],
-    files: { path: "/workspace", items: [] },
+    files: { path: "/", items: [] },
     preview: null,
+    selectedFilePath: "",
+    fileJob: null,
     users: [],
     mentors: [],
     settings: [],
@@ -41,6 +50,7 @@ const state = {
 
 const LOGIN_DEVICE_REFRESH_MS = 3000;
 const AUTH_WATCH_MS = 3000;
+const FILE_JOB_REFRESH_MS = 2000;
 
 const authExpiredMessages = new Set([
   "invalid token",
@@ -71,6 +81,19 @@ const errorMessageMap = {
   "permission required: admin:login:read": "只有管理员可以查看登录管理",
   "permission required: admin:login:write": "只有管理员可以下线登录设备",
   "session not found": "登录设备不存在或已失效",
+  "target already exists": "目标已存在",
+  "path not found": "路径不存在",
+  "path is not a file": "请选择文件",
+  "path is not a directory": "请选择目录",
+  "parent directory does not exist": "父目录不存在",
+  "refusing to operate on protected root": "不能操作受保护的根目录",
+  "target_path is required": "请提供目标路径",
+  "target cannot be inside source directory": "目标目录不能位于源目录内部",
+  "file job already running": "当前已有打包或解压任务正在运行",
+  "too many file jobs running": "当前服务器打包或解压任务较多，请稍后再试",
+  "unsupported archive type": "请选择 zip/tar/tar.gz/tar.bz2/tar.xz 压缩包",
+  "target path is not a directory": "请选择解压目标文件夹",
+  "zip command failed": "zip 命令执行失败",
 };
 
 const roleLabels = {
@@ -167,7 +190,7 @@ async function api(path, options = {}) {
   const payload = type.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
     const rawMessage = typeof payload === "string" ? payload : (payload.code === "VALIDATION_ERROR" ? extractValidationMessage(payload) : payload.message);
-    const message = normalizeErrorMessage(rawMessage || `HTTP ${response.status}`);
+    const message = normalizeHttpError(response.status, rawMessage || `HTTP ${response.status}`);
     if (response.status === 401 && path !== "/auth/login" && state.token) {
       forceLoginRedirect(message);
     }
@@ -176,8 +199,18 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function normalizeHttpError(status, message) {
+  if (status === 413) {
+    return "上传文件过大：请通过scp上传。";
+  }
+  return normalizeErrorMessage(message);
+}
+
 function normalizeErrorMessage(message) {
   const text = String(message || "操作失败").trim();
+  if (text.includes("413 Request Entity Too Large")) {
+    return "上传文件过大：请通过scp上传。";
+  }
   return errorMessageMap[text] || text;
 }
 
@@ -230,6 +263,28 @@ function formValue(form, name) {
 
 function cleanObject(values) {
   return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== "" && value !== null && value !== undefined));
+}
+
+function auditLogPath(page = state.auditPage, pageSize = state.auditPageSize, category = state.auditCategory, filters = state.auditFilters) {
+  const params = new URLSearchParams({
+    page: String(Math.max(1, Number(page) || 1)),
+    page_size: String(normalizeAuditPageSize(pageSize)),
+    category: category || "all",
+  });
+  Object.entries(cleanObject(filters || {})).forEach(([key, value]) => {
+    params.set(key, key.endsWith("_time") ? toIsoDateTime(value) : value);
+  });
+  return `/admin/audit-logs?${params.toString()}`;
+}
+
+function toIsoDateTime(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toISOString();
+}
+
+function normalizeAuditPageSize(value) {
+  const pageSize = Number(value) || 20;
+  return [10, 20, 50, 100].includes(pageSize) ? pageSize : 20;
 }
 
 function cleanUserFilters(filters) {
@@ -302,7 +357,9 @@ async function refreshPage() {
       if (can("envs:read")) state.data.envs = (await api("/envs")).data;
     },
     files: async () => {
-      state.data.files = (await api(`/files/list?path=${encodeURIComponent(state.data.files.path || "/workspace")}`)).data;
+      state.data.files = (await api(`/files/list?path=${encodeURIComponent(state.data.files.path || "/")}`)).data;
+      state.data.fileJob = (await api("/files/jobs/latest")).data;
+      updateFileJobTimer();
     },
     envs: async () => {
       state.data.envs = (await api("/envs")).data;
@@ -327,7 +384,10 @@ async function refreshPage() {
         ? (await api("/admin/login-management/user-sessions", { method: "POST", body: JSON.stringify(loginQuery) })).data
         : [];
       state.data.settings = (await api("/admin/settings")).data;
-      state.data.auditLogs = (await api("/admin/audit-logs")).data;
+      const auditCategory = state.adminMenu === "audit" ? state.auditCategory || "all" : "all";
+      const auditPage = state.adminMenu === "audit" ? state.auditPage || 1 : 1;
+      const auditFilters = state.adminMenu === "audit" ? state.auditFilters : {};
+      state.data.auditLogs = (await api(auditLogPath(auditPage, state.auditPageSize, auditCategory, auditFilters))).data;
     },
   };
   await loaders[state.page]?.();
@@ -356,6 +416,7 @@ function setDashboardRefreshSeconds(value) {
 function updateRealtimeTimers() {
   updateAutoRefreshTimer();
   updateSessionRefreshTimer();
+  updateFileJobTimer();
   updateAuthWatchTimer();
 }
 
@@ -409,6 +470,41 @@ function updateSessionRefreshTimer() {
   const needsSessionRefresh = state.user && (state.page === "account" || (state.page === "admin" && state.adminMenu === "logins"));
   if (!needsSessionRefresh) return;
   state.sessionRefreshTimer = window.setInterval(refreshSessionsLive, LOGIN_DEVICE_REFRESH_MS);
+}
+
+function updateFileJobTimer() {
+  if (state.fileJobRefreshTimer) {
+    window.clearInterval(state.fileJobRefreshTimer);
+    state.fileJobRefreshTimer = null;
+  }
+  if (!state.user || state.page !== "files" || !fileJobIsActive(state.data.fileJob)) return;
+  state.fileJobRefreshTimer = window.setInterval(refreshFileJobLive, FILE_JOB_REFRESH_MS);
+}
+
+async function refreshFileJobLive() {
+  if (!state.user || state.page !== "files" || state.fileJobRefreshBusy) return;
+  state.fileJobRefreshBusy = true;
+  try {
+    state.data.fileJob = (await api("/files/jobs/latest")).data;
+    if (!fileJobIsActive(state.data.fileJob)) {
+      renderFileJobProgressOnly();
+      await refreshPage();
+      render();
+      return;
+    }
+    renderFileJobProgressOnly();
+  } catch (error) {
+    if (!isAuthExpiredMessage(error.message)) {
+      console.warn("file job refresh failed", error);
+    }
+  } finally {
+    state.fileJobRefreshBusy = false;
+    updateFileJobTimer();
+  }
+}
+
+function fileJobIsActive(job) {
+  return job && ["pending", "running"].includes(job.state);
 }
 
 async function watchCurrentSession() {
@@ -470,7 +566,7 @@ async function submitTask(event) {
     body: JSON.stringify({
       description: formValue(form, "description"),
       env_id: formValue(form, "env_id") ? Number(formValue(form, "env_id")) : null,
-      workdir: formValue(form, "workdir") || "/workspace",
+      workdir: formValue(form, "workdir") || "/",
       command: formValue(form, "command"),
       priority: Number(formValue(form, "priority") || 0),
       on_hold: form.elements.on_hold.checked,
@@ -528,13 +624,264 @@ async function deleteEnv(envId) {
 async function openPath(path) {
   state.data.files.path = path;
   state.data.preview = null;
+  state.data.selectedFilePath = "";
   await refreshPage();
 }
 
 async function previewFile(path) {
   const payload = await api(`/files/preview?path=${encodeURIComponent(path)}`);
   state.data.preview = payload.data;
-  state.drawer = { title: `文件预览 ${path}`, body: `<pre class="drawer-log">${escapeHtml(payload.data.content)}</pre>` };
+  state.data.selectedFilePath = path;
+}
+
+function selectFile(path, kind = "") {
+  state.data.selectedFilePath = path;
+  if (kind === "directory") state.data.preview = null;
+  render();
+}
+
+async function openParentPath() {
+  await openPath(parentPath(state.data.files.path || "/"));
+}
+
+async function createFolderFromPrompt() {
+  const name = prompt("新建文件夹名称");
+  if (!name) return;
+  await api("/files/mkdir", { method: "POST", body: JSON.stringify({ path: joinPath(state.data.files.path || "/", name) }) });
+  await refreshPage();
+}
+
+async function createFileFromPrompt() {
+  const name = prompt("新建文件名称");
+  if (!name) return;
+  const path = joinPath(state.data.files.path || "/", name);
+  await api("/files/create", { method: "POST", body: JSON.stringify({ path, content: "" }) });
+  await refreshPage();
+  await previewFile(path);
+}
+
+async function renameSelectedPath() {
+  const source = requireSelectedPath();
+  const name = prompt("重命名为", baseName(source));
+  if (!name || name === baseName(source)) return;
+  const target = joinPath(parentPath(source), name);
+  await api("/files/rename", { method: "POST", body: JSON.stringify({ path: source, target_path: target }) });
+  await refreshPage();
+  state.data.selectedFilePath = target;
+}
+
+async function copySelectedPath() {
+  await openFileTargetPicker("copy");
+}
+
+async function moveSelectedPath() {
+  await openFileTargetPicker("move");
+}
+
+async function archiveSelectedFolder() {
+  const source = requireSelectedPath();
+  const item = currentSelectedFileItem();
+  if (item?.type !== "directory") throw new Error("请选择文件夹");
+  const targetPath = joinPath(parentPath(source), `${baseName(source)}_${Date.now()}.zip`);
+  const payload = await api("/files/archive", { method: "POST", body: JSON.stringify({ path: source, target_path: targetPath }) });
+  state.data.fileJob = payload.data;
+  updateFileJobTimer();
+}
+
+async function extractSelectedZip() {
+  const source = requireSelectedPath();
+  if (!isSupportedArchivePath(source)) throw new Error("请选择 zip/tar/tar.gz/tar.bz2/tar.xz 压缩包");
+  await openFileTargetPicker("extract");
+}
+
+function isSupportedArchivePath(path) {
+  const lowered = (path || "").toLowerCase();
+  return [".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"].some((suffix) => lowered.endsWith(suffix));
+}
+
+async function openFileTargetPicker(mode) {
+  const source = requireSelectedPath();
+  const startPath = state.data.files.path || parentPath(source);
+  state.fileTargetPicker = {
+    mode,
+    sourcePath: source,
+    currentPath: startPath,
+    items: [],
+  };
+  await loadFileTargetPickerPath(startPath);
+  render();
+}
+
+async function loadFileTargetPickerPath(path) {
+  if (!state.fileTargetPicker) return;
+  const payload = await api(`/files/list?path=${encodeURIComponent(path || "/")}`);
+  state.fileTargetPicker.currentPath = payload.data.path || "/";
+  state.fileTargetPicker.items = (payload.data.items || []).filter((item) => item.type === "directory");
+}
+
+async function navigateFileTargetPicker(path) {
+  await loadFileTargetPickerPath(path);
+  render();
+}
+
+function closeFileTargetPicker() {
+  state.fileTargetPicker = null;
+  render();
+}
+
+async function confirmFileTargetPicker() {
+  const picker = state.fileTargetPicker;
+  if (!picker) return;
+  if (picker.mode === "extract") {
+    const payload = await api("/files/extract", { method: "POST", body: JSON.stringify({ path: picker.sourcePath, target_path: picker.currentPath }) });
+    state.data.fileJob = payload.data;
+    state.fileTargetPicker = null;
+    updateFileJobTimer();
+    return;
+  }
+  const targetPath = buildPickedTargetPath(picker.sourcePath, picker.currentPath, picker.mode, true);
+  const endpoint = picker.mode === "copy" ? "/files/copy" : "/files/move";
+  await api(endpoint, { method: "POST", body: JSON.stringify({ path: picker.sourcePath, target_path: targetPath }) });
+  state.fileTargetPicker = null;
+  if (picker.mode === "move") {
+    state.data.preview = null;
+    state.data.selectedFilePath = targetPath;
+  }
+  await refreshPage();
+}
+
+function buildPickedTargetPath(sourcePath, targetFolder, mode, strict = false) {
+  if (mode === "extract") return normalizeClientPath(targetFolder);
+  const sourceItem = currentSelectedFileItem();
+  const isDirectory = sourceItem?.type === "directory";
+  if (isDirectory && isSameOrChildPath(targetFolder, sourcePath)) {
+    if (strict) throw new Error("不能选择自身或子目录");
+    return "";
+  }
+  const sameFolder = normalizeClientPath(targetFolder) === normalizeClientPath(parentPath(sourcePath));
+  if (mode === "copy" && sameFolder) return suggestCopyPath(sourcePath);
+  const targetPath = joinPath(targetFolder, baseName(sourcePath));
+  if (mode === "move" && normalizeClientPath(targetPath) === normalizeClientPath(sourcePath)) {
+    if (strict) throw new Error("不能移动到原位置");
+    return "";
+  }
+  return targetPath;
+}
+
+async function deleteSelectedPath() {
+  const source = requireSelectedPath();
+  if (!confirm(`确认删除 ${source}？`)) return;
+  await api(`/files?path=${encodeURIComponent(source)}`, { method: "DELETE" });
+  state.data.preview = null;
+  state.data.selectedFilePath = "";
+  await refreshPage();
+}
+
+async function uploadCurrentFile(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const file = form.elements.file?.files?.[0];
+  if (!file) throw new Error("请选择要上传的文件");
+  const body = new FormData();
+  body.append("path", state.data.files.path || "/");
+  body.append("file", file);
+  await api("/files/upload", { method: "POST", body });
+  form.reset();
+  await refreshPage();
+}
+
+async function saveCurrentFile(content) {
+  const preview = state.data.preview;
+  if (!preview?.path || preview.encoding !== "text") throw new Error("当前文件不可保存");
+  await api("/files/save", { method: "POST", body: JSON.stringify({ path: preview.path, content }) });
+  await previewFile(preview.path);
+}
+
+async function downloadSelectedPath() {
+  const source = requireSelectedPath();
+  const selectedItem = currentSelectedFileItem();
+  if (selectedItem?.type === "directory") {
+    await archiveSelectedFolder();
+    return;
+  }
+  await downloadPath(source);
+}
+
+async function downloadPath(source) {
+  const response = await fetch(`${state.apiBase.replace(/\/$/, "")}/files/download?path=${encodeURIComponent(source)}`, {
+    headers: {
+      Authorization: `Bearer ${state.token}`,
+      "X-NG-Device-Id": state.deviceId,
+    },
+  });
+  if (!response.ok) throw new Error("下载失败");
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = baseName(source);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function requireSelectedPath() {
+  if (!state.data.selectedFilePath) throw new Error("请先选择文件或目录");
+  return state.data.selectedFilePath;
+}
+
+function currentSelectedFileItem() {
+  const selected = state.data.selectedFilePath;
+  return (state.data.files.items || []).find((item) => item.path === selected) || null;
+}
+
+function joinPath(directory, name) {
+  const safeName = String(name || "").replaceAll("\\", "/").split("/").filter(Boolean).join("/");
+  const base = String(directory || "/").replace(/\/+$/, "");
+  return `${base || ""}/${safeName}`.replace(/\/+/g, "/");
+}
+
+function parentPath(path) {
+  const parts = String(path || "/").replace(/\/+$/, "").split("/").filter(Boolean);
+  if (parts.length <= 1) return "/";
+  return `/${parts.slice(0, -1).join("/")}`;
+}
+
+function baseName(path) {
+  return String(path || "").replace(/\/+$/, "").split("/").filter(Boolean).pop() || "";
+}
+
+function suggestCopyPath(path) {
+  const name = baseName(path);
+  const index = name.lastIndexOf(".");
+  const copyName = index > 0 ? `${name.slice(0, index)}_copy${name.slice(index)}` : `${name}_copy`;
+  return joinPath(parentPath(path), copyName);
+}
+
+function normalizeClientPath(path) {
+  const normalized = `/${String(path || "/").replaceAll("\\", "/").split("/").filter(Boolean).join("/")}`;
+  return normalized === "/" ? "/" : normalized.replace(/\/+$/, "");
+}
+
+function isSameOrChildPath(path, parent) {
+  const normalizedPath = normalizeClientPath(path);
+  const normalizedParent = normalizeClientPath(parent);
+  return normalizedPath === normalizedParent || normalizedPath.startsWith(`${normalizedParent}/`);
+}
+
+function fileTargetActionText(mode) {
+  if (mode === "extract") return "解压到";
+  return mode === "move" ? "移动到" : "复制到";
+}
+
+function fileIcon(item) {
+  if (item.type === "directory") return "DIR";
+  const ext = baseName(item.path).split(".").pop().toLowerCase();
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "IMG";
+  if (["mp4", "webm", "mov"].includes(ext)) return "VID";
+  if (["mp3", "wav", "flac"].includes(ext)) return "AUD";
+  return "TXT";
 }
 
 async function submitUser(event, fixedRole = null) {
@@ -657,7 +1004,55 @@ function switchAdminMenu(menu) {
   state.adminMenu = menu;
   localStorage.setItem("ng_admin_menu", menu);
   updateRealtimeTimers();
+  if (menu === "audit") {
+    run(refreshPage);
+    return;
+  }
   render();
+}
+
+function switchAuditCategory(category) {
+  state.auditCategory = category || "all";
+  state.auditPage = 1;
+  localStorage.setItem("ng_audit_category", state.auditCategory);
+  run(refreshPage);
+}
+
+function switchAuditPage(page) {
+  state.auditPage = Math.max(1, Number(page) || 1);
+  run(refreshPage);
+}
+
+function switchAuditPageSize(pageSize) {
+  state.auditPageSize = normalizeAuditPageSize(pageSize);
+  state.auditPage = 1;
+  localStorage.setItem("ng_audit_page_size", String(state.auditPageSize));
+  run(refreshPage);
+}
+
+function updateAuditFilters(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  state.auditFilters = {
+    keyword: formValue(form, "keyword"),
+    action: formValue(form, "action"),
+    start_time: formValue(form, "start_time"),
+    end_time: formValue(form, "end_time"),
+  };
+  state.auditPage = 1;
+  run(refreshPage, "已查询审计日志");
+}
+
+function resetAuditFilters() {
+  state.auditFilters = { keyword: "", action: "", start_time: "", end_time: "" };
+  state.auditPage = 1;
+  run(refreshPage, "已重置查询");
+}
+
+function jumpAuditPage(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  switchAuditPage(formValue(form, "page"));
 }
 
 function updateUserFilters(event) {
@@ -800,6 +1195,7 @@ function shell(content) {
         ${content}
       </main>
       ${state.drawer ? renderDrawer() : ""}
+      ${state.fileTargetPicker ? renderFileTargetPicker() : ""}
       ${state.toast ? `<div class="toast ${state.toast.type}">${escapeHtml(state.toast.text)}</div>` : ""}
       ${state.loading ? `<div class="loading">正在处理...</div>` : ""}
     </div>
@@ -915,7 +1311,7 @@ function renderTasks() {
         <label class="wide">任务描述<input name="description" placeholder="ResNet 训练 / 参数搜索 / 数据预处理"></label>
         <label>运行环境<select name="env_id"><option value="">不指定</option>${envOptions}</select></label>
         <label>优先级<input name="priority" type="number" min="0" max="100" value="0"></label>
-        <label class="wide">工作目录<input name="workdir" value="/workspace"></label>
+        <label class="wide">工作目录<input name="workdir" value="/"></label>
         <label>GPU 数量<input name="need_gpus" type="number" min="0" max="16" value="1"></label>
         <label>GPU 型号<input name="gpu_types" placeholder="A100,4090"></label>
         <label class="check"><input name="allow_gpu_reuse" type="checkbox">允许复用 GPU</label>
@@ -951,24 +1347,148 @@ function renderTaskZoneTable(tasks) {
 
 function renderFiles() {
   const files = state.data.files.items || [];
+  const currentPath = state.data.files.path || "/";
+  const selected = state.data.selectedFilePath;
+  const preview = state.data.preview;
   return shell(`
-    <section class="panel">
-      <div class="panel-head"><div><h2>工作区文件</h2><span>文件接口会限制在后端允许开放的路径内。</span></div></div>
-      <form method="post" id="fileForm" class="path-bar">
-        <input name="path" value="${escapeAttr(state.data.files.path || "/workspace")}">
-        <button type="submit">打开路径</button>
-      </form>
-      ${files.length ? renderTable(["名称", "类型", "大小", "修改时间", "操作"], files.map((item) => [
-        `<strong>${escapeHtml(item.name)}</strong><br><span class="muted">${escapeHtml(item.path)}</span>`,
-        item.type === "directory" ? "目录" : "文件",
-        formatBytes(item.size_bytes),
-        formatDate(item.modified_at),
-        item.type === "directory"
-          ? `<button class="small secondary" data-open-path="${escapeAttr(item.path)}">进入</button>`
-          : `<button class="small secondary" data-preview="${escapeAttr(item.path)}">预览</button>`,
-      ])) : renderEmpty("当前目录为空")}
+    <section class="file-manager">
+      <aside class="file-sidebar-panel">
+        <div class="file-nav-row">
+          <button class="secondary" data-file-root>根目录</button>
+          <button class="secondary" data-file-up>上级</button>
+          <button class="secondary" data-action="refresh">刷新</button>
+        </div>
+        <div class="file-path">${escapeHtml(currentPath)}</div>
+        <div class="file-list" role="list">
+          ${files.length ? files.map((item) => `
+            <div class="file-row ${selected === item.path ? "active" : ""}" data-select-file="${escapeAttr(item.path)}" data-file-kind="${escapeAttr(item.type)}">
+              <span class="file-glyph">${fileIcon(item)}</span>
+              <span class="file-name">${escapeHtml(item.name)}</span>
+              <span class="file-type">${item.type === "directory" ? "dir" : formatBytes(item.size_bytes)}</span>
+              ${item.type === "directory" ? `<button class="small secondary file-enter" data-open-path="${escapeAttr(item.path)}">进入</button>` : ""}
+            </div>
+          `).join("") : `<div class="file-empty">当前目录为空</div>`}
+        </div>
+        <div class="file-actions-grid">
+          <button class="secondary" data-file-new-folder>新建文件夹</button>
+          <button class="secondary" data-file-new-file>新建文件</button>
+          <button class="secondary" data-file-rename>重命名</button>
+          <button class="secondary" data-file-copy>复制到</button>
+          <button class="secondary" data-file-move>移动到</button>
+          <button class="secondary" data-file-archive>打包成 zip</button>
+          <button class="secondary" data-file-extract>解压压缩包</button>
+          <button class="danger" data-file-delete>删除</button>
+        </div>
+        <form id="fileUploadForm" class="file-upload-form">
+          <input name="file" type="file">
+          <div class="file-transfer-row">
+            <button type="submit">上传到当前目录</button>
+            <button type="button" class="secondary" data-file-download>下载选中</button>
+          </div>
+        </form>
+      </aside>
+      <section class="file-editor-panel">
+        <div class="file-editor-toolbar">
+          <span class="status">${preview?.path ? escapeHtml(preview.path) : "未打开文件"}</span>
+          <button data-file-save ${preview?.encoding === "text" ? "" : "disabled"}>保存</button>
+        </div>
+        ${renderFilePreview(preview)}
+        ${renderFileJobProgress(state.data.fileJob)}
+      </section>
     </section>
   `);
+}
+
+function renderFilePreview(preview) {
+  if (!preview) {
+    return `<textarea class="file-editor" disabled placeholder="选择左侧文本文件后可在这里预览或编辑"></textarea>`;
+  }
+  if (preview.encoding === "text") {
+    return `<div class="file-editor-shell"><textarea id="fileEditor" class="file-editor" spellcheck="false">${escapeHtml(preview.content || "")}</textarea>${preview.truncated ? `<p class="file-note">文件较大，仅显示前 ${formatBytes(preview.content.length)}。</p>` : ""}</div>`;
+  }
+  const source = `data:${preview.content_type};base64,${preview.content}`;
+  if (preview.content_type.startsWith("image/")) {
+    return `<div class="file-media-preview"><img src="${escapeAttr(source)}" alt="${escapeAttr(baseName(preview.path))}"></div>`;
+  }
+  if (preview.content_type.startsWith("video/")) {
+    return `<div class="file-media-preview"><video controls src="${escapeAttr(source)}"></video></div>`;
+  }
+  if (preview.content_type.startsWith("audio/")) {
+    return `<div class="file-media-preview compact"><audio controls src="${escapeAttr(source)}"></audio></div>`;
+  }
+  return `<div class="file-binary-preview"><strong>${escapeHtml(baseName(preview.path))}</strong><span>${escapeHtml(preview.content_type)} · ${formatBytes(preview.size_bytes)}</span></div>`;
+}
+
+function renderFileJobProgress(job) {
+  if (!job) {
+    return `<div class="file-job-progress" id="fileJobProgress"><span>暂无打包或解压任务</span></div>`;
+  }
+  const title = job.action === "extract" ? "解压" : "打包";
+  const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
+  return `
+    <div class="file-job-progress ${job.state}" id="fileJobProgress">
+      <div class="file-job-line">
+        <strong>${title}：${escapeHtml(job.source_path)}</strong>
+        <span>${stateText(job.state)} · ${progress}%</span>
+      </div>
+      <div class="file-job-bar"><i style="width:${progress}%"></i></div>
+      <div class="file-job-detail">
+        <span>${escapeHtml(job.current_file || job.message || "等待任务进度")}</span>
+        <code>${escapeHtml(job.target_path)}</code>
+      </div>
+    </div>
+  `;
+}
+
+function renderFileJobProgressOnly() {
+  const node = document.querySelector("#fileJobProgress");
+  if (!node || state.page !== "files") return;
+  node.outerHTML = renderFileJobProgress(state.data.fileJob);
+}
+
+function renderFileTargetPicker() {
+  const picker = state.fileTargetPicker;
+  const folders = picker.items || [];
+  const action = fileTargetActionText(picker.mode);
+  const targetPath = buildPickedTargetPath(picker.sourcePath, picker.currentPath, picker.mode);
+  const invalidTarget = !targetPath;
+  return `
+    <div class="modal-backdrop">
+      <section class="file-picker-modal" role="dialog" aria-modal="true" aria-labelledby="filePickerTitle">
+        <div class="file-picker-head">
+          <div>
+            <h2 id="filePickerTitle">${action}</h2>
+            <span>${escapeHtml(baseName(picker.sourcePath))}</span>
+          </div>
+          <button class="secondary" data-file-picker-close>关闭</button>
+        </div>
+        <div class="file-picker-current">
+          <span>目标目录</span>
+          <strong>${escapeHtml(picker.currentPath)}</strong>
+        </div>
+        <div class="file-picker-nav">
+          <button class="secondary" data-file-picker-root>根目录</button>
+          <button class="secondary" data-file-picker-up>上级</button>
+        </div>
+        <div class="file-picker-list">
+          ${folders.length ? folders.map((item) => `
+            <button class="file-picker-row" data-file-picker-open="${escapeAttr(item.path)}">
+              <span class="file-glyph">DIR</span>
+              <span>${escapeHtml(item.name)}</span>
+            </button>
+          `).join("") : `<div class="file-empty">当前目录下没有子文件夹</div>`}
+        </div>
+        <div class="file-picker-target">
+          <span>将生成</span>
+          <code>${escapeHtml(targetPath || "不能选择当前目标目录")}</code>
+        </div>
+        <div class="file-picker-actions">
+          <button class="secondary" data-file-picker-close>取消</button>
+          <button data-file-picker-confirm ${invalidTarget ? "disabled" : ""}>选择此文件夹</button>
+        </div>
+      </section>
+    </div>
+  `;
 }
 
 function renderEnvs() {
@@ -1115,7 +1635,6 @@ function renderAdmin() {
   return shell(`
     <section class="admin-head">
       <div class="admin-actions">
-        <button class="secondary" data-nav="dashboard">返回控制台</button>
         <button data-action="refresh">刷新后台数据</button>
       </div>
     </section>
@@ -1139,7 +1658,7 @@ function renderAdminMenuContent(menu, data) {
   if (selected === "users") return renderAdminUsers(data.users);
   if (selected === "logins") return renderAdminLoginManagement(data.onlineUsers, data.userSessions);
   if (selected === "settings") return renderAdminSettings(data.settings);
-  if (selected === "audit") return renderAdminAudit(data.auditItems);
+  if (selected === "audit") return renderAdminAudit(state.data.auditLogs || { items: data.auditItems, total: data.auditItems.length });
   return renderAdminOverview(data);
 }
 
@@ -1324,17 +1843,90 @@ function renderAdminSettings(settings) {
   `;
 }
 
-function renderAdminAudit(auditItems) {
+function renderAdminAudit(auditLogs) {
+  const auditItems = auditLogs.items || [];
+  const category = state.auditCategory || "all";
+  const page = auditLogs.page || state.auditPage || 1;
+  const pageSize = normalizeAuditPageSize(auditLogs.page_size || state.auditPageSize);
+  const totalPages = Math.max(1, Math.ceil((auditLogs.total || 0) / pageSize));
+  const filters = state.auditFilters || {};
   return `
     <section class="panel admin-card">
-      <div class="panel-head"><div><h2>审计日志</h2><span>关键管理动作会留痕。</span></div></div>
-      ${auditItems.length ? renderTable(["动作", "对象", "时间"], auditItems.map((item) => [
+      <div class="panel-head"><div><h2>审计日志</h2><span>可按操作类型分类查看。</span></div></div>
+      <section class="admin-tabs compact-tabs">
+        ${auditCategories().map(([id, label]) => `<button class="secondary ${category === id ? "active" : ""}" data-audit-category="${id}">${label}</button>`).join("")}
+      </section>
+      <form method="post" id="auditSearchForm" class="form-grid compact-form search-form audit-search">
+        <label class="wide">搜索<input name="keyword" value="${escapeAttr(filters.keyword || "")}" placeholder="动作 / 操作对象 / 操作者 (统一识别码, 用户名, 姓名) / 结果 / 详情"></label>
+        <label>动作<input name="action" value="${escapeAttr(filters.action || "")}" placeholder="例如 user.update"></label>
+        <br>
+        <label>开始时间<input name="start_time" type="datetime-local" value="${escapeAttr(filters.start_time || "")}"></label>
+        <label>结束时间<input name="end_time" type="datetime-local" value="${escapeAttr(filters.end_time || "")}"></label>
+        <div class="form-actions"><button type="submit">查询</button><button type="button" class="secondary" data-action="reset-audit-filters">重置</button></div>
+      </form>
+      <div class="audit-summary">
+        <p class="muted">当前分类 ${escapeHtml(auditCategoryName(category))}，共 ${escapeHtml(auditLogs.total || 0)} 条，第 ${escapeHtml(page)} / ${escapeHtml(totalPages)} 页。</p>
+        <label class="page-size-control">每页
+          <select name="audit_page_size">${[10, 20, 50, 100].map((size) => `<option value="${size}" ${size === pageSize ? "selected" : ""}>${size} 条</option>`).join("")}</select>
+        </label>
+      </div>
+      ${auditItems.length ? renderTable(["分类", "动作", "对象", "操作者", "结果", "时间", "详情"], auditItems.map((item) => [
+        escapeHtml(auditCategoryName(item.category || auditCategoryOf(item))),
         escapeHtml(item.action),
         `${escapeHtml(item.target_type)} #${escapeHtml(item.target_id)}`,
+        item.actor_user_id ? `#${escapeHtml(item.actor_user_id)}` : "-",
+        escapeHtml(item.result || "-"),
         formatDate(item.created_at),
+        `<span class="muted">${escapeHtml(auditDetailText(item))}</span>`,
       ])) : renderEmpty("暂无审计日志")}
+      <div class="pagination-controls">
+        <button class="secondary" data-audit-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button>
+        <form method="post" id="auditPageJumpForm" class="pager-jump">
+          <label>跳转到<input name="page" type="number" min="1" max="${totalPages}" value="${escapeAttr(page)}"></label>
+          <button type="submit" class="secondary">跳转</button>
+        </form>
+        <button class="secondary" data-audit-page="${page + 1}" ${page >= totalPages ? "disabled" : ""}>下一页</button>
+      </div>
     </section>
   `;
+}
+
+function auditCategories() {
+  return [
+    ["all", "全部"],
+    ["system", "系统操作"],
+    ["user", "用户操作"],
+    ["archive", "压缩文件"],
+    ["file", "文件操作"],
+    ["task", "任务操作"],
+    ["env", "环境操作"],
+    ["node", "节点操作"],
+    ["other", "其他"],
+  ];
+}
+
+function auditCategoryName(category) {
+  return Object.fromEntries(auditCategories())[category] || "其他";
+}
+
+function auditCategoryOf(item) {
+  const action = item.action || "";
+  const targetType = item.target_type || "";
+  if (targetType === "system" || targetType === "settings" || action.startsWith("settings.")) return "system";
+  if (targetType === "user" || targetType === "login_session" || action.startsWith("user.") || action.startsWith("auth.")) return "user";
+  if (["file.archive", "file.extract"].includes(action)) return "archive";
+  if (targetType === "file") return "file";
+  if (targetType === "task") return "task";
+  if (["env", "env_package", "env_install_job"].includes(targetType) || action.startsWith("env.")) return "env";
+  if (targetType === "node") return "node";
+  return "other";
+}
+
+function auditDetailText(item) {
+  const detail = item.detail_json || {};
+  const pairs = Object.entries(detail).filter(([, value]) => value !== null && value !== undefined && value !== "");
+  if (!pairs.length) return "-";
+  return pairs.slice(0, 3).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`).join("；");
 }
 
 function renderUserTable(users) {
@@ -1593,6 +2185,7 @@ function stateText(value) {
     registered: "已登记",
     enabled: "启用",
     disabled: "停用",
+    pending: "等待中",
   };
   return map[value] || value || "-";
 }
@@ -1684,6 +2277,45 @@ function bindEvents() {
     event.preventDefault();
     run(() => openPath(formValue(event.currentTarget, "path")));
   });
+  document.querySelector("#fileUploadForm")?.addEventListener("submit", (event) => run(() => uploadCurrentFile(event), "文件已上传"));
+  document.querySelector("[data-file-root]")?.addEventListener("click", () => run(() => openPath("/")));
+  document.querySelector("[data-file-up]")?.addEventListener("click", () => run(openParentPath));
+  document.querySelector("[data-file-new-folder]")?.addEventListener("click", () => run(createFolderFromPrompt, "文件夹已创建"));
+  document.querySelector("[data-file-new-file]")?.addEventListener("click", () => run(createFileFromPrompt, "文件已创建"));
+  document.querySelector("[data-file-rename]")?.addEventListener("click", () => run(renameSelectedPath, "已重命名"));
+  document.querySelector("[data-file-copy]")?.addEventListener("click", () => run(copySelectedPath));
+  document.querySelector("[data-file-move]")?.addEventListener("click", () => run(moveSelectedPath));
+  document.querySelector("[data-file-archive]")?.addEventListener("click", () => run(archiveSelectedFolder, "已开始打包"));
+  document.querySelector("[data-file-extract]")?.addEventListener("click", () => run(extractSelectedZip));
+  document.querySelector("[data-file-delete]")?.addEventListener("click", () => run(deleteSelectedPath, "已删除"));
+  document.querySelector("[data-file-download]")?.addEventListener("click", () => run(downloadSelectedPath));
+  document.querySelector("[data-file-save]")?.addEventListener("click", () => {
+    const content = document.querySelector("#fileEditor")?.value ?? "";
+    run(() => saveCurrentFile(content), "文件已保存");
+  });
+  document.querySelectorAll("[data-select-file]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const path = button.dataset.selectFile;
+      const kind = button.dataset.fileKind;
+      if (kind === "directory") selectFile(path, kind);
+      else run(() => previewFile(path));
+    });
+    button.addEventListener("dblclick", () => {
+      const path = button.dataset.selectFile;
+      const kind = button.dataset.fileKind;
+      run(() => (kind === "directory" ? openPath(path) : previewFile(path)));
+    });
+  });
+  document.querySelectorAll("[data-file-picker-close]").forEach((button) => button.addEventListener("click", closeFileTargetPicker));
+  document.querySelector("[data-file-picker-root]")?.addEventListener("click", () => run(() => navigateFileTargetPicker("/")));
+  document.querySelector("[data-file-picker-up]")?.addEventListener("click", () => run(() => navigateFileTargetPicker(parentPath(state.fileTargetPicker?.currentPath || "/"))));
+  document.querySelector("[data-file-picker-confirm]")?.addEventListener("click", () => {
+    const successText = state.fileTargetPicker?.mode === "move" ? "已移动" : (state.fileTargetPicker?.mode === "extract" ? "已开始解压" : "已复制");
+    run(confirmFileTargetPicker, successText);
+  });
+  document.querySelectorAll("[data-file-picker-open]").forEach((button) => {
+    button.addEventListener("click", () => run(() => navigateFileTargetPicker(button.dataset.filePickerOpen)));
+  });
   document.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.nav)));
   document.querySelector("[data-action='logout']")?.addEventListener("click", () => run(logout));
   document.querySelectorAll("[data-action='refresh']").forEach((button) => button.addEventListener("click", () => run(refreshPage, "已刷新")));
@@ -1694,10 +2326,19 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-task-zone]").forEach((button) => button.addEventListener("click", () => switchTaskZone(button.dataset.taskZone)));
   document.querySelectorAll("[data-admin-menu]").forEach((button) => button.addEventListener("click", () => switchAdminMenu(button.dataset.adminMenu)));
+  document.querySelectorAll("[data-audit-category]").forEach((button) => button.addEventListener("click", () => switchAuditCategory(button.dataset.auditCategory)));
+  document.querySelectorAll("[data-audit-page]").forEach((button) => button.addEventListener("click", () => switchAuditPage(button.dataset.auditPage)));
+  document.querySelector("#auditSearchForm")?.addEventListener("submit", (event) => updateAuditFilters(event));
+  document.querySelector("[data-action='reset-audit-filters']")?.addEventListener("click", () => resetAuditFilters());
+  document.querySelector("#auditPageJumpForm")?.addEventListener("submit", (event) => jumpAuditPage(event));
+  document.querySelector("[name='audit_page_size']")?.addEventListener("change", (event) => switchAuditPageSize(event.currentTarget.value));
   document.querySelectorAll("[data-cancel]").forEach((button) => button.addEventListener("click", () => run(() => cancelTask(button.dataset.cancel), "任务已取消")));
   document.querySelectorAll("[data-resubmit]").forEach((button) => button.addEventListener("click", () => run(() => resubmitTask(button.dataset.resubmit), "任务已重新提交")));
   document.querySelectorAll("[data-log]").forEach((button) => button.addEventListener("click", () => run(() => showTaskLog(button.dataset.log))));
-  document.querySelectorAll("[data-open-path]").forEach((button) => button.addEventListener("click", () => run(() => openPath(button.dataset.openPath))));
+  document.querySelectorAll("[data-open-path]").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    run(() => openPath(button.dataset.openPath));
+  }));
   document.querySelectorAll("[data-preview]").forEach((button) => button.addEventListener("click", () => run(() => previewFile(button.dataset.preview))));
   document.querySelectorAll("[data-test-env]").forEach((button) => button.addEventListener("click", () => run(() => testEnv(button.dataset.testEnv))));
   document.querySelectorAll("[data-delete-env]").forEach((button) => button.addEventListener("click", () => run(() => deleteEnv(button.dataset.deleteEnv), "环境已删除")));

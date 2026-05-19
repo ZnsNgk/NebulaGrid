@@ -12,7 +12,7 @@ from app.core.security import create_session_token, hash_password, verify_passwo
 from app.db.models import LoginSession, User, UserSupervisor
 from app.db.session import SessionLocal
 from app.schemas.auth import AdminOnlineUserInfo, AdminUserLoginSessions, LoginResult, LoginSessionInfo, PublicUser
-from app.services.linux_account_service import home_path_for_user, linux_account_for_role
+from app.services.linux_account_service import home_path_for_user, linux_account_for_role, set_child_account_password
 
 SESSION_STALE_MINUTES = 30
 
@@ -189,10 +189,12 @@ def update_current_user_profile(user: UserRecord, real_name: str) -> UserRecord:
 
 
 def change_current_user_password(user: UserRecord, current_password: str, new_password: str) -> None:
-    """校验旧密码后修改当前用户密码。"""
+    """校验旧密码后修改当前用户密码，并同步对应 SSH 子账户密码。"""
     if not verify_password(current_password, user.password_hash):
         raise unauthorized("current password is invalid")
-    update_user_record(user, password_hash=hash_password(new_password))
+    updated = update_user_record(user, password_hash=hash_password(new_password))
+    set_child_account_password(updated.username, updated.role.value, new_password)
+    revoke_user_sessions(user.id)
 
 
 def record_login_session(user: UserRecord, token: str, login_ip: str, user_agent: str, device_id: str = "") -> LoginSessionRecord:
@@ -403,6 +405,26 @@ def filter_user_models_for_login_management(db: Session, user_id: int | None = N
 def logout_session(token: str) -> None:
     """标记当前 token 对应会话已退出。"""
     update_session(token, logout_time=utc_now())
+
+
+def revoke_user_sessions(user_id: int) -> int:
+    """吊销指定用户的全部在线会话。
+
+    账号停用、删除或改密后，旧 token 不能继续访问系统；这里只标记会话状态，
+    保留历史登录记录供登录管理和审计排查使用。
+    """
+    now = utc_datetime()
+    revoked = 0
+    with SessionLocal() as db:
+        sessions = db.scalars(select(LoginSession).where(LoginSession.user_id == user_id)).all()
+        for session in sessions:
+            if session.logout_at is not None or session.revoked_at is not None:
+                continue
+            session.revoked_at = now
+            session.logout_at = now
+            revoked += 1
+        db.commit()
+    return revoked
 
 
 def revoke_login_session(user: UserRecord, session_id: int, current_token: str | None = None) -> LoginSessionInfo:

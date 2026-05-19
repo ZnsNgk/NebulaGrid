@@ -46,6 +46,12 @@ def me(request: Request, current_user: UserRecord = Depends(get_current_user)):
     return api_success(data=build_public_user(current_user).model_dump(), request_id=request.headers.get("x-request-id"))
 
 
+@router.get("/me")
+def get_me(request: Request, current_user: UserRecord = Depends(get_current_user)):
+    """兼容文档和旧测试中的 GET /auth/me，返回内容与 POST /auth/me 保持一致。"""
+    return me(request, current_user)
+
+
 @router.post("/me/update")
 def post_me_update(
     payload: AccountUpdateRequest,
@@ -68,6 +74,16 @@ def post_password_change(
     change_current_user_password(current_user, payload.current_password, payload.new_password)
     record_audit(current_user.id, "user.password.change", "user", str(current_user.id), ip=get_request_ip(request))
     return api_success(data={"password_changed": True}, request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/change-password")
+def post_change_password_alias(
+    payload: PasswordChangeRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """兼容早期文档中的 /auth/change-password 路径。"""
+    return post_password_change(payload, request, current_user)
 
 
 @router.post("/sessions/list")

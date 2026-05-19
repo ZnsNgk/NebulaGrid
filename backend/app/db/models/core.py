@@ -260,6 +260,25 @@ class EnvPackageManifest(Base, TimestampMixin):
     file_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
+class FileJob(Base):
+    """文件打包和解压任务表，用于跨刷新、重启和多 worker 共享进度状态。"""
+
+    __tablename__ = "file_jobs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    action: Mapped[str] = mapped_column(String(32), index=True)
+    source_path: Mapped[str] = mapped_column(String(1024))
+    target_path: Mapped[str] = mapped_column(String(1024))
+    state: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    current_file: Mapped[str] = mapped_column(String(1024), default="")
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class TaskRuntimeGuard(Base):
     """运行时守护记录表，追踪任务实际 PID/GPU 使用一致性。"""
 

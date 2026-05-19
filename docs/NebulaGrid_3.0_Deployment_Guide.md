@@ -222,6 +222,7 @@ sudo mkdir -p /etc/nebulagrid
 sudo tee /etc/nebulagrid/backend.env >/dev/null <<'EOF'
 NEBULAGRID_APP_NAME=NebulaGrid
 NEBULAGRID_ENV=production
+NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true
 NEBULAGRID_DATABASE_URL=postgresql+psycopg://nebulagrid:replace-with-strong-password@127.0.0.1:5432/nebulagrid
 NEBULAGRID_REDIS_URL=redis://127.0.0.1:6379/0
 NEBULAGRID_INFLUXDB_URL=http://127.0.0.1:8086
@@ -231,7 +232,6 @@ NEBULAGRID_INFLUXDB_TOKEN=replace-with-influx-token
 NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
 NEBULAGRID_DATA_ROOT=/home/ddltm/data
 NEBULAGRID_USER_HOME_ROOT=/home/ddltm/data/user
-NEBULAGRID_WORKSPACE_ALIAS=/workspace
 NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/miniconda3
 NEBULAGRID_CONDA_ENV_ROOT=/home/ddltm/envs/miniconda3/envs
 NEBULAGRID_TASK_LOG_ROOT=/home/ddltm/data/logs/task_logs
@@ -361,7 +361,10 @@ server {
     listen 80;
     server_name nebulagrid.local;
 
-    client_max_body_size 1024m;
+    # 文件管理会上传代码包、模型包或数据压缩包。Nginx 默认只有 1m，
+    # 如果这里过小，请求会在到达 FastAPI 前直接返回 413。
+    client_max_body_size 20g;
+    client_body_timeout 3600s;
 
     location /api/ {
         proxy_pass http://127.0.0.1:8000/api/;
@@ -369,6 +372,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 
     location /api/docs {
@@ -377,6 +382,14 @@ server {
 }
 EOF
 sudo ln -sf /etc/nginx/sites-available/nebulagrid.conf /etc/nginx/sites-enabled/nebulagrid.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+如果上传文件时出现 `413 Request Entity Too Large`，说明当前生效的 Nginx 配置仍然限制了请求体大小。确认并重载：
+
+```bash
+sudo nginx -T | grep -n client_max_body_size
 sudo nginx -t
 sudo systemctl reload nginx
 ```
@@ -410,7 +423,49 @@ curl -s http://127.0.0.1:8000/api/admin/nodes \
   -d '{"name":"node-a","ip":"192.168.1.21","ssh_user":"ddltm","gpu_models":["A100","A100"]}'
 ```
 
-## 16. 当前实现边界
+## 16. SSH 子账户同步
+
+生产环境启用 `NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true` 后，API 服务会在创建用户、启动补齐历史用户、修改密码和删除用户时维护 Linux 子账户。API 服务运行在 systemd 中，没有交互终端，所以不能依赖 sudo 密码缓存，也不能让后端保存 sudo 密码；这里必须给 API 运行用户配置受限的 `NOPASSWD` sudoers。
+
+先确认 API 实际运行用户：
+
+```bash
+systemctl cat nebulagrid-api
+systemctl show nebulagrid-api -p User -p Group
+```
+
+如果 `User=` 不是 `ddltm`，下面 sudoers 左侧的用户名也要改成实际用户。以 `ddltm` 为例：
+
+```bash
+sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
+```
+
+写入：
+
+```text
+ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl
+```
+
+保存后用 API 运行用户和绝对路径验证 sudoers 是否生效：
+
+```bash
+sudo -u ddltm sudo -n /usr/sbin/useradd --create-home --home-dir /home/ddltm/data/user/nebulagrid_sudo_probe --shell /bin/bash nebulagrid_sudo_probe
+printf 'nebulagrid_sudo_probe:temporary-password\n' | sudo -u ddltm sudo -n /usr/sbin/chpasswd
+sudo -u ddltm sudo -n /usr/bin/chown -R nebulagrid_sudo_probe:nebulagrid_sudo_probe /home/ddltm/data/user/nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
+```
+
+如果出现 `interactive authentication is required`、`a password is required` 或 `not allowed to execute`，说明 sudoers 没有匹配到 API 实际执行的绝对路径，或者授权用户不是 API 实际运行用户，需要先修正授权。
+
+平台用户可用自己的用户名和密码 SSH 到 master，默认 home 为 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。平台会把用户目录设置为 `755`，便于实验室成员互相读取和拷贝文件。
+
+## 17. 文件打包/解压状态持久化
+
+文件管理中的目录打包和压缩包解压任务会写入 PostgreSQL 的 `file_jobs` 表，而不是保存在 API 进程内存中。这样页面刷新、重新登录、API 重启或多 worker 部署时，前端仍可通过 `/api/files/jobs/latest` 读取当前用户最近一次任务状态。API 启动时会把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
+
+当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。系统限制同一用户同时只能运行一个文件打包/解压任务，并设置全局并发上限，避免共享盘 IO 被大量压缩任务打满。
+
+## 18. 当前实现边界
 
 当前后端已经具备：
 
@@ -419,6 +474,8 @@ curl -s http://127.0.0.1:8000/api/admin/nodes \
 - 任务、节点、文件、环境、用户、审计、设置等 API 契约。
 - worker 进程入口和远端脚本骨架。
 - 基于 NFS 的路径规划和部署流程。
+
+管理员审计日志已经落库到 PostgreSQL `audit_logs` 表，`/api/admin/audit-logs` 支持 `page`、`page_size` 和 `category` 查询参数。后台审计页按系统操作、用户操作、压缩文件、文件操作、任务操作、环境操作、节点操作和其他分类展示，压缩/解压分别对应 `file.archive` 与 `file.extract`。
 
 仍需在真实机器上继续完善：
 
@@ -436,6 +493,3 @@ curl -s http://127.0.0.1:8000/api/admin/nodes \
 2. 启动 API 并完成登录、节点登记、任务提交 API 测试。
 3. 再逐步接 scheduler/executor/monitor 的真实 SSH 行为。
 4. 最后开启环境包安装和 runtime guard 的强控制逻辑。
-
-
-

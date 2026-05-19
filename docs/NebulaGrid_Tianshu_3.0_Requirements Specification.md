@@ -127,7 +127,7 @@ NebulaGrid 3.0 的目标是提供一个浏览器即可访问的统一入口，�
 
 - 系统负责调度和启动用户命令，不负责保证用户代码本身正确。训练脚本报错、数据路径错误、CUDA 版本不匹配应记录为任务失败。
 
-- 系统不是强隔离容器平台。若暂不使用 Docker/容器，用户任务仍运行在计算节点的统一主账户下，例如 `ddltm`；该主账户必须在 master 和所有计算节点保持用户名、密码、UID、GID 一致。学生和导师子账户只在 master 创建，用于用户 SSH 到主节点和访问自己的 `/home/ddltm/data/user/<user_name>` home；管理员复用部署前已存在的主账户，不额外创建管理员子账户。因此必须通过路径约束、GPU 绑定检测、审计和制度约束降低风险。
+- 系统不是强隔离容器平台。若暂不使用 Docker/容器，用户任务仍运行在计算节点的统一主账户下，例如 `ddltm`；该主账户必须在 master 和所有计算节点保持用户名、密码、UID、GID 一致。平台用户子账户只在 master 创建，用于用户 SSH 到主节点和访问自己的 `/home/ddltm/data/user/<user_name>` home；`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户受保护并复用，不由平台修改系统密码或删除。因此必须通过路径约束、GPU 绑定检测、审计和制度约束降低风险。
 
 - 系统不是 Slurm/Kubernetes 的替代品。3.0 面向实验室多机多卡、轻量任务排队和 Web 管理场景，优先保证简单、可维护、可恢复。
 
@@ -288,6 +288,8 @@ nebulagrid/
 | state                 | enum           | 必填          | enabled / disabled。disabled 账号不可登录，已登录会话在鉴权时会被拒绝。                    |
 | created_at            | datetime       | 必填          | 记录账号创建时间。                                                                        |
 
+文件打包和解压任务应持久化到 `file_jobs` 表，字段包括 `user_id`、`action`、`source_path`、`target_path`、`state`、`progress`、`current_file`、`message`、`created_at`、`updated_at` 和 `finished_at`。系统需要限制同一用户只能同时运行一个打包/解压任务，并设置全局并发上限，避免共享盘 IO 被大量压缩任务打满。API 启动时应把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
+
 ## 4.4 登录与设备状态
 
 系统应记录用户登录 IP、设备指纹、登录时间、退出时间、当前在线会话数量和当前在线 IP/设备。该信息主要用于用户自查是否被盗号，同时也是管理员追踪异常操作的重要依据。
@@ -377,7 +379,7 @@ nebulagrid/
 | **需求编号** | **需求描述**                                                                      | **优先级** |
 |--------------|-----------------------------------------------------------------------------------|------------|
 | FILE-001     | 文件管理必须基于虚拟路径，不向普通用户暴露服务器绝对路径。                        | P0         |
-| FILE-002     | 支持上传、下载、删除、重命名、新建文件夹、压缩文件夹、解压 zip/tar/tar.gz。       | P0         |
+| FILE-002     | 支持上传、下载、删除、重命名、新建文件夹、压缩文件夹、解压 zip/tar/tar.gz/tgz/tar.bz2/tbz2/tar.xz/txz。       | P0         |
 | FILE-003     | 支持文本文件预览和在线编辑；图片、音频、视频按格式预览；不支持格式提示下载。      | P0         |
 | FILE-004     | 所有路径必须通过 PathResolver 验证，禁止 ..、软链接逃逸、绝对路径绕过和越权访问。 | P0         |
 | FILE-005     | 大文件上传应支持大小限制、进度显示和失败重试；管理员可配置 max_upload_size。      | P1         |
@@ -471,7 +473,7 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | task_dependencies     | task_id, prev_task_id, policy                                                                                                                     | 前驱任务关系。                                                  |
 | task_allocations      | task_id, node_id, gpu_ids, cpu_allocated, allocation_mode, allocated_at, released_at                                                              | 资源占用记录。                                                  |
 | task_events           | task_id, event_type, message, actor_user_id, created_at, detail_json                                                                              | 任务事件流。                                                    |
-| audit_logs            | actor_user_id, action, target_type, target_id, ip, result, created_at, detail_json                                                                | 审计日志。                                                      |
+| audit_logs            | actor_user_id, action, target_type, target_id, ip, result, created_at, detail_json                                                                | 审计日志；管理员后台按系统、用户、压缩文件、文件、任务、环境、节点和其他分类查询。 |
 | settings              | key, value, updated_by, updated_at                                                                                                                | 系统配置。                                                      |
 | env_packages          | id, env_id, owner_user_id, filename, package_type, file_path, size_bytes, sha256, status, created_at                                              | 用户上传的 wheel 或压缩 Python 包元数据。                       |
 | env_install_jobs      | id, package_id, env_id, mode, target_node_id, visible_gpu_indices, status, remote_pid, log_path, return_code, created_by, started_at, finished_at | 环境包安装/编译作业。该表独立于 tasks，不进入普通调度队列。     |
@@ -559,17 +561,17 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | Tasks     | POST /api/tasks/{task_id}/resubmit                    | 重新提交。                                                                | 拥有者/管理员                    |
 | Logs      | GET /api/tasks/{task_id}/log?tail=200KB               | 读取任务日志尾部。                                                        | 任务可见者                       |
 | Logs      | GET /api/tasks/{task_id}/log/download                 | 下载完整日志。                                                            | 任务可见者                       |
-| Files     | GET /api/files/list?path=/workspace                   | 列目录。                                                                  | 路径可见者                       |
+| Files     | GET /api/files/list?path=/                            | 列当前用户文件根目录。                                                    | 路径可见者                       |
 | Files     | POST /api/files/upload                                | 上传文件。                                                                | 路径可写者                       |
 | Files     | GET /api/files/preview                                | 预览文本/图片/音视频。                                                    | 路径可见者                       |
 | Files     | POST /api/files/archive                               | 压缩文件或目录。                                                          | 路径可写者                       |
-| Files     | POST /api/files/extract                               | 解压 zip/tar/tar.gz。                                                     | 路径可写者                       |
+| Files     | POST /api/files/extract                               | 解压 zip/tar/tar.gz/tgz/tar.bz2/tbz2/tar.xz/txz。                         | 路径可写者                       |
 | Envs      | GET /api/envs                                         | 环境列表。                                                                | 按角色过滤                       |
 | Envs      | POST /api/envs/upload-pack                            | 上传并导入 conda-pack 环境。                                              | 用户本人/管理员                  |
 | Envs      | POST /api/envs/{id}/test                              | 测试环境。                                                                | 环境可见者                       |
 | Users     | GET /api/users                                        | 用户列表。                                                                | 导师/管理员，按范围过滤          |
 | Users     | POST /api/users                                       | 创建用户。                                                                | 导师创建学生；管理员创建任意角色 |
-| Admin     | GET /api/admin/audit-logs                             | 审计日志分页查询。                                                        | 管理员                           |
+| Admin     | GET /api/admin/audit-logs?page=&page_size=&category=  | 审计日志分页查询；category 支持 all/system/user/archive/file/task/env/node/other。 | 管理员                           |
 | Admin     | GET/PATCH /api/admin/settings                         | 系统设置读取和修改。                                                      | 管理员                           |
 | Envs      | POST /api/envs/{env_id}/packages/upload               | 上传 whl 或压缩 Python 包，生成 env_package 记录。                        | 环境所有者/管理员                |
 | Envs      | POST /api/envs/{env_id}/packages/{package_id}/install | 安装上传包；可选择 normal 或 compile 模式，compile 模式可指定节点和 GPU。 | 环境所有者/管理员                |
@@ -706,7 +708,7 @@ export QT_QPA_PLATFORM=offscreen
 
 ## 10.1 路径模型
 
-用户界面统一展示虚拟路径，例如 `/workspace/project/train.py`。后端 PathResolver 将虚拟路径解析为服务器真实路径，并检查该路径是否落在 NFS 共享的 `/home/ddltm/data/user/<user_name>/`、`/home/ddltm/envs/miniconda3/envs/<env_name>` 或管理员配置的 visible_roots 内。所有文件 API、任务 workdir、环境路径和日志下载都必须调用同一个 PathResolver。master 与计算节点必须以相同路径挂载 `/home/ddltm/data` 和 `/home/ddltm/envs`，否则远端任务可能找不到项目路径、日志路径或环境路径。
+用户界面统一展示以当前用户文件根目录为基准的虚拟路径，例如 `/project/train.py`；虚拟根目录 `/` 对应 `/home/ddltm/data/user/<user_name>/`。后端 PathResolver 将虚拟路径解析为服务器真实路径，并检查该路径是否落在 NFS 共享的 `/home/ddltm/data/user/<user_name>/`、`/home/ddltm/envs/miniconda3/envs/<env_name>` 或管理员配置的 visible_roots 内。所有文件 API、任务 workdir、环境路径和日志下载都必须调用同一个 PathResolver。master 与计算节点必须以相同路径挂载 `/home/ddltm/data` 和 `/home/ddltm/envs`，否则远端任务可能找不到项目路径、日志路径或环境路径。
 
 ```python
 def resolve_virtual_path(user, virtual_path, mode):
@@ -783,9 +785,10 @@ def resolve_virtual_path(user, virtual_path, mode):
 | 文件安全     | 统一 PathResolver；禁止路径穿越、软链接逃逸、任意绝对路径访问；危险操作审计。                                |
 | 命令安全     | 用户命令作为任务主体执行，系统前缀由后端生成；禁止在 Web 终端给普通用户开放 master shell。                   |
 | SSH 安全     | 优先使用主账户 SSH key；若使用密码文件，权限仅允许主账户或受控服务读取。节点 IP、主账户 SSH 用户、UID/GID 仅管理员可见。 |
+| sudo 安全    | API 服务不能保存 sudo 密码，也不能依赖 sudo 密码缓存；需要维护 Linux 子账户时，必须给 API 运行用户配置受限的 `NOPASSWD` sudoers，并使用绝对路径授权。 |
 | 上传安全     | 限制文件大小和类型；解压前检测路径穿越；临时目录隔离；失败清理。                                             |
 | GPU 约束     | 设置 CUDA_VISIBLE_DEVICES，同时用进程/GPU 监控检测越权占卡。                                                 |
-| 审计         | 任务、节点、用户、文件、环境和配置的写操作必须写入 audit_logs。                                              |
+| 审计         | 任务、节点、用户、文件、压缩/解压、环境和配置的写操作必须写入 audit_logs，并在管理员后台分类展示。             |
 | 环境包安全   | 上传包必须校验扩展名、大小、sha256、路径安全、软链接逃逸和目标环境归属；压缩包解压必须在隔离临时目录中完成。 |
 | GPU 违规检测 | 普通任务必须记录远端 PID/进程组和分配 GPU UUID；守护线程发现越权 GPU 使用时应中止任务并标记 alloc_error。    |
 
@@ -1078,7 +1081,7 @@ offline --> [*]
 | 任务               | 用户提交的一条训练/推理/脚本命令及其资源需求。           |
 | 环境               | 任务运行所需的软件环境，通常为 conda/miniconda 环境。    |
 | 主账户             | master 与每个计算节点都存在的统一执行账户，例如 `ddltm`，要求用户名、密码、UID 和 GID 一致；用于 NebulaGrid 服务、SSH 控制和远端 runner 执行。 |
-| 子账户             | NebulaGrid 为学生和导师在 master 上创建的 Linux 账户，用于用户 SSH 到主节点；home 映射到 `/home/ddltm/data/user/<user_name>`，不在计算节点创建。管理员复用主账户。 |
+| 子账户             | NebulaGrid 为平台用户在 master 上创建的 Linux 账户，用于用户 SSH 到主节点；home 映射到 `/home/ddltm/data/user/<user_name>`，不在计算节点创建。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户受保护并复用。 |
 | NFS 共享目录       | master 通过 NFS 共享给计算节点的 `/home/ddltm/data` 和 `/home/ddltm/envs`；其中 `/home/ddltm/data/user` 保存用户 home，`/home/ddltm/data/logs` 保存日志，`/home/ddltm/envs` 保存 miniconda、环境和节点监控代码。 |
 | GPU 复用           | 允许多个轻量任务共享同一 GPU，但受显存和任务数阈值限制。 |
 | 前驱任务           | 当前任务开始前必须完成的依赖任务。                       |

@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -15,13 +17,18 @@ from app.schemas.users import (
     UserUpdateRequest,
 )
 from app.services.audit_service import record_audit, utc_now
-from app.services.auth_service import UserRecord, replace_supervisors, user_model_to_record
+from app.services.auth_service import UserRecord, replace_supervisors, revoke_user_sessions, user_model_to_record
 from app.services.linux_account_service import (
     create_child_account,
     delete_child_account,
+    ensure_child_account,
+    ensure_managed_home_directory,
     home_path_for_user,
     linux_account_for_role,
+    set_child_account_password,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def list_users(user: UserRecord, payload: UserListRequest | None = None) -> list[UserInfo]:
@@ -97,6 +104,7 @@ def create_user(user: UserRecord, payload: UserCreateRequest) -> UserInfo:
             account_plan = create_child_account(model.username, model.id, model.role, password=payload.password)
             model.home_path = account_plan.home_path
             model.linux_account_name = account_plan.account_name
+            ensure_managed_home_directory(model.home_path)
         for supervisor_id in supervisor_ids:
             db.add(UserSupervisor(student_id=model.id, supervisor_id=supervisor_id))
         db.commit()
@@ -147,6 +155,7 @@ def update_user(user: UserRecord, payload: UserUpdateRequest) -> UserInfo:
             if target.role == Role.ADMIN and next_role != Role.ADMIN and count_admin_users(db) <= 1:
                 raise forbidden("last admin user cannot be downgraded")
             data["role"] = next_role.value
+        state_changed_to_disabled = data.get("state") == "disabled" and target.state != "disabled"
         if "state" in data and data["state"] is not None and target.role == Role.ADMIN and data["state"] != "enabled" and count_admin_users(db) <= 1:
             raise forbidden("last admin user cannot be disabled")
 
@@ -188,6 +197,8 @@ def update_user(user: UserRecord, payload: UserUpdateRequest) -> UserInfo:
     audit_detail = {key: str(value) for key, value in data.items() if key != "password_hash"}
     if supervisor_ids_changed:
         audit_detail["supervisor_ids"] = ",".join(str(item) for item in updated.supervisor_ids)
+    if state_changed_to_disabled:
+        audit_detail["revoked_sessions"] = str(revoke_user_sessions(updated.id))
     record_audit(user.id, "user.update", "user", str(updated.id), detail_json=audit_detail)
     return to_user_info(updated)
 
@@ -208,7 +219,19 @@ def reset_user_password(user: UserRecord, payload: UserPasswordResetRequest) -> 
         db.commit()
         db.refresh(target_model)
         updated = user_model_to_record(target_model, db)
-    record_audit(user.id, "user.password.reset", "user", str(updated.id))
+    account_plan = set_child_account_password(updated.username, updated.role.value, payload.password)
+    revoked_sessions = revoke_user_sessions(updated.id)
+    record_audit(
+        user.id,
+        "user.password.reset",
+        "user",
+        str(updated.id),
+        detail_json={
+            "revoked_sessions": revoked_sessions,
+            "linux_account_name": account_plan.account_name,
+            "linux_account_executed": account_plan.executed,
+        },
+    )
     return to_user_info(updated)
 
 
@@ -224,7 +247,7 @@ def delete_user(user: UserRecord, user_id: int) -> UserInfo:
             raise forbidden("last admin user cannot be deleted")
         info = to_user_info(target, db)
         account_plan = None
-        if target.role in {Role.STUDENT, Role.MENTOR}:
+        if target.role in {Role.ADMIN, Role.STUDENT, Role.MENTOR}:
             account_plan = delete_child_account(target.username, target.role.value)
         db.query(UserSupervisor).filter(
             or_(UserSupervisor.student_id == target.id, UserSupervisor.supervisor_id == target.id)
@@ -232,6 +255,7 @@ def delete_user(user: UserRecord, user_id: int) -> UserInfo:
         db.delete(target_model)
         db.commit()
 
+    revoke_user_sessions(target.id)
     record_audit(
         user.id,
         "user.delete",
@@ -306,6 +330,40 @@ def count_admin_users(db: Session | None = None) -> int:
     finally:
         if owns_session:
             active_db.close()
+
+
+def ensure_existing_user_linux_accounts() -> int:
+    """启动时为历史平台用户补齐 Linux 账户和文件根目录。"""
+    created_or_existing = 0
+    with SessionLocal() as db:
+        for model in db.scalars(select(User).order_by(User.id)).all():
+            username_for_log = model.username
+            try:
+                expected_home = home_path_for_user(model.username, model.role)
+                if model.role in {Role.ADMIN.value, Role.STUDENT.value, Role.MENTOR.value} and model.home_path != expected_home:
+                    model.home_path = expected_home
+                elif not model.home_path:
+                    model.home_path = expected_home
+                if not model.linux_account_name:
+                    model.linux_account_name = linux_account_for_role(model.username, model.role)
+                if model.role in {Role.ADMIN.value, Role.STUDENT.value, Role.MENTOR.value}:
+                    account_plan = ensure_child_account(model.username, model.role)
+                    model.home_path = account_plan.home_path
+                    model.linux_account_name = account_plan.account_name
+                    if ensure_managed_home_directory(model.home_path):
+                        created_or_existing += 1
+                db.commit()
+            except Exception:
+                # 历史用户可能存在不符合 Linux 用户名规则的账号，或部署机 sudoers 尚未放开 useradd/chpasswd。
+                # 启动补齐失败需要进入日志供管理员修复，但不能让一个异常账户把整套 Web API 拖成 502。
+                db.rollback()
+                logger.exception("failed to ensure Linux account for existing user %s", username_for_log)
+    return created_or_existing
+
+
+def ensure_existing_user_home_directories() -> int:
+    """兼容旧启动调用：实际会同时补齐 Linux 账户和用户根目录。"""
+    return ensure_existing_user_linux_accounts()
 
 
 def username_exists(db: Session, username: str, exclude_user_id: int | None = None) -> bool:

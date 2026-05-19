@@ -188,7 +188,9 @@ flowchart TB
 └── /home/ddltm/envs                          # 通过 NFS 挂载 master 的 /home/ddltm/envs，包含环境与 runner/monitor/env_installer
 ```
 
-部署约定：master 作为 NFS server，共享 `/home/ddltm/data` 和 `/home/ddltm/envs` 到所有计算节点。`/home/ddltm/data/user/<user_name>` 是平台用户在 master 上的 home 目录；`/home/ddltm/data/logs` 存放任务日志和环境安装日志；`/home/ddltm/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台为学生和导师创建的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；管理员用户复用部署前已存在的主账户，不额外创建管理员子账户。计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/home/ddltm/data/user/<user_name>` 下的文件执行必要的增删查改，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
+部署约定：master 作为 NFS server，共享 `/home/ddltm/data` 和 `/home/ddltm/envs` 到所有计算节点。`/home/ddltm/data/user/<user_name>` 是平台用户在 master 上的 home 目录；`/home/ddltm/data/logs` 存放任务日志和环境安装日志；`/home/ddltm/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台用户的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户受保护并复用，不由平台修改系统密码或删除。计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/home/ddltm/data/user/<user_name>` 下的文件执行必要的增删查改，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
+
+API 服务维护 Linux 子账户时必须使用受限 sudoers。由于 systemd 服务没有交互终端，后端不能保存 sudo 密码，也不能依赖 sudo 密码缓存；部署时必须给 API 运行用户配置 `NOPASSWD`，并使用 `/usr/sbin/useradd`、`/usr/sbin/chpasswd`、`/usr/bin/chown` 等绝对路径授权。
 
 中期可演进为：数据库独立部署，Redis 独立部署，API 多实例，Scheduler/Monitor/Executor 保持单实例或通过 leader election 控制。
 
@@ -287,6 +289,7 @@ erDiagram
     users ||--o{ environments : owns
     users ||--o{ env_install_jobs : starts
     users ||--o{ audit_logs : acts
+    users ||--o{ file_jobs : starts
 
     nodes ||--o{ gpu_devices : contains
     nodes ||--o{ tasks : runs
@@ -329,6 +332,23 @@ erDiagram
 | id | bigint / uuid | 内部主键 |
 | student_id | fk users.id | 学生用户 ID |
 | supervisor_id | fk users.id | 导师用户 ID，当前实现中导师角色值为 `mentor` |
+
+#### 6.2.x file_jobs
+
+文件管理中的目录打包和压缩包解压属于重 IO 后台任务，状态必须进入数据库，不能只保存在 API 进程内存。`file_jobs` 表用于页面刷新、重新登录、API 多 worker 部署后的进度恢复，也用于限制单用户和全局并发。API 启动时应把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | varchar primary key | 后台文件任务 ID |
+| user_id | fk users.id | 发起任务的用户 |
+| action | enum/string | archive / extract |
+| source_path | varchar | 用户视角的源虚拟路径 |
+| target_path | varchar | 用户视角的目标虚拟路径 |
+| state | enum/string | pending / running / succeeded / failed |
+| progress | int | 0-100 的进度百分比 |
+| current_file | varchar | 当前正在处理的压缩包成员或输出条目 |
+| message | text | 展示给前端的进度或错误信息 |
+| created_at / updated_at / finished_at | timestamp | 创建、更新和完成时间 |
 
 #### 6.2.3 login_sessions
 
@@ -514,10 +534,11 @@ erDiagram
 | target_type | varchar | users/tasks/nodes/envs/files/system |
 | target_id | varchar | 目标 ID |
 | ip | varchar | 操作 IP |
-| user_agent | text | 浏览器 UA |
 | result | enum | success/failed/denied |
-| detail | jsonb | 详情 |
+| detail_json | jsonb | 详情 |
 | created_at | timestamp | 时间 |
+
+管理员后台不额外存储分类字段，而是按 `action` 和 `target_type` 动态归类：系统操作、用户操作、压缩文件、文件操作、任务操作、环境操作、节点操作和其他。`file.archive` 与 `file.extract` 会单独进入“压缩文件”分类，便于排查共享盘 IO 和用户上传/解压行为。
 
 ---
 
@@ -656,7 +677,8 @@ API Router
 | GET | /api/files/download | 下载 |
 | POST | /api/files/mkdir | 创建目录 |
 | POST | /api/files/archive | 打包文件夹 |
-| POST | /api/files/extract | 解压 zip/tar |
+| POST | /api/files/extract | 解压 zip/tar/tar.gz/tgz/tar.bz2/tbz2/tar.xz/txz |
+| GET | /api/files/jobs/latest | 当前用户最近一次打包/解压任务状态 |
 | GET | /api/files/preview | 文本/图片/音视频预览 |
 | DELETE | /api/files | 删除 |
 
@@ -1071,7 +1093,7 @@ running install job exists -> reject new install job or queue it
 前端永远展示虚拟路径，例如：
 
 ```text
-/workspace/project/train.py
+/project/train.py
 /home/ddltm/envs/miniconda3/envs/torch201
 /logs/2026051809201250.log
 ```
@@ -1268,7 +1290,8 @@ MVP 推荐 Session Cookie + CSRF 防护，原因是管理后台操作多，主�
 5. 禁止前端传入真实系统路径绕过 PathResolver；
 6. 对危险命令可增加提示或黑名单，但不能依赖黑名单保证安全；
 7. 计算节点上的任务以跨节点一致的主账户运行，不能把计算节点 Unix 账户当作用户隔离边界；
-8. 后续如需要强隔离，可引入容器、cgroup 或独立 Unix 用户。
+8. API 维护 master 子账户必须依赖受限 `NOPASSWD` sudoers，不能保存 sudo 密码或依赖交互认证；
+9. 后续如需要强隔离，可引入容器、cgroup 或独立 Unix 用户。
 
 ### 17.3 文件安全
 
@@ -1598,4 +1621,3 @@ FastAPI API Server
 ```
 
 该架构能够覆盖当前需求分析书中提出的角色管理、节点监控、任务调度、环境管理、文件管理、日志查看、用户状态、管理员后台、环境包安装和调度错误守护等需求，并为后续横向项目、软著、论文工程系统展示和实验室长期运维留下扩展空间。
-

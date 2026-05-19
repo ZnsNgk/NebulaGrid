@@ -65,6 +65,24 @@ def migrate_existing_schema() -> None:
                     "supervisor_id": "INTEGER",
                 },
             )
+        if "audit_logs" in tables:
+            ensure_columns(
+                connection,
+                "audit_logs",
+                {
+                    "actor_user_id": "INTEGER",
+                    "action": "VARCHAR(128)",
+                    "target_type": "VARCHAR(64)",
+                    "target_id": "VARCHAR(128)",
+                    "ip": "VARCHAR(64)",
+                    "result": "VARCHAR(32) DEFAULT 'success'",
+                    "detail_json": "JSON DEFAULT '{}'::json",
+                    "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT now()",
+                },
+            )
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_created_at ON audit_logs (created_at)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_action ON audit_logs (action)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_target_type ON audit_logs (target_type)"))
 
 
 def ensure_columns(connection, table_name: str, columns: dict[str, str]) -> None:
@@ -112,7 +130,7 @@ def seed_defaults(db: Session) -> None:
     for key, value in {
         "scheduler.enabled": "true",
         "monitor.enabled": "true",
-        "uploads.max_size_mb": "1024",
+        "uploads.max_size_mb": "20480",
     }.items():
         exists = db.get(Setting, key)
         if exists is None:

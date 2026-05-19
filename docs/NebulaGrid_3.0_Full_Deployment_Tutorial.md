@@ -400,7 +400,6 @@ NEBULAGRID_INFLUXDB_TOKEN=replace-with-influx-token
 NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
 NEBULAGRID_DATA_ROOT=/home/ddltm/data
 NEBULAGRID_USER_HOME_ROOT=/home/ddltm/data/user
-NEBULAGRID_WORKSPACE_ALIAS=/workspace
 NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/miniconda3
 NEBULAGRID_CONDA_ENV_ROOT=/home/ddltm/envs/miniconda3/envs
 NEBULAGRID_TASK_LOG_ROOT=/home/ddltm/data/logs/task_logs
@@ -685,7 +684,10 @@ server {
     listen 80;
     server_name _;
 
-    client_max_body_size 1024m;
+    # 文件管理会上传代码包、模型包或数据压缩包。Nginx 默认只有 1m，
+    # 如果这里过小，请求会在到达 FastAPI 前直接返回 413。
+    client_max_body_size 20g;
+    client_body_timeout 3600s;
 
     root /home/ddltm/master/frontend;
     index index.html;
@@ -701,6 +703,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }
 EOF
@@ -734,6 +738,14 @@ root /var/www/nebulagrid;
 ```bash
 sudo ln -sf /etc/nginx/sites-available/nebulagrid.conf /etc/nginx/sites-enabled/nebulagrid.conf
 sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+如果上传文件时浏览器提示 `413 Request Entity Too Large`，说明当前生效的 Nginx 配置仍然限制了请求体大小。用下面命令确认生效值并重新加载：
+
+```bash
+sudo nginx -T | grep -n client_max_body_size
 sudo nginx -t
 sudo systemctl reload nginx
 ```
@@ -812,8 +824,33 @@ curl -s http://127.0.0.1:8000/api/nodes \
 curl -s http://127.0.0.1:8000/api/tasks \
   -H "Authorization: Bearer ${TOKEN}" \
   -H 'Content-Type: application/json' \
-  -d '{"description":"smoke test","workdir":"/workspace","command":"python --version","requirement":{"need_gpus":0}}'
+  -d '{"description":"smoke test","workdir":"/","command":"python --version","requirement":{"need_gpus":0}}'
 ```
+
+### 17.6 验证文件打包/解压任务
+
+文件管理中的打包和解压任务会写入 PostgreSQL 的 `file_jobs` 表，页面刷新、重新登录或 API 多 worker 部署时仍可读取最近一次任务状态。API 启动时会把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。
+
+```bash
+curl -s http://127.0.0.1:8000/api/files/jobs/latest \
+  -H "Authorization: Bearer ${TOKEN}"
+```
+
+如果刚启动过打包或解压，返回数据中应包含 `action`、`state`、`progress`、`source_path` 和 `target_path`。同一用户同时只能运行一个文件打包/解压任务，系统也会限制全局并发，避免共享盘 IO 被大量压缩任务打满。
+
+### 17.7 验证审计日志落库与分类
+
+关键写操作会写入 PostgreSQL 的 `audit_logs` 表，管理员后台“审计日志”页面会分页读取数据库记录，并按系统操作、用户操作、压缩文件、文件操作、任务操作、环境操作、节点操作和其他分类展示。
+
+```bash
+curl -s 'http://127.0.0.1:8000/api/admin/audit-logs?page_size=20&category=all' \
+  -H "Authorization: Bearer ${TOKEN}"
+
+curl -s 'http://127.0.0.1:8000/api/admin/audit-logs?page_size=20&category=archive' \
+  -H "Authorization: Bearer ${TOKEN}"
+```
+
+如果从旧版本升级，`init_db.py` 会补齐 `audit_logs` 缺失字段并创建常用索引。该表建议纳入长期备份，用于追溯谁在何时对什么对象执行了什么操作。
 
 ## 18. 防火墙
 
@@ -866,7 +903,34 @@ journalctl -u nebulagrid-api -n 100 --no-pager
 http://主节点IP/api
 ```
 
-### 19.3 数据库连接失败
+### 19.3 Nginx 返回 502
+
+`502 Bad Gateway` 表示 Nginx 正常工作，但反向代理到后端 API 失败。先看 API 服务是否启动：
+
+```bash
+systemctl status nebulagrid-api --no-pager
+journalctl -u nebulagrid-api -n 200 --no-pager
+curl -v http://127.0.0.1:8000/api/health
+```
+
+如果日志里出现 `sudo`、`useradd`、`chpasswd`、`chown`、`linux account command failed` 或 `interactive authentication is required`，说明 SSH 子账户同步缺少 `NOPASSWD` sudoers 授权，或者历史用户名不符合 Linux 账户规则。API 服务运行在 systemd 中，没有交互终端，所以不能依赖 sudo 密码缓存，也不能让后端保存 sudo 密码；必须给 API 运行用户配置受限的免密 sudoers。
+
+先确认 API 实际运行用户：
+
+```bash
+systemctl cat nebulagrid-api
+systemctl show nebulagrid-api -p User -p Group
+```
+
+如果 `User=` 不是 `ddltm`，第 21 节 sudoers 左侧的用户名也必须改成实际用户。然后确认 `/etc/sudoers.d/nebulagrid-ddltm` 包含第 21 节列出的 `useradd/usermod/userdel/chpasswd/mkdir/chown/chmod/find/setfacl`，再重启 API：
+
+```bash
+sudo visudo -c
+sudo systemctl restart nebulagrid-api
+journalctl -u nebulagrid-api -n 100 --no-pager
+```
+
+### 19.4 数据库连接失败
 
 检查环境变量：
 
@@ -881,7 +945,7 @@ systemctl status postgresql --no-pager
 psql 'postgresql://nebulagrid:replace-with-strong-password@127.0.0.1:5432/nebulagrid' -c 'select 1;'
 ```
 
-### 19.4 NFS 挂载失败
+### 19.5 NFS 挂载失败
 
 主节点检查：
 
@@ -898,7 +962,7 @@ sudo mount -v -t nfs master:/home/ddltm/data /home/ddltm/data
 sudo mount -v -t nfs master:/home/ddltm/envs /home/ddltm/envs
 ```
 
-### 19.5 SSH 免密失败
+### 19.6 SSH 免密失败
 
 主节点检查：
 
@@ -921,7 +985,7 @@ sudo chmod 600 /home/ddltm/.ssh/authorized_keys
 sudo chown -R ddltm:ddltm /home/ddltm/.ssh
 ```
 
-### 19.6 Python 包安装慢或失败
+### 19.7 Python 包安装慢或失败
 
 可以配置 pip 镜像：
 
@@ -956,7 +1020,7 @@ sudo systemctl reload nginx
 
 如果代码来自 rsync/scp，重新同步后执行同样的 pip install 和 systemctl restart。
 
-## 23. 主账户部署模式总结
+## 21. 主账户部署模式总结
 
 代码根目录固定为 `/home/ddltm/master`，权限边界拆成两部分。
 
@@ -988,7 +1052,7 @@ sudo systemctl reload nginx
 - `systemctl restart/reload`。
 - 修改 Nginx 配置。
 
-如果希望 `ddltm` 能无密码重启 NebulaGrid 服务，可以让管理员添加一条非常窄的 sudoers 规则：
+NebulaGrid API 以 `ddltm` 运行，但创建 SSH 子账户、同步 SSH 密码和删除子账户需要 root 权限。生产环境启用 `NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true` 后，需要给 `ddltm` 添加一条受限 sudoers 规则：
 
 ```bash
 sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
@@ -997,19 +1061,27 @@ sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
 写入：
 
 ```text
-ddltm ALL=(root) NOPASSWD: /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
+ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
 ```
 
-保存后，`ddltm` 可以执行：
+这样平台创建用户时会创建同名 Linux 账户，用户可用平台用户名和密码 SSH 到 master，并默认进入 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。用户在 Web 修改密码或管理员重置密码时，会同步执行 `chpasswd`；删除平台用户时会同步执行 `userdel --remove`。所有用户目录按实验室共享策略设置为 `755`，便于互相读取和拷贝文件。
+
+保存后，用 API 运行用户验证 `sudo -n` 是否能无交互执行。下面以 `ddltm` 为例：
 
 ```bash
+sudo -u ddltm sudo -n /usr/sbin/useradd --create-home --home-dir /home/ddltm/data/user/nebulagrid_sudo_probe --shell /bin/bash nebulagrid_sudo_probe
+printf 'nebulagrid_sudo_probe:temporary-password\n' | sudo -u ddltm sudo -n /usr/sbin/chpasswd
+sudo -u ddltm sudo -n /usr/bin/chown -R nebulagrid_sudo_probe:nebulagrid_sudo_probe /home/ddltm/data/user/nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 sudo systemctl restart nebulagrid-api
 sudo systemctl reload nginx
 ```
 
+上面的 `nebulagrid_sudo_probe` 只用于验证 sudoers 是否真的允许 API 需要的账户命令。因为 sudoers 会严格匹配命令绝对路径，所以如果这里出现 `interactive authentication is required`、`a password is required` 或 `not allowed to execute`，先修正 `/etc/sudoers.d/nebulagrid-ddltm`，不要只测试 `sudo useradd` 这种相对命令。
+
 不要给 `ddltm` 配置宽泛的 `NOPASSWD: ALL`，这样会扩大系统风险。
 
-## 21. 最小验收清单
+## 22. 最小验收清单
 
 部署完成后，至少确认以下项目：
 
@@ -1020,10 +1092,11 @@ sudo systemctl reload nginx
 - 主节点可以 `sudo -u ddltm ssh ddltm@node-a 'nvidia-smi -L'`。
 - 计算节点可以看到 `/home/ddltm/envs/nebulagrid_remote/monitor.py`。
 - PostgreSQL 中能看到 NebulaGrid 数据表。
+- PostgreSQL 中能看到 `file_jobs` 表；打包/解压后 `/api/files/jobs/latest` 能返回最近任务状态。
 - InfluxDB 中能查询到 `node_metrics` / `gpu_metrics` 监控点。
 - systemd 中 API 和 worker 服务为 running。
 
-## 22. 当前版本边界
+## 23. 当前版本边界
 
 当前代码适合部署后开始真实机器联调。以下能力还需要继续开发完善：
 
@@ -1033,6 +1106,3 @@ sudo systemctl reload nginx
 - runtime guard 检查实际 PID/GPU 使用并处理 `alloc_error`。
 - env install worker 执行真实包安装、日志回收和状态更新。
 - Alembic 数据库迁移；当前初始化使用 ORM `create_all`，适合 MVP 部署和测试。
-
-
-

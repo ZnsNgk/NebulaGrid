@@ -23,20 +23,13 @@ def resolve_visible_path(path: str) -> Path:
 
 
 def resolve_user_visible_path(path: str, username: str, role: str = "student") -> Path:
-    """解析用户可见路径，把 /workspace 安全映射到配置的用户 home 根目录。"""
+    """解析用户可见路径，把虚拟根目录 / 安全映射到当前用户文件根目录。"""
     settings = get_settings()
     normalized = normalize_virtual_path(path)
-    alias = settings.user_workspace_alias.rstrip("/")
     if role == "admin":
         user_root = Path(f"/home/{settings.main_linux_user}").resolve(strict=False)
     else:
         user_root = (Path(settings.user_home_root) / username).resolve(strict=False)
-    if normalized == alias or normalized.startswith(f"{alias}/"):
-        suffix = normalized[len(alias) :].lstrip("/")
-        candidate = user_root / suffix
-    else:
-        candidate = Path(normalized)
-    real_path = candidate.resolve(strict=False)
     user_home_root = Path(settings.user_home_root).resolve(strict=False)
     shared_roots = [
         root
@@ -44,6 +37,18 @@ def resolve_user_visible_path(path: str, username: str, role: str = "student") -
         if root != user_home_root
     ]
     allowed_roots = [user_root, *shared_roots]
+
+    # 文件管理不再暴露 /workspace 概念。普通的 /project/train.py 这类虚拟路径
+    # 都落到用户文件根目录下；只有已经位于共享可见根中的真实绝对路径才按原路径解析。
+    absolute_candidate = Path(normalized).resolve(strict=False)
+    if normalized == "/":
+        candidate = user_root
+    elif any(absolute_candidate == root or root in absolute_candidate.parents for root in allowed_roots):
+        candidate = absolute_candidate
+    else:
+        candidate = user_root / normalized.lstrip("/")
+
+    real_path = candidate.resolve(strict=False)
     if not any(real_path == root or root in real_path.parents for root in allowed_roots):
         raise forbidden("path is outside allowed user roots")
     return real_path

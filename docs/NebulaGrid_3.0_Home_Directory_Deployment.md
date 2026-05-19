@@ -188,7 +188,16 @@ sudo systemctl restart nebulagrid-api nebulagrid-scheduler nebulagrid-node-monit
 sudo systemctl reload nginx
 ```
 
-如果管理员愿意给 `ddltm` 很窄的重启权限，可以配置 sudoers：
+如果启用了 SSH 子账户同步或希望 `ddltm` 可以执行受控重启，需要配置很窄的 sudoers。API 服务运行在 systemd 中，没有交互终端，所以不能依赖 sudo 密码缓存，也不能让后端保存 sudo 密码；所有需要 API 调用的命令必须使用 `NOPASSWD` 和绝对路径授权。
+
+先确认 API 实际运行用户：
+
+```bash
+systemctl cat nebulagrid-api
+systemctl show nebulagrid-api -p User -p Group
+```
+
+如果 `User=` 不是 `ddltm`，下面 sudoers 左侧的用户名也要改成实际用户。以 `ddltm` 为例：
 
 ```bash
 sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
@@ -197,10 +206,24 @@ sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
 写入：
 
 ```text
-ddltm ALL=(root) NOPASSWD: /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
+ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
 ```
+
+保存后用 API 运行用户和绝对路径验证 sudoers 是否生效：
+
+```bash
+sudo -u ddltm sudo -n /usr/sbin/useradd --create-home --home-dir /home/ddltm/data/user/nebulagrid_sudo_probe --shell /bin/bash nebulagrid_sudo_probe
+printf 'nebulagrid_sudo_probe:temporary-password\n' | sudo -u ddltm sudo -n /usr/sbin/chpasswd
+sudo -u ddltm sudo -n /usr/bin/chown -R nebulagrid_sudo_probe:nebulagrid_sudo_probe /home/ddltm/data/user/nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
+```
+
+如果出现 `interactive authentication is required`、`a password is required` 或 `not allowed to execute`，说明 sudoers 没有匹配到 API 实际执行的绝对路径，或者授权用户不是 API 实际运行用户，需要先修正授权。
 
 不要给 `NOPASSWD: ALL`。
 
+## 9. 文件任务状态
 
+文件管理中的目录打包和压缩包解压任务会写入 PostgreSQL 的 `file_jobs` 表，而不是保存在 API 进程内存中。页面刷新、重新登录、API 重启或多 worker 部署后，前端仍可通过 `/api/files/jobs/latest` 读取当前用户最近一次任务状态。API 启动时会把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
 
+当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。同一用户同时只能运行一个文件打包/解压任务，系统也会限制全局并发，避免共享盘 IO 被大量压缩任务打满。

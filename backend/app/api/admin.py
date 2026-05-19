@@ -108,11 +108,28 @@ def get_admin_audit_logs(
     request: Request,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
+    category: str | None = Query(default=None, max_length=32),
+    keyword: str | None = Query(default=None, max_length=128),
+    action: str | None = Query(default=None, max_length=128),
+    start_time: str | None = Query(default=None, max_length=40),
+    end_time: str | None = Query(default=None, max_length=40),
     current_user: UserRecord = Depends(get_current_user),
 ):
     """分页查询审计日志。"""
-    items, total = list_audit_logs(current_user, page, page_size)
-    data = {"items": [item.model_dump() for item in items], "total": total, "page": page, "page_size": page_size}
+    items, total = list_audit_logs(current_user, page, page_size, category, keyword, action, start_time, end_time)
+    data = {
+        "items": [item.model_dump() for item in items],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "category": category or "all",
+        "filters": {
+            "keyword": keyword or "",
+            "action": action or "",
+            "start_time": start_time or "",
+            "end_time": end_time or "",
+        },
+    }
     return api_success(data=data, request_id=request.headers.get("x-request-id"))
 
 

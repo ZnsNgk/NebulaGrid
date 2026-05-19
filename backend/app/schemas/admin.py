@@ -5,7 +5,7 @@ class AuditLogInfo(BaseModel):
     """审计日志响应模型，记录关键管理动作的来源、目标和结果。"""
 
     id: int
-    actor_user_id: int
+    actor_user_id: int | None
     action: str
     target_type: str
     target_id: str
@@ -13,6 +13,7 @@ class AuditLogInfo(BaseModel):
     result: str
     created_at: str
     detail_json: dict
+    category: str = "other"
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -28,4 +29,3 @@ class SettingInfo(BaseModel):
     value: str
     updated_by: int | None = None
     updated_at: str | None = None
-

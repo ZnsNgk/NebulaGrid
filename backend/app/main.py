@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -8,6 +10,10 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.responses import api_error
 from app.db.init_db import init_database
+from app.services.file_service import mark_interrupted_file_jobs
+from app.services.user_service import ensure_existing_user_linux_accounts
+
+logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
@@ -43,8 +49,14 @@ def register_startup_tasks(app: FastAPI) -> None:
 
     @app.on_event("startup")
     def initialize_database_on_startup() -> None:
-        """执行幂等数据库初始化；连接失败时让启动失败，便于运维尽早看到真实配置问题。"""
+        """执行幂等数据库初始化，并补齐历史用户的文件根目录。"""
         init_database()
+        mark_interrupted_file_jobs()
+        try:
+            ensure_existing_user_linux_accounts()
+        except Exception:
+            # Linux 子账户补齐依赖系统命令和 sudoers；部署遗漏时记录错误但不阻断 API 启动。
+            logger.exception("failed to reconcile Linux accounts on startup")
 
 
 def register_exception_handlers(app: FastAPI) -> None:

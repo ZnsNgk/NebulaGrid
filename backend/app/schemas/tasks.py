@@ -16,7 +16,7 @@ class TaskCreateRequest(BaseModel):
 
     description: str = Field(default="", max_length=512)
     env_id: int | None = None
-    workdir: str = Field(default="/workspace", min_length=1, max_length=1024)
+    workdir: str = Field(default="/", min_length=1, max_length=1024)
     command: str = Field(min_length=1, max_length=4096)
     priority: int = Field(default=0, ge=0, le=100)
     on_hold: bool = False
@@ -65,4 +65,3 @@ class TaskGuardInfo(BaseModel):
     violation_count: int
     state: str
     last_check_at: str | None
-
