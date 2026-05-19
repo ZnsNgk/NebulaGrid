@@ -1,9 +1,9 @@
 from itertools import count
+from pathlib import PurePosixPath
 
 from app.core.config import get_settings
 from app.core.errors import forbidden, not_found, validation_error
-from app.core.path_resolver import resolve_user_visible_path
-from app.core.rbac import Role, require_permission
+from app.core.rbac import require_permission
 from app.schemas.envs import (
     EnvInfo,
     EnvInstallJobInfo,
@@ -24,22 +24,23 @@ _JOBS: list[EnvInstallJobInfo] = []
 
 
 def list_envs(user: UserRecord) -> list[EnvInfo]:
-    """返回用户可见环境列表，管理员和导师可先查看全部占位数据。"""
+    """返回当前用户可使用的全部环境，并标记哪些环境允许当前用户修改。"""
     require_permission(user.role, "envs:read")
-    if user.role in {Role.ADMIN, Role.MENTOR, Role.VIEWER}:
-        return _ENVS
-    return [env for env in _ENVS if env.owner_user_id == user.id]
+    return [mark_env_permissions(user, env) for env in _ENVS]
 
 
 def upload_env_pack(user: UserRecord, payload: EnvUploadRequest) -> EnvInfo:
-    """登记 conda-pack 环境元数据，真实上传和解压导入后续接入。"""
+    """登记用户环境，并把真实路径固定到 miniconda 的 envs 目录一级子目录。"""
     require_permission(user.role, "envs:write")
-    resolve_user_visible_path(payload.path, user.id)
+    env_path = build_conda_env_path(payload.name, payload.path)
+    if any(item.path == env_path or item.name == payload.name for item in _ENVS):
+        raise validation_error("environment name already exists")
     env = EnvInfo(
         id=next(_ENV_ID),
         owner_user_id=user.id,
         name=payload.name,
-        path=payload.path,
+        path=env_path,
+        can_modify=True,
         description=payload.description,
         source_type="conda_pack",
         state="registered",
@@ -52,7 +53,7 @@ def upload_env_pack(user: UserRecord, payload: EnvUploadRequest) -> EnvInfo:
 
 
 def test_env(user: UserRecord, env_id: int) -> dict[str, str | bool]:
-    """触发环境测试占位动作，真实版本会调用远端 Python 版本探测。"""
+    """测试任意可用环境，环境使用权限与修改权限分离。"""
     env = get_env_for_user(user, env_id)
     return {"ok": True, "env_id": str(env.id), "state": env.state}
 
@@ -62,9 +63,9 @@ def upload_package(
     env_id: int,
     payload: EnvPackageUploadRequest,
 ) -> EnvPackageInfo:
-    """登记环境包元数据，后续替换为真实文件上传、校验和落盘。"""
+    """登记环境包元数据；包安装属于修改环境，必须限制为环境所有者。"""
     env = get_env_for_user(user, env_id)
-    require_env_owner_or_admin(user, env)
+    require_env_owner(user, env)
     settings = get_settings()
     package = EnvPackageInfo(
         id=next(_PACKAGE_ID),
@@ -89,9 +90,9 @@ def install_package(
     package_id: int,
     payload: EnvPackageInstallRequest,
 ) -> EnvInstallJobInfo:
-    """创建环境包安装作业，MVP 阶段只入队不执行远端命令。"""
+    """创建环境包安装作业；只有环境所有者能修改目标环境。"""
     env = get_env_for_user(user, env_id)
-    require_env_owner_or_admin(user, env)
+    require_env_owner(user, env)
     package = require_package(package_id)
     if package.env_id != env.id:
         raise validation_error("package does not belong to env")
@@ -112,7 +113,7 @@ def install_package(
 
 
 def get_install_job(user: UserRecord, job_id: int) -> EnvInstallJobInfo:
-    """返回环境安装作业详情，并复用环境可见性判断。"""
+    """返回环境安装作业详情，并复用环境使用权限判断。"""
     job = require_job(job_id)
     get_env_for_user(user, job.env_id)
     return job
@@ -125,10 +126,10 @@ def get_install_job_log(user: UserRecord, job_id: int) -> str:
 
 
 def cancel_install_job(user: UserRecord, job_id: int) -> EnvInstallJobInfo:
-    """取消等待或运行中的环境安装作业，并记录审计信息。"""
+    """取消自己创建的环境安装作业，并记录审计信息。"""
     job = get_install_job(user, job_id)
-    if job.created_by != user.id and user.role != Role.ADMIN:
-        raise forbidden("job creator or admin required")
+    if job.created_by != user.id:
+        raise forbidden("job creator required")
     if job.status in {"succeeded", "failed", "cancelled"}:
         raise validation_error("finished job cannot be cancelled")
     job.status = "cancelled"
@@ -137,18 +138,29 @@ def cancel_install_job(user: UserRecord, job_id: int) -> EnvInstallJobInfo:
     return job
 
 
-def get_env_for_user(user: UserRecord, env_id: int) -> EnvInfo:
-    """获取用户可见环境，不可见时返回 NOT_FOUND 以减少越权探测。"""
-    env = next((item for item in _ENVS if item.id == env_id), None)
-    if env is None or (user.role not in {Role.ADMIN, Role.MENTOR, Role.VIEWER} and env.owner_user_id != user.id):
-        raise not_found("env not found")
+def delete_env(user: UserRecord, env_id: int) -> EnvInfo:
+    """删除自己创建的环境元数据；真实目录删除后续由受控作业处理，避免误删共享环境。"""
+    env = get_env_for_user(user, env_id)
+    require_env_owner(user, env)
+    stored_env = next(item for item in _ENVS if item.id == env_id)
+    _ENVS.remove(stored_env)
+    record_audit(user.id, "env.delete", "env", str(env.id))
     return env
 
 
-def require_env_owner_or_admin(user: UserRecord, env: EnvInfo) -> None:
-    """断言用户是环境所有者或管理员，失败时返回 403。"""
-    if user.role != Role.ADMIN and env.owner_user_id != user.id:
-        raise forbidden("env owner or admin required")
+def get_env_for_user(user: UserRecord, env_id: int) -> EnvInfo:
+    """获取用户可使用的环境；所有具备 envs:read 的用户都可使用全部环境。"""
+    require_permission(user.role, "envs:read")
+    env = next((item for item in _ENVS if item.id == env_id), None)
+    if env is None:
+        raise not_found("env not found")
+    return mark_env_permissions(user, env)
+
+
+def require_env_owner(user: UserRecord, env: EnvInfo) -> None:
+    """断言用户可以修改该环境；任何角色都只修改自己创建的环境。"""
+    if env.owner_user_id != user.id:
+        raise forbidden("env owner required")
 
 
 def require_package(package_id: int) -> EnvPackageInfo:
@@ -165,3 +177,22 @@ def require_job(job_id: int) -> EnvInstallJobInfo:
     if job is None:
         raise not_found("install job not found")
     return job
+
+
+def build_conda_env_path(name: str, requested_path: str | None = None) -> str:
+    """把环境名解析为 conda 可识别的一级环境目录，拒绝任何嵌套目录或路径逃逸。"""
+    cleaned = name.strip()
+    if cleaned in {"", ".", ".."} or "/" in cleaned or "\\" in cleaned:
+        raise validation_error("environment name must be a single directory name")
+    root = PurePosixPath(get_settings().conda_env_root)
+    env_path = str(root / cleaned)
+    if requested_path and str(PurePosixPath(requested_path)) != env_path:
+        raise validation_error("environment path must be under conda env root without extra directories")
+    return env_path
+
+
+def mark_env_permissions(user: UserRecord, env: EnvInfo) -> EnvInfo:
+    """返回带当前用户修改权限标记的副本，避免把权限状态写回全局环境元数据。"""
+    data = env.model_dump()
+    data["can_modify"] = env.owner_user_id == user.id
+    return EnvInfo(**data)

@@ -5,7 +5,8 @@ from app.core.path_resolver import resolve_user_visible_path
 from app.core.rbac import Role, require_permission
 from app.schemas.tasks import TaskCreateRequest, TaskGuardInfo, TaskInfo, TaskUpdateRequest
 from app.services.audit_service import record_audit, utc_now
-from app.services.auth_service import UserRecord
+from app.services.auth_service import UserRecord, find_user_by_id
+from app.services.env_service import get_env_for_user
 
 _TASK_ID = count(1)
 _TASKS: list[TaskInfo] = []
@@ -40,7 +41,9 @@ def create_task(user: UserRecord, payload: TaskCreateRequest) -> TaskInfo:
     require_permission(user.role, "tasks:create")
     if user.state != "enabled":
         raise forbidden("disabled user cannot submit tasks")
-    resolve_user_visible_path(payload.workdir, user.id)
+    resolve_user_visible_path(payload.workdir, user.username, user.role.value)
+    if payload.env_id is not None:
+        get_env_for_user(user, payload.env_id)
     numeric_id = next(_TASK_ID)
     task = TaskInfo(
         id=numeric_id,
@@ -77,7 +80,14 @@ def update_task(user: UserRecord, task_id: str, payload: TaskUpdateRequest) -> T
         raise validation_error("only wait or on_hold tasks can be edited")
     data = payload.model_dump(exclude_unset=True)
     if "workdir" in data and data["workdir"] is not None:
-        resolve_user_visible_path(data["workdir"], task.user_id)
+        owner = find_user_by_id(task.user_id)
+        resolve_user_visible_path(
+            data["workdir"],
+            owner.username if owner else str(task.user_id),
+            owner.role.value if owner else user.role.value,
+        )
+    if "env_id" in data and data["env_id"] is not None:
+        get_env_for_user(user, data["env_id"])
     for key, value in data.items():
         if key == "requirement" and payload.requirement is not None:
             task.requirement = payload.requirement

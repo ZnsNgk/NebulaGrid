@@ -17,6 +17,7 @@ class PublicUser(BaseModel):
     role: str
     state: str
     permissions: list[str]
+    avatar: str | None = None
 
 
 class LoginResult(BaseModel):
@@ -26,3 +27,31 @@ class LoginResult(BaseModel):
     token_type: str = "bearer"
     user: PublicUser
 
+
+class AccountUpdateRequest(BaseModel):
+    """用户自助更新资料请求；用户名和角色等敏感字段仍由管理员管理。"""
+
+    real_name: str = Field(min_length=1, max_length=128)
+    avatar: str | None = Field(default=None, max_length=1024)
+
+
+class PasswordChangeRequest(BaseModel):
+    """用户自助修改密码请求，必须提供当前密码以降低会话被盗后的风险。"""
+
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class LoginSessionInfo(BaseModel):
+    """登录设备和 IP 响应模型，用于用户自查当前在线会话和历史登录记录。"""
+
+    id: int
+    login_ip: str
+    login_device: str
+    user_agent: str
+    login_time: str
+    last_seen_at: str
+    logout_time: str | None = None
+    revoked_at: str | None = None
+    state: str
+    current: bool = False

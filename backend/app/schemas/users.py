@@ -20,7 +20,7 @@ class UserInfo(BaseModel):
 class UserCreateRequest(BaseModel):
     """创建用户请求体，导师只能创建学生，管理员可创建任意角色。"""
 
-    username: str = Field(min_length=1, max_length=64)
+    username: str = Field(min_length=1, max_length=32, pattern=r"^[a-z_][a-z0-9_-]{0,31}$")
     real_name: str = Field(min_length=1, max_length=128)
     role: str = Field(default="student", pattern="^(student|mentor|admin|viewer)$")
     password: str = Field(min_length=8, max_length=256)

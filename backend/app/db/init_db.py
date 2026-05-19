@@ -25,7 +25,7 @@ def seed_defaults(db: Session) -> None:
                 role="admin",
                 password_hash=hash_password("admin123"),
                 state="enabled",
-                home_path=f"{settings.user_home_root}/1",
+                home_path=f"/home/{settings.main_linux_user}",
                 linux_account_name=settings.main_linux_user,
             )
         )

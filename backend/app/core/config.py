@@ -15,7 +15,6 @@ class Settings:
     user_workspace_alias: str = "/workspace"
     visible_roots: tuple[str, ...] = (
         "/home/ddltm/data/user",
-        "/home/ddltm/envs/user_envs",
         "/home/ddltm/envs/miniconda3",
     )
     database_url: str = "postgresql+psycopg://nebulagrid:nebulagrid@127.0.0.1:5432/nebulagrid"
@@ -26,12 +25,14 @@ class Settings:
     influxdb_token: str = ""
     influxdb_latest_range: str = "30m"
     task_log_root: str = "/home/ddltm/data/logs/task_logs"
+    conda_env_root: str = "/home/ddltm/envs/miniconda3/envs"
     env_package_root: str = "/home/ddltm/envs/packages"
     env_install_log_root: str = "/home/ddltm/data/logs/env_install_logs"
     runtime_root: str = "/home/ddltm/data/runtime"
     remote_code_root: str = "/home/ddltm/envs/nebulagrid_remote"
     miniconda_python: str = "/home/ddltm/envs/miniconda3/bin/python"
     main_linux_user: str = "ddltm"
+    manage_linux_accounts: bool = False
     session_secret: str = "change-this-session-secret"
     scheduler_interval_seconds: int = 5
     monitor_interval_seconds: int = 5
@@ -49,7 +50,7 @@ def get_settings() -> Settings:
     """从环境变量构造配置对象，并缓存结果避免每次请求重复解析。"""
     visible_roots = os.getenv(
         "NEBULAGRID_VISIBLE_ROOTS",
-        "/home/ddltm/data/user,/home/ddltm/envs/user_envs,/home/ddltm/envs/miniconda3",
+        "/home/ddltm/data/user,/home/ddltm/envs/miniconda3",
     )
     return Settings(
         app_name=os.getenv("NEBULAGRID_APP_NAME", "NebulaGrid"),
@@ -70,12 +71,14 @@ def get_settings() -> Settings:
         influxdb_token=os.getenv("NEBULAGRID_INFLUXDB_TOKEN", ""),
         influxdb_latest_range=os.getenv("NEBULAGRID_INFLUXDB_LATEST_RANGE", "30m"),
         task_log_root=os.getenv("NEBULAGRID_TASK_LOG_ROOT", "/home/ddltm/data/logs/task_logs"),
+        conda_env_root=os.getenv("NEBULAGRID_CONDA_ENV_ROOT", "/home/ddltm/envs/miniconda3/envs"),
         env_package_root=os.getenv("NEBULAGRID_ENV_PACKAGE_ROOT", "/home/ddltm/envs/packages"),
         env_install_log_root=os.getenv("NEBULAGRID_ENV_INSTALL_LOG_ROOT", "/home/ddltm/data/logs/env_install_logs"),
         runtime_root=os.getenv("NEBULAGRID_RUNTIME_ROOT", "/home/ddltm/data/runtime"),
         remote_code_root=os.getenv("NEBULAGRID_REMOTE_CODE_ROOT", "/home/ddltm/envs/nebulagrid_remote"),
         miniconda_python=os.getenv("NEBULAGRID_MINICONDA_PYTHON", "/home/ddltm/envs/miniconda3/bin/python"),
         main_linux_user=os.getenv("NEBULAGRID_MAIN_LINUX_USER", "ddltm"),
+        manage_linux_accounts=os.getenv("NEBULAGRID_MANAGE_LINUX_ACCOUNTS", "false").lower() == "true",
         session_secret=os.getenv("NEBULAGRID_SESSION_SECRET", "change-this-session-secret"),
         scheduler_interval_seconds=int(os.getenv("NEBULAGRID_SCHEDULER_INTERVAL_SECONDS", "5")),
         monitor_interval_seconds=int(os.getenv("NEBULAGRID_MONITOR_INTERVAL_SECONDS", "5")),

@@ -4,7 +4,7 @@ from app.api.deps import get_current_user
 from app.core.responses import api_success
 from app.schemas.users import UserCreateRequest
 from app.services.auth_service import UserRecord
-from app.services.user_service import create_user, list_users
+from app.services.user_service import create_user, delete_user, list_users
 
 router = APIRouter()
 
@@ -26,3 +26,13 @@ def post_user(
     user = create_user(current_user, payload)
     return api_success(data=user.model_dump(), request_id=request.headers.get("x-request-id"))
 
+
+@router.delete("/{user_id}")
+def delete_user_account(
+    user_id: int,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """删除平台用户，并由服务层同步处理 Linux 子账户和最后管理员保护。"""
+    user = delete_user(current_user, user_id)
+    return api_success(data=user.model_dump(), request_id=request.headers.get("x-request-id"))

@@ -23,6 +23,7 @@ const state = {
     auditLogs: { items: [], total: 0, page: 1, page_size: 20 },
     manual: null,
     envResult: null,
+    sessions: [],
   },
 };
 
@@ -75,7 +76,8 @@ const demoStore = {
       role: "admin",
       state: "enabled",
       permissions: ["*"],
-      home_path: "/home/ddltm/data/user/1",
+      linux_account_name: "ddltm",
+      home_path: "/home/ddltm",
       created_at: new Date().toISOString(),
     },
     {
@@ -85,7 +87,8 @@ const demoStore = {
       role: "mentor",
       state: "enabled",
       permissions: ["dashboard:read", "nodes:read", "tasks:read", "tasks:create", "files:read", "files:write", "envs:read", "envs:write", "users:read", "users:create_student"],
-      home_path: "/home/ddltm/data/user/2",
+      linux_account_name: "mentor",
+      home_path: "/home/ddltm/data/user/mentor",
       created_at: new Date().toISOString(),
     },
     {
@@ -95,7 +98,8 @@ const demoStore = {
       role: "student",
       state: "enabled",
       permissions: ["dashboard:read", "nodes:read", "tasks:read", "tasks:create", "files:read", "files:write", "envs:read", "envs:write"],
-      home_path: "/home/ddltm/data/user/3",
+      linux_account_name: "student",
+      home_path: "/home/ddltm/data/user/student",
       created_at: new Date().toISOString(),
     },
   ],
@@ -106,16 +110,18 @@ const demoStore = {
       name: "node-a",
       ip: "192.168.1.21",
       ssh_user: "ddltm",
+      max_speed_mbps: 10000,
       state: "online",
       scheduling_enabled: true,
       cpu_usage: 36,
       avail_ram_mb: 118784,
+      network_bandwidth_mbps: 10000,
       upload_mbps: 12,
       download_mbps: 28,
       metric_collected_at: new Date().toISOString(),
       gpus: [
-        { id: 1, gpu_index: 0, model: "NVIDIA A100", total_vram_mb: 40960, free_vram_mb: 31500, gpu_usage: 22, process_count: 1, schedulable: true },
-        { id: 2, gpu_index: 1, model: "NVIDIA A100", total_vram_mb: 40960, free_vram_mb: 40220, gpu_usage: 0, process_count: 0, schedulable: true },
+        { id: 1, gpu_index: 0, model: "NVIDIA A100", total_vram_mb: 40960, free_vram_mb: 31500, gpu_usage: 22, process_count: 1, schedulable: true, scheduled_occupied: true },
+        { id: 2, gpu_index: 1, model: "NVIDIA A100", total_vram_mb: 40960, free_vram_mb: 40220, gpu_usage: 0, process_count: 0, schedulable: true, scheduled_occupied: false },
       ],
     },
     {
@@ -123,14 +129,16 @@ const demoStore = {
       name: "node-b",
       ip: "192.168.1.22",
       ssh_user: "ddltm",
+      max_speed_mbps: null,
       state: "offline",
       scheduling_enabled: false,
       cpu_usage: null,
       avail_ram_mb: null,
+      network_bandwidth_mbps: null,
       upload_mbps: null,
       download_mbps: null,
       gpus: [
-        { id: 3, gpu_index: 0, model: "RTX 4090", total_vram_mb: 24576, free_vram_mb: null, gpu_usage: null, process_count: null, schedulable: false },
+        { id: 3, gpu_index: 0, model: "RTX 4090", total_vram_mb: 24576, free_vram_mb: null, gpu_usage: null, process_count: null, schedulable: false, scheduled_occupied: false },
       ],
     },
   ],
@@ -140,7 +148,8 @@ const demoStore = {
       id: 1,
       owner_user_id: 1,
       name: "torch-cu121",
-      path: "/home/ddltm/envs/user_envs/1/torch-cu121",
+      path: "/home/ddltm/envs/miniconda3/envs/torch-cu121",
+      can_modify: true,
       description: "PyTorch CUDA 12.1",
       source_type: "registered",
       state: "available",
@@ -160,6 +169,7 @@ const demoStore = {
     { key: "metrics.backend", value: "influxdb", updated_by: null, updated_at: null },
   ],
   auditLogs: [],
+  sessions: [],
 };
 
 function can(permission) {
@@ -239,6 +249,10 @@ async function demoApi(path, options = {}) {
   await new Promise((resolve) => window.setTimeout(resolve, 120));
   if (path === "/health") return ok({ service: "NebulaGrid", status: "ok", environment: "demo", version: "demo" });
   if (path === "/auth/login") return ok(loginDemoUser(body?.identity || "admin"));
+  if (path === "/auth/me" && method === "PATCH") return ok(updateDemoProfile(body));
+  if (path === "/auth/me/password" && method === "POST") return ok({ password_changed: true });
+  if (path === "/auth/sessions" && method === "GET") return ok(demoStore.sessions);
+  if (path.startsWith("/auth/sessions/") && method === "DELETE") return ok(revokeDemoSession(path.split("/")[3]));
   if (path === "/auth/me") return ok(demoStore.currentUser || demoStore.users[0]);
   if (path === "/dashboard/summary") return ok(buildDemoSummary());
   if (path === "/nodes") return ok(demoStore.nodes);
@@ -251,12 +265,14 @@ async function demoApi(path, options = {}) {
   if (path.includes("/resubmit")) return ok(resubmitDemoTask(path.split("/")[2]));
   if (path.includes("/log")) return `[${path.split("/")[2]}] demo log\ntraining loss=0.024\ncompleted`;
   if (path === "/envs") return ok(demoStore.envs);
-  if (path === "/envs/upload-pack" && method === "POST") return ok(addDemoEnv(body));
+  if ((path === "/envs/upload-pack" || path === "/envs/register" || path === "/envs/import-conda-pack") && method === "POST") return ok(addDemoEnv(body));
+  if (path.startsWith("/envs/") && method === "DELETE") return ok(deleteDemoEnv(path.split("/")[2]));
   if (path.endsWith("/test")) return ok({ status: "ok", message: "demo environment is ready", python: "3.11" });
   if (path.startsWith("/files/list")) return ok({ path: state.data.files.path || "/workspace", items: demoStore.files });
   if (path.startsWith("/files/preview")) return ok({ path: decodeURIComponent(path.split("path=")[1] || "/workspace/train.py"), content_type: "text/plain", content: "print('hello NebulaGrid')\n", truncated: false });
-  if (path === "/users") return ok(demoStore.users);
   if (path === "/users" && method === "POST") return ok(addDemoUser(body));
+  if (path.startsWith("/users/") && method === "DELETE") return ok(deleteDemoUser(path.split("/")[2]));
+  if (path === "/users") return ok(demoStore.users);
   if (path === "/admin/settings" && method === "GET") return ok(demoStore.settings);
   if (path === "/admin/settings" && method === "PATCH") return ok(updateDemoSettings(body.values));
   if (path === "/admin/audit-logs") return ok({ items: demoStore.auditLogs, total: demoStore.auditLogs.length, page: 1, page_size: 20 });
@@ -271,12 +287,24 @@ function ok(data) {
 function loginDemoUser(identity) {
   const lowered = String(identity || "admin").toLowerCase();
   demoStore.currentUser = demoStore.users.find((user) => user.username === lowered || user.role === lowered) || demoStore.users[0];
+  demoStore.sessions.unshift({
+    id: Date.now(),
+    login_ip: "127.0.0.1",
+    login_device: "Demo Browser on Local",
+    user_agent: navigator.userAgent,
+    login_time: nowText(),
+    last_seen_at: nowText(),
+    logout_time: null,
+    revoked_at: null,
+    state: "online",
+    current: true,
+  });
   return { access_token: demoStore.token, token_type: "bearer", user: demoStore.currentUser };
 }
 
 function buildDemoSummary() {
   const totalGpus = demoStore.nodes.reduce((sum, node) => sum + node.gpus.length, 0);
-  const freeGpus = demoStore.nodes.flatMap((node) => node.gpus).filter((gpu) => gpu.schedulable && Number(gpu.process_count || 0) === 0).length;
+  const freeGpus = demoStore.nodes.flatMap((node) => node.gpus).filter((gpu) => gpu.schedulable && !gpu.scheduled_occupied).length;
   return {
     nodes_total: demoStore.nodes.length,
     nodes_online: demoStore.nodes.filter((node) => node.state === "online").length,
@@ -295,13 +323,15 @@ function addDemoNode(payload) {
     name: payload.name,
     ip: payload.ip,
     ssh_user: payload.ssh_user || "ddltm",
+    max_speed_mbps: payload.max_speed_mbps ?? null,
     state: "offline",
     scheduling_enabled: false,
     cpu_usage: null,
     avail_ram_mb: null,
+    network_bandwidth_mbps: null,
     upload_mbps: null,
     download_mbps: null,
-    gpus: (payload.gpu_models || []).map((model, index) => ({ id: Date.now() + index, gpu_index: index, model, total_vram_mb: 0, schedulable: true })),
+    gpus: (payload.gpu_models || []).map((model, index) => ({ id: Date.now() + index, gpu_index: index, model, total_vram_mb: 0, schedulable: true, scheduled_occupied: false })),
   };
   demoStore.nodes.push(node);
   pushAudit("node.create", "node", node.name);
@@ -357,7 +387,8 @@ function addDemoEnv(payload) {
     id: demoStore.envs.length + 1,
     owner_user_id: demoStore.currentUser?.id || 1,
     name: payload.name,
-    path: payload.path,
+    path: `/home/ddltm/envs/miniconda3/envs/${payload.name}`,
+    can_modify: true,
     description: payload.description || "",
     source_type: "registered",
     state: "registered",
@@ -370,6 +401,14 @@ function addDemoEnv(payload) {
   return env;
 }
 
+function deleteDemoEnv(envId) {
+  const index = demoStore.envs.findIndex((item) => String(item.id) === String(envId));
+  if (index < 0) return {};
+  const [env] = demoStore.envs.splice(index, 1);
+  pushAudit("env.delete", "env", String(env.id));
+  return env;
+}
+
 function addDemoUser(payload) {
   const user = {
     id: Math.max(...demoStore.users.map((item) => item.id)) + 1,
@@ -378,12 +417,49 @@ function addDemoUser(payload) {
     role: payload.role,
     state: payload.state,
     permissions: payload.role === "student" ? demoStore.users.find((item) => item.role === "student").permissions : [],
-    home_path: `/home/ddltm/data/user/${demoStore.users.length + 1}`,
+    linux_account_name: payload.role === "admin" ? "ddltm" : payload.username,
+    home_path: payload.role === "admin" ? "/home/ddltm" : `/home/ddltm/data/user/${payload.username}`,
     created_at: nowText(),
   };
   demoStore.users.push(user);
   pushAudit("user.create", "user", user.username);
   return user;
+}
+
+function updateDemoProfile(payload) {
+  if (!demoStore.currentUser) demoStore.currentUser = demoStore.users[0];
+  demoStore.currentUser.real_name = payload.real_name;
+  demoStore.currentUser.avatar = payload.avatar || null;
+  const user = demoStore.users.find((item) => item.id === demoStore.currentUser.id);
+  if (user) {
+    user.real_name = demoStore.currentUser.real_name;
+    user.avatar = demoStore.currentUser.avatar;
+  }
+  pushAudit("user.profile.update", "user", String(demoStore.currentUser.id));
+  return demoStore.currentUser;
+}
+
+function revokeDemoSession(sessionId) {
+  const session = demoStore.sessions.find((item) => String(item.id) === String(sessionId));
+  if (session) {
+    session.state = "offline";
+    session.revoked_at = nowText();
+    session.logout_time = session.logout_time || session.revoked_at;
+  }
+  pushAudit("auth.session.revoke", "login_session", String(sessionId));
+  return session || {};
+}
+
+function deleteDemoUser(userId) {
+  const index = demoStore.users.findIndex((item) => String(item.id) === String(userId));
+  if (index < 0) return {};
+  const target = demoStore.users[index];
+  if (target.role === "admin" && demoStore.users.filter((item) => item.role === "admin").length <= 1) {
+    throw new Error("last admin user cannot be deleted");
+  }
+  demoStore.users.splice(index, 1);
+  pushAudit("user.delete", "user", String(userId));
+  return target;
 }
 
 function updateDemoSettings(values) {
@@ -489,13 +565,14 @@ async function refreshPage() {
       state.data.manual = (await api("/manual/current")).data;
     },
     account: async () => {
-      if (can("users:read")) state.data.users = (await api("/users")).data;
+      state.data.sessions = (await api("/auth/sessions")).data;
     },
     students: async () => {
       state.data.users = (await api("/users")).data;
     },
     admin: async () => {
       state.data.nodes = (await api("/nodes")).data;
+      state.data.users = (await api("/users")).data;
       state.data.settings = (await api("/admin/settings")).data;
       state.data.auditLogs = (await api("/admin/audit-logs")).data;
     },
@@ -550,6 +627,7 @@ async function submitNode(event) {
       name: formValue(form, "name"),
       ip: formValue(form, "ip"),
       ssh_user: formValue(form, "ssh_user") || "ddltm",
+      max_speed_mbps: formValue(form, "max_speed_mbps") ? Number(formValue(form, "max_speed_mbps")) : null,
       gpu_models: parseList(formValue(form, "gpu_models")),
     }),
   });
@@ -608,11 +686,10 @@ async function showTaskLog(taskId) {
 async function submitEnv(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  await api("/envs/upload-pack", {
+  await api("/envs/register", {
     method: "POST",
     body: JSON.stringify({
       name: formValue(form, "name"),
-      path: formValue(form, "path"),
       description: formValue(form, "description"),
       python_version: formValue(form, "python_version") || null,
     }),
@@ -624,6 +701,11 @@ async function submitEnv(event) {
 async function testEnv(envId) {
   const payload = await api(`/envs/${envId}/test`, { method: "POST" });
   state.drawer = { title: `环境检测 #${envId}`, body: `<pre class="drawer-log">${escapeHtml(JSON.stringify(payload.data, null, 2))}</pre>` };
+}
+
+async function deleteEnv(envId) {
+  await api(`/envs/${envId}`, { method: "DELETE" });
+  await refreshPage();
 }
 
 async function openPath(path) {
@@ -652,6 +734,43 @@ async function submitUser(event, fixedRole = null) {
     }),
   });
   form.reset();
+  await refreshPage();
+}
+
+async function submitProfile(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const payload = await api("/auth/me", {
+    method: "PATCH",
+    body: JSON.stringify({
+      real_name: formValue(form, "real_name"),
+      avatar: formValue(form, "avatar") || null,
+    }),
+  });
+  state.user = payload.data;
+  await refreshPage();
+}
+
+async function changePassword(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  await api("/auth/me/password", {
+    method: "POST",
+    body: JSON.stringify({
+      current_password: formValue(form, "current_password"),
+      new_password: formValue(form, "new_password"),
+    }),
+  });
+  form.reset();
+}
+
+async function deleteUser(userId) {
+  await api(`/users/${userId}`, { method: "DELETE" });
+  await refreshPage();
+}
+
+async function revokeSession(sessionId) {
+  await api(`/auth/sessions/${sessionId}`, { method: "DELETE" });
   await refreshPage();
 }
 
@@ -775,12 +894,14 @@ function renderDashboard() {
 }
 
 function renderNodeCard(node) {
+  const gpus = node.gpus || [];
+  const bandwidth = speed(node.network_bandwidth_mbps ?? node.max_speed_mbps);
   return `
     <article class="node-card">
       <div class="node-head">
         <div>
           <h3>${escapeHtml(node.name)}</h3>
-          <p>${escapeHtml(node.ip)} · ${escapeHtml(node.ssh_user)}</p>
+          <p>可用带宽 ${bandwidth} · ${gpus.length} GPUs</p>
         </div>
         <span class="status ${node.state}">${stateText(node.state)}</span>
       </div>
@@ -790,22 +911,25 @@ function renderNodeCard(node) {
         ${miniMetric("上传", speed(node.upload_mbps))}
         ${miniMetric("下载", speed(node.download_mbps))}
       </div>
-      <div class="gpu-list">
-        ${(node.gpus || []).map((gpu) => `
+      ${gpus.length ? `
+        <div class="gpu-list">
+          ${gpus.map((gpu) => `
           <div class="gpu-row">
-            <div>
+            <div class="gpu-title">
               <strong>GPU ${gpu.gpu_index}</strong>
               <span>${escapeHtml(gpu.model || "Unknown")}</span>
             </div>
-            <div class="gpu-metrics">
-              ${bar("使用率", gpu.gpu_usage)}
-              ${bar("显存", gpu.total_vram_mb && gpu.free_vram_mb !== null && gpu.free_vram_mb !== undefined ? Math.round((1 - gpu.free_vram_mb / gpu.total_vram_mb) * 100) : null)}
-              <span>可用显存 ${formatMb(gpu.free_vram_mb)}</span>
-              <span>调用进程 ${emptyDash(gpu.process_count)}</span>
+            <div class="gpu-summary">
+              ${percent(gpu.gpu_usage)} · 显存 ${formatMb(vramUsedMb(gpu))} / ${formatMb(gpu.total_vram_mb)} · 调度占用 ${gpu.scheduled_occupied ? "是" : "否"}
+            </div>
+            <div class="gpu-bars">
+              ${metricBar("GPU 使用率", gpu.gpu_usage, percent(gpu.gpu_usage))}
+              ${metricBar("显存使用量", vramUsedPercent(gpu), `${formatMb(vramUsedMb(gpu))} / ${formatMb(gpu.total_vram_mb)}`)}
             </div>
           </div>
-        `).join("")}
-      </div>
+          `).join("")}
+        </div>
+      ` : ""}
     </article>
   `;
 }
@@ -871,7 +995,6 @@ function renderEnvs() {
       <div class="panel-head"><div><h2>登记环境</h2><span>当前表单登记已有 conda 环境，后续环境包安装会接入同一页面。</span></div></div>
       <form id="envForm" class="form-grid">
         <label>环境名称<input name="name" placeholder="torch-cu121" required></label>
-        <label class="wide">环境路径<input name="path" placeholder="/home/ddltm/envs/user_envs/1/torch-cu121" required></label>
         <label>Python 版本<input name="python_version" placeholder="3.11"></label>
         <label class="full-row">说明<input name="description" placeholder="PyTorch CUDA 12.1"></label>
         <div class="form-actions"><button type="submit">登记环境</button></div>
@@ -884,7 +1007,7 @@ function renderEnvs() {
         `<span class="status ${env.state}">${stateText(env.state)}</span>`,
         `<code>${escapeHtml(env.path)}</code>`,
         escapeHtml(env.python_version || "-"),
-        `<button class="small secondary" data-test-env="${env.id}">检测</button>`,
+        `<button class="small secondary" data-test-env="${env.id}">检测</button>${env.can_modify ? `<button class="small danger" data-delete-env="${env.id}">删除</button>` : ""}`,
       ])) : renderEmpty("暂无环境")}
     </section>
   `);
@@ -907,16 +1030,17 @@ function renderManual() {
 
 function renderAccount() {
   const permissions = state.user?.permissions || [];
-  const users = state.data.users || [];
+  const sessions = state.data.sessions || [];
   return shell(`
     <section class="split">
       <article class="panel">
-        <div class="panel-head"><div><h2>当前账号</h2><span>账号身份决定左侧可见页面和可执行操作。</span></div></div>
+        <div class="panel-head"><div><h2>当前账号</h2><span>这里只展示和管理自己的登录身份。</span></div></div>
         <dl class="kv">
           <dt>姓名</dt><dd>${escapeHtml(state.user?.real_name || "-")}</dd>
           <dt>用户名</dt><dd>${escapeHtml(state.user?.username || "-")}</dd>
           <dt>角色</dt><dd>${roleName(state.user?.role)}</dd>
           <dt>状态</dt><dd>${stateText(state.user?.state || "enabled")}</dd>
+          <dt>SSH 账户</dt><dd><code>${escapeHtml(accountNameForUser(state.user))}</code></dd>
         </dl>
       </article>
       <article class="panel">
@@ -924,23 +1048,28 @@ function renderAccount() {
         <div class="permission-list">${permissions.map((permission) => `<span>${escapeHtml(permission)}</span>`).join("")}</div>
       </article>
     </section>
-    ${state.user?.role === "admin" ? `
-      <section class="panel">
-        <div class="panel-head"><div><h2>创建账号</h2><span>管理员可创建学生、导师、管理员或展示账号。</span></div></div>
-        <form id="userForm" class="form-grid">
-          <label>用户名<input name="username" required></label>
-          <label>姓名<input name="real_name" required></label>
-          <label>角色<select name="role"><option value="student">学生</option><option value="mentor">导师</option><option value="admin">管理员</option><option value="viewer">展示用户</option></select></label>
-          <label>状态<select name="state"><option value="enabled">启用</option><option value="disabled">禁用</option></select></label>
-          <label>初始密码<input name="password" type="password" minlength="8" required></label>
-          <div class="form-actions"><button type="submit">创建账号</button></div>
+    <section class="split">
+      <article class="panel">
+        <div class="panel-head"><div><h2>修改资料</h2><span>用户名、角色和状态由管理员后台维护。</span></div></div>
+        <form id="profileForm" class="form-grid compact-form">
+          <label>姓名<input name="real_name" value="${escapeAttr(state.user?.real_name || "")}" required></label>
+          <label class="wide">头像地址<input name="avatar" value="${escapeAttr(state.user?.avatar || "")}" placeholder="/avatars/me.png"></label>
+          <div class="form-actions"><button type="submit">保存资料</button></div>
         </form>
-      </section>
-      <section class="panel">
-        <div class="panel-head"><div><h2>账号列表</h2><span>用户 home 目录会映射到 /home/ddltm/data/user/&lt;user_id&gt;。</span></div></div>
-        ${users.length ? renderUserTable(users) : renderEmpty("暂无账号")}
-      </section>
-    ` : ""}
+      </article>
+      <article class="panel">
+        <div class="panel-head"><div><h2>重设密码</h2><span>修改密码需要先输入当前密码。</span></div></div>
+        <form id="passwordForm" class="form-grid compact-form">
+          <label>当前密码<input name="current_password" type="password" required></label>
+          <label>新密码<input name="new_password" type="password" minlength="8" required></label>
+          <div class="form-actions"><button type="submit">更新密码</button></div>
+        </form>
+      </article>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>登录设备</h2><span>查看登录 IP、设备和在线状态，发现异常可撤销会话。</span></div></div>
+      ${sessions.length ? renderSessionTable(sessions) : renderEmpty("暂无登录记录")}
+    </section>
   `);
 }
 
@@ -966,30 +1095,66 @@ function renderStudents() {
 
 function renderAdmin() {
   const nodes = state.data.nodes || [];
+  const users = state.data.users || [];
   const settings = state.data.settings || [];
   const auditItems = state.data.auditLogs.items || [];
+  const onlineNodes = nodes.filter((node) => node.state === "online").length;
+  const offlineNodes = nodes.filter((node) => ["offline", "manual_offline"].includes(node.state)).length;
   return shell(`
-    <section class="panel">
-      <div class="panel-head"><div><h2>登记计算节点</h2><span>只登记计算节点，master/control-plane 节点会被后端拒绝或过滤。</span></div></div>
-      <form id="nodeForm" class="form-grid">
-        <label>节点名称<input name="name" placeholder="node-a" required></label>
-        <label>IP 地址<input name="ip" placeholder="192.168.1.21" required></label>
-        <label>SSH 用户<input name="ssh_user" value="ddltm"></label>
-        <label class="wide">GPU 型号列表<input name="gpu_models" placeholder="A100,A100"></label>
-        <div class="form-actions"><button type="submit">登记节点</button></div>
-      </form>
+    <section class="admin-head">
+      <div>
+        <h2>管理员后台</h2>
+        <p>仅管理员账号可访问 · ${escapeHtml(state.user?.username || "-")}</p>
+      </div>
+      <div class="admin-actions">
+        <button class="secondary" data-nav="dashboard">返回控制台</button>
+        <button data-action="refresh">刷新后台数据</button>
+      </div>
     </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>节点运维</h2><span>重新连接或强制下线会写入审计日志。</span></div></div>
-      ${nodes.length ? renderTable(["节点", "状态", "资源", "操作"], nodes.map((node) => [
-        `<strong>${escapeHtml(node.name)}</strong><br><span class="muted">${escapeHtml(node.ip)}</span>`,
-        `<span class="status ${node.state}">${stateText(node.state)}</span>`,
-        `${(node.gpus || []).length} GPU<br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
-        `<button class="small secondary" data-reconnect-node="${node.id}">重连</button><button class="small danger" data-offline-node="${node.id}">下线</button>`,
-      ])) : renderEmpty("暂无节点")}
+    <section class="admin-tabs">
+      <span>总览</span>
+      <span>节点管理</span>
+      <span>用户管理</span>
+      <span>系统设置</span>
+      <span>审计日志</span>
     </section>
-    <section class="split">
-      <article class="panel">
+    <section class="admin-stats">
+      ${renderAdminStat("Web 用户", users.length)}
+      ${renderAdminStat("配置节点", nodes.length)}
+      ${renderAdminStat("在线节点", onlineNodes)}
+      ${renderAdminStat("下线节点", offlineNodes)}
+    </section>
+    <section class="admin-grid">
+      <article class="panel admin-card">
+        <div class="panel-head"><div><h2>节点管理</h2><span>登记计算节点，重连或下线会写入审计日志。</span></div></div>
+        <form id="nodeForm" class="form-grid">
+          <label>节点名称<input name="name" placeholder="node-a" required></label>
+          <label>IP 地址<input name="ip" placeholder="192.168.1.21" required></label>
+          <label>SSH 用户<input name="ssh_user" value="ddltm"></label>
+          <label>网络带宽 Mbps<input name="max_speed_mbps" type="number" min="1" placeholder="10000"></label>
+          <label class="wide">GPU 型号列表<input name="gpu_models" placeholder="A100,A100"></label>
+          <div class="form-actions"><button type="submit">登记节点</button></div>
+        </form>
+        ${nodes.length ? renderTable(["节点", "状态", "资源", "操作"], nodes.map((node) => [
+          `<strong>${escapeHtml(node.name)}</strong><br><span class="muted">${escapeHtml(node.ip)}</span>`,
+          `<span class="status ${node.state}">${stateText(node.state)}</span>`,
+          `${(node.gpus || []).length} GPU<br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
+          `<button class="small secondary" data-reconnect-node="${node.id}">重连</button><button class="small danger" data-offline-node="${node.id}">下线</button>`,
+        ])) : renderEmpty("暂无节点")}
+      </article>
+      <article class="panel admin-card">
+        <div class="panel-head"><div><h2>用户管理</h2><span>管理员用 ddltm SSH，学生和导师创建独立账户。</span></div></div>
+        <form id="userForm" class="form-grid">
+          <label>用户名<input name="username" required></label>
+          <label>姓名<input name="real_name" required></label>
+          <label>角色<select name="role"><option value="student">学生</option><option value="mentor">导师</option><option value="admin">管理员</option><option value="viewer">展示用户</option></select></label>
+          <label>状态<select name="state"><option value="enabled">启用</option><option value="disabled">禁用</option></select></label>
+          <label>初始密码<input name="password" type="password" minlength="8" required></label>
+          <div class="form-actions"><button type="submit">创建账号</button></div>
+        </form>
+        ${users.length ? renderUserTable(users) : renderEmpty("暂无账号")}
+      </article>
+      <article class="panel admin-card">
         <div class="panel-head"><div><h2>系统设置</h2><span>保存后立即写入后端设置存储。</span></div></div>
         <form id="settingForm" class="form-grid compact-form">
           <label>键<input name="key" placeholder="scheduler.enabled" required></label>
@@ -998,7 +1163,7 @@ function renderAdmin() {
         </form>
         ${settings.length ? renderTable(["键", "值"], settings.map((item) => [escapeHtml(item.key), `<code>${escapeHtml(item.value)}</code>`])) : renderEmpty("暂无设置")}
       </article>
-      <article class="panel">
+      <article class="panel admin-card">
         <div class="panel-head"><div><h2>审计日志</h2><span>关键管理动作会留痕。</span></div></div>
         ${auditItems.length ? renderTable(["动作", "对象", "时间"], auditItems.map((item) => [
           escapeHtml(item.action),
@@ -1011,11 +1176,24 @@ function renderAdmin() {
 }
 
 function renderUserTable(users) {
-  return renderTable(["账号", "角色", "状态", "Home"], users.map((user) => [
+  return renderTable(["账号", "角色", "状态", "Linux", "Home", "操作"], users.map((user) => [
     `<strong>${escapeHtml(user.real_name)}</strong><br><span class="muted">${escapeHtml(user.username)}</span>`,
     roleName(user.role),
     stateText(user.state),
+    `<code>${escapeHtml(user.linux_account_name || "-")}</code>`,
     `<code>${escapeHtml(user.home_path || "-")}</code>`,
+    can("users:delete") ? `<button class="small danger" data-delete-user="${user.id}">删除</button>` : "-",
+  ]));
+}
+
+function renderSessionTable(sessions) {
+  return renderTable(["设备", "IP", "登录时间", "最后活跃", "状态", "操作"], sessions.map((session) => [
+    `<strong>${escapeHtml(session.login_device || "unknown device")}</strong><br><span class="muted">${escapeHtml(session.user_agent || "-")}</span>`,
+    escapeHtml(session.login_ip || "-"),
+    formatDate(session.login_time),
+    formatDate(session.last_seen_at),
+    `<span class="status ${session.state === "online" ? "online" : "offline"}">${session.current ? "当前会话 · " : ""}${stateText(session.state)}</span>`,
+    session.state === "online" ? `<button class="small danger" data-revoke-session="${session.id}">撤销</button>` : "-",
   ]));
 }
 
@@ -1058,6 +1236,27 @@ function bar(label, value) {
       <i><em style="width:${safe || 0}%"></em></i>
     </label>
   `;
+}
+
+function metricBar(label, value, text) {
+  const safe = value === null || value === undefined ? null : Math.max(0, Math.min(100, Number(value) || 0));
+  return `
+    <label class="metric-bar">
+      <span>${label}</span><b>${text}</b>
+      <i><em style="width:${safe || 0}%"></em></i>
+    </label>
+  `;
+}
+
+function vramUsedMb(gpu) {
+  if (!gpu?.total_vram_mb || gpu.free_vram_mb === null || gpu.free_vram_mb === undefined) return null;
+  return Math.max(0, gpu.total_vram_mb - gpu.free_vram_mb);
+}
+
+function vramUsedPercent(gpu) {
+  const used = vramUsedMb(gpu);
+  if (used === null || !gpu?.total_vram_mb) return null;
+  return Math.round((used / gpu.total_vram_mb) * 100);
 }
 
 function renderMarkdown(markdown) {
@@ -1158,6 +1357,15 @@ function inlineMarkdown(value) {
 
 function roleName(role) {
   return roleLabels[role] || role || "-";
+}
+
+function accountNameForUser(user) {
+  if (!user) return "-";
+  return user.linux_account_name || (user.role === "admin" ? "ddltm" : user.username);
+}
+
+function renderAdminStat(label, value) {
+  return `<article><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></article>`;
 }
 
 function stateText(value) {
@@ -1262,7 +1470,7 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.nav)));
   document.querySelector("[data-action='logout']")?.addEventListener("click", () => run(logout));
-  document.querySelector("[data-action='refresh']")?.addEventListener("click", () => run(refreshPage, "已刷新"));
+  document.querySelectorAll("[data-action='refresh']").forEach((button) => button.addEventListener("click", () => run(refreshPage, "已刷新")));
   document.querySelector("[name='dashboard_refresh_seconds']")?.addEventListener("change", (event) => setDashboardRefreshSeconds(event.currentTarget.value));
   document.querySelector("[data-action='demo']")?.addEventListener("click", () => run(() => enterDemo("admin"), "已进入演示模式"));
   document.querySelector("[data-action='close-drawer']")?.addEventListener("click", () => {
@@ -1276,6 +1484,8 @@ function bindEvents() {
   document.querySelectorAll("[data-open-path]").forEach((button) => button.addEventListener("click", () => run(() => openPath(button.dataset.openPath))));
   document.querySelectorAll("[data-preview]").forEach((button) => button.addEventListener("click", () => run(() => previewFile(button.dataset.preview))));
   document.querySelectorAll("[data-test-env]").forEach((button) => button.addEventListener("click", () => run(() => testEnv(button.dataset.testEnv))));
+  document.querySelectorAll("[data-delete-env]").forEach((button) => button.addEventListener("click", () => run(() => deleteEnv(button.dataset.deleteEnv), "环境已删除")));
+  document.querySelectorAll("[data-delete-user]").forEach((button) => button.addEventListener("click", () => run(() => deleteUser(button.dataset.deleteUser), "账号已删除")));
   document.querySelectorAll("[data-reconnect-node]").forEach((button) => button.addEventListener("click", () => run(() => reconnectNode(button.dataset.reconnectNode), "已提交重连")));
   document.querySelectorAll("[data-offline-node]").forEach((button) => button.addEventListener("click", () => run(() => forceOfflineNode(button.dataset.offlineNode), "已强制下线")));
 }

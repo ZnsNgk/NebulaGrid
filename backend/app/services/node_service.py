@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.errors import not_found, validation_error
 from app.core.rbac import require_permission
-from app.db.models import Gpu, Node
+from app.db.models import Gpu, Node, TaskAllocation
 from app.schemas.nodes import GpuInfo, NodeCreateRequest, NodeInfo
 from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
@@ -21,7 +21,8 @@ def list_nodes(user: UserRecord, db: Session) -> list[NodeInfo]:
     ).all()
     compute_nodes = [node for node in nodes if not is_control_plane_node(node)]
     latest_metrics = load_latest_metrics(compute_nodes)
-    return [build_node_info(node, latest_metrics) for node in compute_nodes]
+    occupied_gpu_ids = load_occupied_gpu_ids(compute_nodes, db)
+    return [build_node_info(node, latest_metrics, occupied_gpu_ids) for node in compute_nodes]
 
 
 def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> NodeInfo:
@@ -60,7 +61,7 @@ def get_node(node_id: int, db: Session) -> NodeInfo | None:
     node = db.get(Node, node_id)
     if node is None or is_control_plane_node(node):
         return None
-    return build_node_info(node, load_latest_metrics([node]))
+    return build_node_info(node, load_latest_metrics([node]), load_occupied_gpu_ids([node], db))
 
 
 def reconnect_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
@@ -100,9 +101,15 @@ def require_node_model(node_id: int, db: Session) -> Node:
     return node
 
 
-def build_node_info(node: Node, latest_metrics: LatestMetrics) -> NodeInfo:
+def build_node_info(
+    node: Node,
+    latest_metrics: LatestMetrics,
+    occupied_gpu_ids: set[int] | None = None,
+) -> NodeInfo:
     """把节点 ORM 对象转换为前端模型，并附带 InfluxDB 最新监控快照。"""
     metric = latest_metrics.nodes.get(node.id)
+    metric_bandwidth = metric.network_bandwidth_mbps if metric else None
+    occupied_gpu_ids = occupied_gpu_ids or set()
     return NodeInfo(
         id=node.id,
         name=node.name,
@@ -114,30 +121,52 @@ def build_node_info(node: Node, latest_metrics: LatestMetrics) -> NodeInfo:
         max_speed_mbps=node.max_speed_mbps,
         state=node.state,
         scheduling_enabled=node.scheduling_enabled,
-        gpus=[build_gpu_info(gpu, latest_metrics) for gpu in sorted(node.gpus, key=lambda item: item.gpu_index)],
+        gpus=[
+            build_gpu_info(gpu, latest_metrics, occupied_gpu_ids)
+            for gpu in sorted(node.gpus, key=lambda item: item.gpu_index)
+        ],
         cpu_usage=metric.cpu_usage if metric else None,
         avail_ram_mb=metric.avail_ram_mb if metric else None,
+        network_bandwidth_mbps=metric_bandwidth or node.max_speed_mbps,
         upload_mbps=metric.upload_mbps if metric else None,
         download_mbps=metric.download_mbps if metric else None,
         metric_collected_at=metric.collected_at if metric else None,
     )
 
 
-def build_gpu_info(gpu: Gpu, latest_metrics: LatestMetrics) -> GpuInfo:
+def build_gpu_info(gpu: Gpu, latest_metrics: LatestMetrics, occupied_gpu_ids: set[int] | None = None) -> GpuInfo:
     """把 GPU ORM 对象转换为前端模型，并附带 InfluxDB 最新监控快照。"""
     metric = latest_metrics.gpus.get(gpu.id)
+    occupied_gpu_ids = occupied_gpu_ids or set()
     return GpuInfo(
         id=gpu.id,
         gpu_index=gpu.gpu_index,
         model=gpu.model,
         total_vram_mb=gpu.total_vram_mb,
         schedulable=gpu.schedulable,
+        scheduled_occupied=gpu.id in occupied_gpu_ids,
         remark=gpu.remark,
         free_vram_mb=metric.free_vram_mb if metric else None,
         gpu_usage=metric.gpu_usage if metric else None,
         process_count=metric.process_count if metric else None,
         metric_collected_at=metric.collected_at if metric else None,
     )
+
+
+def load_occupied_gpu_ids(nodes: list[Node], db: Session) -> set[int]:
+    """Return GPU IDs currently held by unreleased scheduler allocations."""
+    node_ids = [node.id for node in nodes]
+    if not node_ids:
+        return set()
+    allocations = db.scalars(
+        select(TaskAllocation)
+        .where(TaskAllocation.node_id.in_(node_ids))
+        .where(TaskAllocation.released_at.is_(None))
+    ).all()
+    occupied: set[int] = set()
+    for allocation in allocations:
+        occupied.update(coerce_int(gpu_id) for gpu_id in allocation.gpu_ids)
+    return occupied
 
 
 def load_latest_metrics(nodes: list[Node]) -> LatestMetrics:

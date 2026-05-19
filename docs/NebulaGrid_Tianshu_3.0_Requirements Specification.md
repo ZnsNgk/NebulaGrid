@@ -127,7 +127,7 @@ NebulaGrid 3.0 的目标是提供一个浏览器即可访问的统一入口，�
 
 - 系统负责调度和启动用户命令，不负责保证用户代码本身正确。训练脚本报错、数据路径错误、CUDA 版本不匹配应记录为任务失败。
 
-- 系统不是强隔离容器平台。若暂不使用 Docker/容器，用户任务仍运行在计算节点的统一主账户下，例如 `ddltm`；该主账户必须在 master 和所有计算节点保持用户名、密码、UID、GID 一致。用户子账户只在 master 创建，用于用户 SSH 到主节点和访问自己的 `/home/ddltm/data/user/<user_id>` home，因此必须通过路径约束、GPU 绑定检测、审计和制度约束降低风险。
+- 系统不是强隔离容器平台。若暂不使用 Docker/容器，用户任务仍运行在计算节点的统一主账户下，例如 `ddltm`；该主账户必须在 master 和所有计算节点保持用户名、密码、UID、GID 一致。学生和导师子账户只在 master 创建，用于用户 SSH 到主节点和访问自己的 `/home/ddltm/data/user/<user_name>` home；管理员复用部署前已存在的主账户，不额外创建管理员子账户。因此必须通过路径约束、GPU 绑定检测、审计和制度约束降低风险。
 
 - 系统不是 Slurm/Kubernetes 的替代品。3.0 面向实验室多机多卡、轻量任务排队和 Web 管理场景，优先保证简单、可维护、可恢复。
 
@@ -150,7 +150,7 @@ NebulaGrid 3.0 的目标是提供一个浏览器即可访问的统一入口，�
 
 ## 3.2 部署拓扑
 
-最小可用部署仍然保持一个主控节点和若干计算节点。主控节点运行 Web 后端、调度器、节点监控器和数据库；主控节点与计算节点通过 NFS 协议共享 `/home/ddltm/data` 和 `/home/ddltm/envs`。`/home/ddltm/data/user/<user_id>` 是平台用户在 master 上的 home 目录，`/home/ddltm/data/logs` 存储任务日志和环境安装日志，`/home/ddltm/data/runtime` 存储运行时文件，`/home/ddltm/envs` 存储 miniconda、用户环境目录和节点监控/远端执行代码。计算节点只需要创建与 master 一致的主账户并允许主控节点通过该账户 SSH 访问，不创建平台用户子账户。若后续要提升可靠性，可以将数据库独立部署，并把调度器保持为单实例以避免重复派发任务。
+最小可用部署仍然保持一个主控节点和若干计算节点。主控节点运行 Web 后端、调度器、节点监控器和数据库；主控节点与计算节点通过 NFS 协议共享 `/home/ddltm/data` 和 `/home/ddltm/envs`。`/home/ddltm/data/user/<user_name>` 是平台用户在 master 上的 home 目录，`/home/ddltm/data/logs` 存储任务日志和环境安装日志，`/home/ddltm/data/runtime` 存储运行时文件，`/home/ddltm/envs` 存储 miniconda、用户环境目录和节点监控/远端执行代码。计算节点只需要创建与 master 一致的主账户并允许主控节点通过该账户 SSH 访问，不创建平台用户子账户。若后续要提升可靠性，可以将数据库独立部署，并把调度器保持为单实例以避免重复派发任务。
 
 ```text
 用户浏览器 / 展示大屏
@@ -283,7 +283,7 @@ nebulagrid/
 | supervisor_ids        | array/relation | 学生可填      | 一个学生可关联 1 到 2 位导师，建议使用关系表而不是 supervisor1/supervisor2 两个固定字段。 |
 | avatar                | string         | 选填          | 头像文件路径或对象存储 key。                                                              |
 | password_hash         | string         | 必填          | 不可保存明文密码。使用安全哈希和随机盐。                                                  |
-| home_path/root        | string         | 必填          | 用户工作根目录，固定映射为 `/home/ddltm/data/user/<user_id>`。仅管理员可见绝对路径，普通用户只看到虚拟路径。 |
+| home_path/root        | string         | 必填          | 用户工作根目录，固定映射为 `/home/ddltm/data/user/<user_name>`。仅管理员可见绝对路径，普通用户只看到虚拟路径。 |
 | linux_account_name    | string         | 必填          | master 上对应的 Linux 子账户名，用于用户 SSH 到主节点；该账户不在计算节点创建。            |
 | linux_uid/linux_gid   | int            | 可选          | master 子账户 UID/GID，用于审计和排障；计算节点只保证主账户 UID/GID 与 master 一致。       |
 | state                 | enum           | 必填          | active / disabled / archived。disabled 允许登录管理文件环境，但禁止提交新任务。           |
@@ -344,7 +344,7 @@ nebulagrid/
 
 ## 5.4 环境管理
 
-3.0 的环境管理应同时支持“已有 conda 环境登记”和“用户上传 conda-pack 环境包”。考虑到主节点不联网，推荐流程是：用户在个人电脑或 WSL/Linux 环境中维护 conda 环境，使用 conda-pack 打包后上传到系统，由系统在 NFS 共享的 `/home/ddltm/envs/user_envs/<user_id>/` 下解包并执行校验。用户也可以 SSH 到 master 的个人子账户整理自己的 `/home/ddltm/data/user/<user_id>` 文件，但不直接登录计算节点。
+3.0 的环境管理应同时支持“已有 conda 环境登记”和“用户上传 conda-pack 环境包”。考虑到主节点不联网，推荐流程是：用户在个人电脑或 WSL/Linux 环境中维护 conda 环境，使用 conda-pack 打包后上传到系统，由系统在 NFS 共享的 `/home/ddltm/envs/miniconda3/envs/<env_name>` 下解包并执行校验。环境必须直接位于 miniconda 的 `envs` 一级目录下，不能再按用户创建二级目录，否则 miniconda 无法识别。用户也可以 SSH 到 master 的个人子账户整理自己的 `/home/ddltm/data/user/<user_name>` 文件，但不直接登录计算节点。
 
 除完整环境导入外，3.0 还应支持“环境内包安装”能力。用户可在环境详情页上传 .whl 文件或压缩的 Python 包（.zip/.tar/.tar.gz/.tgz），选择目标环境后由系统自动安装或导入。该功能用于解决主控节点不联网、用户无法直接 SSH 维护环境时的增量更新问题。
 
@@ -702,7 +702,7 @@ export QT_QPA_PLATFORM=offscreen
 
 ## 10.1 路径模型
 
-用户界面统一展示虚拟路径，例如 `/workspace/project/train.py`。后端 PathResolver 将虚拟路径解析为服务器真实路径，并检查该路径是否落在 NFS 共享的 `/home/ddltm/data/user/<user_id>/`、`/home/ddltm/envs/user_envs/<user_id>/` 或管理员配置的 visible_roots 内。所有文件 API、任务 workdir、环境路径和日志下载都必须调用同一个 PathResolver。master 与计算节点必须以相同路径挂载 `/home/ddltm/data` 和 `/home/ddltm/envs`，否则远端任务可能找不到项目路径、日志路径或环境路径。
+用户界面统一展示虚拟路径，例如 `/workspace/project/train.py`。后端 PathResolver 将虚拟路径解析为服务器真实路径，并检查该路径是否落在 NFS 共享的 `/home/ddltm/data/user/<user_name>/`、`/home/ddltm/envs/miniconda3/envs/<env_name>` 或管理员配置的 visible_roots 内。所有文件 API、任务 workdir、环境路径和日志下载都必须调用同一个 PathResolver。master 与计算节点必须以相同路径挂载 `/home/ddltm/data` 和 `/home/ddltm/envs`，否则远端任务可能找不到项目路径、日志路径或环境路径。
 
 ```python
 def resolve_virtual_path(user, virtual_path, mode):
@@ -727,7 +727,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 3. 系统将包保存到临时目录，校验压缩包类型、大小、路径安全和是否包含 Linux 可执行结构。
 
-4. 系统解包到 NFS 共享的用户环境目录，例如 `/home/ddltm/envs/user_envs/<user_id>/<env_name>`。
+4. 系统解包到 NFS 共享的 miniconda 环境目录，例如 `/home/ddltm/envs/miniconda3/envs/<env_name>`；该目录层级必须保持为 envs 下的一级目录。
 
 5. 执行 conda-unpack 或等价修复脚本，记录导入日志。
 
@@ -976,8 +976,8 @@ paths:
   nfs_data_root: /home/ddltm/data
   nfs_env_root: /home/ddltm/envs
   user_home_root: /home/ddltm/data/user
-  user_home_template: /home/ddltm/data/user/{user_id}
-  env_root: /home/ddltm/envs/user_envs
+  user_home_template: /home/ddltm/data/user/{user_name}
+  env_root: /home/ddltm/envs/miniconda3/envs
   env_package_root: /home/ddltm/envs/packages
   miniconda_root: /home/ddltm/envs/miniconda3
   task_log_root: /home/ddltm/data/logs/task_logs
@@ -986,14 +986,14 @@ paths:
   visible_roots:
     - /home/ddltm/data/user
     - /home/ddltm/data/shared
-    - /home/ddltm/envs/user_envs
+    - /home/ddltm/envs/miniconda3
 
 accounts:
   main_user: ddltm
   main_group: ddltm
   require_same_uid_gid_on_nodes: true
   create_child_accounts_on_master_only: true
-  child_home_template: /home/ddltm/data/user/{user_id}
+  child_home_template: /home/ddltm/data/user/{user_name}
 
 scheduler:
   interval_seconds: 2
@@ -1074,7 +1074,7 @@ offline --> [*]
 | 任务               | 用户提交的一条训练/推理/脚本命令及其资源需求。           |
 | 环境               | 任务运行所需的软件环境，通常为 conda/miniconda 环境。    |
 | 主账户             | master 与每个计算节点都存在的统一执行账户，例如 `ddltm`，要求用户名、密码、UID 和 GID 一致；用于 NebulaGrid 服务、SSH 控制和远端 runner 执行。 |
-| 子账户             | NebulaGrid 为用户在 master 上创建的 Linux 账户，用于用户 SSH 到主节点；home 映射到 `/home/ddltm/data/user/<user_id>`，不在计算节点创建。 |
+| 子账户             | NebulaGrid 为学生和导师在 master 上创建的 Linux 账户，用于用户 SSH 到主节点；home 映射到 `/home/ddltm/data/user/<user_name>`，不在计算节点创建。管理员复用主账户。 |
 | NFS 共享目录       | master 通过 NFS 共享给计算节点的 `/home/ddltm/data` 和 `/home/ddltm/envs`；其中 `/home/ddltm/data/user` 保存用户 home，`/home/ddltm/data/logs` 保存日志，`/home/ddltm/envs` 保存 miniconda、环境和节点监控代码。 |
 | GPU 复用           | 允许多个轻量任务共享同一 GPU，但受显存和任务数阈值限制。 |
 | 前驱任务           | 当前任务开始前必须完成的依赖任务。                       |

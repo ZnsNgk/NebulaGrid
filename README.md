@@ -10,7 +10,7 @@ NebulaGrid 3.0 是纯 B/S 架构的分布式 GPU 任务调度与实验资源管�
 
 - 用户通过浏览器访问统一入口；如确需 SSH，仅登录 master 上的个人子账户，不直接登录计算节点。
 - master 主控节点运行 Web/API、调度器、节点监控、任务执行器、运行守护、环境安装 worker、数据库、时序监控库和缓存。
-- master 与计算节点通过 NFS 共享 `/home/ddltm/data` 和 `/home/ddltm/envs`：`/home/ddltm/data/user/<user_id>` 作为平台用户 home 目录，`/home/ddltm/data/logs` 存放任务与环境日志，`/home/ddltm/envs` 存放 miniconda、用户环境和节点监控/远端执行代码。
+- master 与计算节点通过 NFS 共享 `/home/ddltm/data` 和 `/home/ddltm/envs`：`/home/ddltm/data/user/<user_name>` 作为平台用户 home 目录，`/home/ddltm/data/logs` 存放任务与环境日志，`/home/ddltm/envs` 存放 miniconda、用户环境和节点监控/远端执行代码。
 - master 使用统一主账户运行平台与远端 SSH 控制，例如 `ddltm`；所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，避免 NFS 权限和远端执行身份不一致。
 - 平台为用户创建的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；计算节点不创建这些子账户，任务由主账户通过受控 runner 在计算节点启动。
 - PostgreSQL 作为任务、节点、GPU、用户、审计和事件的单一事实来源。
@@ -65,7 +65,7 @@ NebulaGrid 3.0 是纯 B/S 架构的分布式 GPU 任务调度与实验资源管�
 - 可访问所有计算节点的网络。
 - 作为 NFS server 共享 `/home/ddltm/data` 和 `/home/ddltm/envs`，并具备读写用户 home、任务日志、环境目录和远端脚本目录的权限。
 - 创建平台主账户，例如 `ddltm`，该账户在 master 和所有计算节点上的用户名、密码、UID、GID 必须一致；NebulaGrid 服务、SSH 控制命令和远端任务 runner 默认使用该主账户。
-- master 上的平台子账户由系统按用户创建，只存在于 master，home 目录统一映射为 `/home/ddltm/data/user/<user_id>`；主账户需要能对这些 home 目录执行增删查改，以便文件管理、任务准备、日志归档和管理员运维。
+- master 上的平台子账户由系统按用户名创建，只存在于 master，home 目录统一映射为 `/home/ddltm/data/user/<user_name>`；主账户需要能对这些 home 目录执行增删查改，以便文件管理、任务准备、日志归档和管理员运维。
 
 建议系统用户：
 
@@ -88,7 +88,7 @@ sudo chmod 750 /etc/nebulagrid /home/ddltm/data /home/ddltm/envs /var/log/nebula
 - 不需要、也不应在计算节点创建平台子账户；用户 SSH 入口只在 master，计算节点只接受主账户的受控 SSH 执行。
 - NVIDIA 驱动已安装，`nvidia-smi` 可用。
 - 已挂载 master 通过 NFS 共享的 `/home/ddltm/data`，且挂载路径与 master 保持一致。
-- `/home/ddltm/data/user/<user_id>` 下可访问对应用户 home，`/home/ddltm/data/logs` 下可访问任务日志和环境安装日志，`/home/ddltm/data/runtime` 下可访问运行时文件。
+- `/home/ddltm/data/user/<user_name>` 下可访问对应用户 home，`/home/ddltm/data/logs` 下可访问任务日志和环境安装日志，`/home/ddltm/data/runtime` 下可访问运行时文件。
 - `/home/ddltm/envs` 下可访问 miniconda、用户环境目录和 `nebulagrid_remote` 节点监控/远端执行代码。
 
 计算节点预检查示例：
@@ -138,7 +138,7 @@ sudo chmod 640 /etc/nebulagrid/secrets.env
 
 ```text
 /home/ddltm/data/                     # 通过 NFS 共享到所有计算节点
-├── user/                   # 平台用户 home 根目录，子账户 home 为 /home/ddltm/data/user/<user_id>
+├── user/                   # 平台用户 home 根目录，子账户 home 为 /home/ddltm/data/user/<user_name>
 ├── logs/
 │   ├── task_logs/          # 任务 stdout/stderr 日志
 │   └── env_install_logs/   # 环境安装日志
@@ -157,7 +157,7 @@ sudo chmod 640 /etc/nebulagrid/secrets.env
 注意：
 
 - `/home/ddltm/data` 必须在 master 和所有计算节点保持相同挂载路径，避免用户 home、任务 workdir、日志路径或环境路径在节点侧失效。
-- 用户子账户只在 master 存在，home 目录为 `/home/ddltm/data/user/<user_id>`。计算节点侧所有任务进程以主账户运行，必须通过 PathResolver 和审计约束访问范围，不能依赖计算节点本地 Unix 子账户隔离。
+- 用户子账户只在 master 存在，home 目录为 `/home/ddltm/data/user/<user_name>`。计算节点侧所有任务进程以主账户运行，必须通过 PathResolver 和审计约束访问范围，不能依赖计算节点本地 Unix 子账户隔离。
 - 用户文件、任务日志、环境目录和数据库备份应分别设计备份策略，不建议混在同一个备份包中。
 - 解压、导入环境包时必须先进入隔离临时目录，完成路径安全检查后再移动到目标目录。
 - `/home/ddltm/envs/nebulagrid_remote` 由 master 统一维护，计算节点只执行该目录中的受控 runner、monitor 和 env_installer。
@@ -288,7 +288,7 @@ influxdb:
 storage:
   nfs_data_root: /home/ddltm/data
   user_home_root: /home/ddltm/data/user
-  user_home_template: /home/ddltm/data/user/{user_id}
+  user_home_template: /home/ddltm/data/user/{user_name}
   task_log_root: /home/ddltm/data/logs/task_logs
   env_package_root: /home/ddltm/envs/packages
   env_install_log_root: /home/ddltm/data/logs/env_install_logs
@@ -302,7 +302,7 @@ accounts:
   main_group: ddltm
   require_same_uid_gid_on_nodes: true
   create_child_accounts_on_master_only: true
-  child_home_template: /home/ddltm/data/user/{user_id}
+  child_home_template: /home/ddltm/data/user/{user_name}
 
 scheduler:
   enabled: true
@@ -717,7 +717,7 @@ Runtime Guard 应检查任务进程树实际使用的 GPU UUID：
 - [ ] 管理员账号可登录，普通用户、导师、展示者权限边界正确。
 - [ ] 至少一个计算节点在线，`nvidia-smi` 采集正常。
 - [ ] master 与计算节点均能通过相同路径访问 `/home/ddltm/data`，NFS 挂载、主账户 UID/GID、权限和读写测试正常。
-- [ ] 平台用户的 master 子账户 home 均映射到 `/home/ddltm/data/user/<user_id>`，主账户可对其文件执行必要的增删查改，计算节点不存在这些子账户。
+- [ ] 平台用户的 master 子账户 home 均映射到 `/home/ddltm/data/user/<user_name>`，主账户可对其文件执行必要的增删查改，计算节点不存在这些子账户。
 - [ ] GPU 任务可提交、调度、运行、停止、释放资源。
 - [ ] 日志 tail、完整查看和下载按权限工作。
 - [ ] 文件路径越权返回 403 或 404，不泄露真实路径。

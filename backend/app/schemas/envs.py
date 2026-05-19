@@ -8,6 +8,7 @@ class EnvInfo(BaseModel):
     owner_user_id: int
     name: str
     path: str
+    can_modify: bool = False
     description: str
     source_type: str
     state: str
@@ -20,7 +21,7 @@ class EnvUploadRequest(BaseModel):
     """环境导入占位请求体，MVP 阶段记录元数据而不处理真实包文件。"""
 
     name: str = Field(min_length=1, max_length=128)
-    path: str = Field(min_length=1, max_length=1024)
+    path: str | None = Field(default=None, max_length=1024)
     description: str = Field(default="", max_length=512)
     python_version: str | None = Field(default=None, max_length=32)
 
@@ -73,4 +74,3 @@ class EnvInstallJobInfo(BaseModel):
     created_by: int
     started_at: str | None = None
     finished_at: str | None = None
-

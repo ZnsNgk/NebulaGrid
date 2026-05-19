@@ -1,4 +1,5 @@
 import hmac
+from secrets import token_urlsafe
 from hashlib import sha256
 
 from app.core.errors import unauthorized
@@ -16,10 +17,11 @@ def verify_password(password: str, password_hash: str) -> bool:
     return hmac.compare_digest(hash_password(password), password_hash)
 
 
-def create_session_token(username: str) -> str:
+def create_session_token(username: str, nonce: str | None = None) -> str:
     """签发可读的演示令牌，后续接入 JWT 或服务端 session 时替换这里。"""
-    digest = sha256(f"{TOKEN_PREFIX}:{username}".encode("utf-8")).hexdigest()[:24]
-    return f"{TOKEN_PREFIX}.{username}.{digest}"
+    session_nonce = nonce or token_urlsafe(12)
+    digest = sha256(f"{TOKEN_PREFIX}:{username}:{session_nonce}".encode("utf-8")).hexdigest()[:24]
+    return f"{TOKEN_PREFIX}.{username}.{session_nonce}.{digest}"
 
 
 def parse_authorization_header(value: str | None) -> str:
@@ -34,5 +36,10 @@ def parse_authorization_header(value: str | None) -> str:
 
 def verify_session_token(token: str, username: str) -> bool:
     """校验演示令牌是否与指定用户匹配，避免客户端随意伪造用户名。"""
-    return hmac.compare_digest(token, create_session_token(username))
-
+    parts = token.split(".")
+    if len(parts) == 4:
+        return hmac.compare_digest(token, create_session_token(username, parts[2]))
+    if len(parts) == 3:
+        digest = sha256(f"{TOKEN_PREFIX}:{username}".encode("utf-8")).hexdigest()[:24]
+        return hmac.compare_digest(token, f"{TOKEN_PREFIX}.{username}.{digest}")
+    return False

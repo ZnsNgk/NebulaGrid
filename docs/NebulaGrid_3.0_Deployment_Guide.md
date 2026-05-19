@@ -72,7 +72,7 @@ sudo -u ddltm ssh node-a 'hostname && id && nvidia-smi -L'
 ```bash
 sudo mkdir -p /home/ddltm/data/user /home/ddltm/data/logs/task_logs /home/ddltm/data/logs/env_install_logs
 sudo mkdir -p /home/ddltm/data/runtime /home/ddltm/data/backups /home/ddltm/envs/packages
-sudo mkdir -p /home/ddltm/envs/miniconda3 /home/ddltm/envs/user_envs /home/ddltm/envs/nebulagrid_remote
+sudo mkdir -p /home/ddltm/envs/miniconda3/envs /home/ddltm/envs/nebulagrid_remote
 sudo chown -R ddltm:ddltm /home/ddltm/data
 sudo chown -R ddltm:ddltm /home/ddltm/envs
 sudo chmod 750 /home/ddltm/data
@@ -232,7 +232,8 @@ NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
 NEBULAGRID_DATA_ROOT=/home/ddltm/data
 NEBULAGRID_USER_HOME_ROOT=/home/ddltm/data/user
 NEBULAGRID_WORKSPACE_ALIAS=/workspace
-NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/user_envs,/home/ddltm/envs/miniconda3
+NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/miniconda3
+NEBULAGRID_CONDA_ENV_ROOT=/home/ddltm/envs/miniconda3/envs
 NEBULAGRID_TASK_LOG_ROOT=/home/ddltm/data/logs/task_logs
 NEBULAGRID_ENV_PACKAGE_ROOT=/home/ddltm/envs/packages
 NEBULAGRID_ENV_INSTALL_LOG_ROOT=/home/ddltm/data/logs/env_install_logs

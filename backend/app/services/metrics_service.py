@@ -17,6 +17,7 @@ class NodeMetricSnapshot:
 
     cpu_usage: int | None = None
     avail_ram_mb: int | None = None
+    network_bandwidth_mbps: int | None = None
     upload_mbps: int | None = None
     download_mbps: int | None = None
     collected_at: str | None = None
@@ -53,6 +54,7 @@ def write_monitor_snapshot(node: Any, payload: dict[str, Any], gpu_rows: list[tu
             {
                 "cpu_usage": coerce_int(payload.get("cpu_usage")),
                 "avail_ram_mb": coerce_int(payload.get("avail_ram_mb")),
+                "network_bandwidth_mbps": coerce_int(payload.get("network_bandwidth_mbps")),
                 "upload_mbps": coerce_int(payload.get("upload_mbps")),
                 "download_mbps": coerce_int(payload.get("download_mbps")),
             },
@@ -112,6 +114,7 @@ def get_latest_metrics(node_ids: list[int], gpu_ids: list[int]) -> LatestMetrics
             node_id: NodeMetricSnapshot(
                 cpu_usage=values.get("cpu_usage"),
                 avail_ram_mb=values.get("avail_ram_mb"),
+                network_bandwidth_mbps=values.get("network_bandwidth_mbps"),
                 upload_mbps=values.get("upload_mbps"),
                 download_mbps=values.get("download_mbps"),
                 collected_at=values.get("collected_at"),

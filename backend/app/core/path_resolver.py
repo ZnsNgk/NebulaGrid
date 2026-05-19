@@ -22,19 +22,27 @@ def resolve_visible_path(path: str) -> Path:
     return real_path
 
 
-def resolve_user_visible_path(path: str, user_id: int) -> Path:
+def resolve_user_visible_path(path: str, username: str, role: str = "student") -> Path:
     """解析用户可见路径，把 /workspace 安全映射到配置的用户 home 根目录。"""
     settings = get_settings()
     normalized = normalize_virtual_path(path)
     alias = settings.user_workspace_alias.rstrip("/")
+    if role == "admin":
+        user_root = Path(f"/home/{settings.main_linux_user}").resolve(strict=False)
+    else:
+        user_root = (Path(settings.user_home_root) / username).resolve(strict=False)
     if normalized == alias or normalized.startswith(f"{alias}/"):
         suffix = normalized[len(alias) :].lstrip("/")
-        candidate = Path(settings.user_home_root) / str(user_id) / suffix
+        candidate = user_root / suffix
     else:
         candidate = Path(normalized)
     real_path = candidate.resolve(strict=False)
-    user_root = (Path(settings.user_home_root) / str(user_id)).resolve(strict=False)
-    shared_roots = [Path(root).resolve(strict=False) for root in settings.visible_roots]
+    user_home_root = Path(settings.user_home_root).resolve(strict=False)
+    shared_roots = [
+        root
+        for root in (Path(item).resolve(strict=False) for item in settings.visible_roots)
+        if root != user_home_root
+    ]
     allowed_roots = [user_root, *shared_roots]
     if not any(real_path == root or root in real_path.parents for root in allowed_roots):
         raise forbidden("path is outside allowed user roots")

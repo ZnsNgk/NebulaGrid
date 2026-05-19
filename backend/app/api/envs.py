@@ -7,6 +7,7 @@ from app.schemas.envs import EnvPackageInstallRequest, EnvPackageUploadRequest, 
 from app.services.auth_service import UserRecord
 from app.services.env_service import (
     cancel_install_job,
+    delete_env,
     get_install_job,
     get_install_job_log,
     install_package,
@@ -28,6 +29,8 @@ def get_envs(request: Request, current_user: UserRecord = Depends(get_current_us
 
 
 @router.post("/upload-pack")
+@router.post("/register")
+@router.post("/import-conda-pack")
 def post_upload_pack(
     payload: EnvUploadRequest,
     request: Request,
@@ -35,6 +38,13 @@ def post_upload_pack(
 ):
     """登记 conda-pack 环境导入请求。"""
     env = upload_env_pack(current_user, payload)
+    return api_success(data=env.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.delete("/{env_id}")
+def delete_registered_env(env_id: int, request: Request, current_user: UserRecord = Depends(get_current_user)):
+    """删除当前用户自己创建的环境登记信息。"""
+    env = delete_env(current_user, env_id)
     return api_success(data=env.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
@@ -92,4 +102,3 @@ def post_cancel_env_install_job(
     """取消环境安装作业。"""
     job = cancel_install_job(current_user, job_id)
     return api_success(data=job.model_dump(), request_id=request.headers.get("x-request-id"))
-

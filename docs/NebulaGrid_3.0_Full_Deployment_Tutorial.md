@@ -162,7 +162,7 @@ sudo mkdir -p /home/ddltm/data/runtime
 sudo mkdir -p /home/ddltm/data/backups
 sudo mkdir -p /home/ddltm/envs/packages
 sudo mkdir -p /home/ddltm/envs/miniconda3
-sudo mkdir -p /home/ddltm/envs/user_envs
+sudo mkdir -p /home/ddltm/envs/miniconda3/envs
 sudo mkdir -p /home/ddltm/envs/nebulagrid_remote
 sudo chown -R ddltm:ddltm /home/ddltm/data
 sudo chown -R ddltm:ddltm /home/ddltm/envs
@@ -390,6 +390,7 @@ sudo mkdir -p /etc/nebulagrid
 sudo tee /etc/nebulagrid/backend.env >/dev/null <<'EOF'
 NEBULAGRID_APP_NAME=NebulaGrid
 NEBULAGRID_ENV=production
+NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true
 NEBULAGRID_DATABASE_URL=postgresql+psycopg://nebulagrid:replace-with-strong-password@127.0.0.1:5432/nebulagrid
 NEBULAGRID_REDIS_URL=redis://127.0.0.1:6379/0
 NEBULAGRID_INFLUXDB_URL=http://127.0.0.1:8086
@@ -400,7 +401,8 @@ NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
 NEBULAGRID_DATA_ROOT=/home/ddltm/data
 NEBULAGRID_USER_HOME_ROOT=/home/ddltm/data/user
 NEBULAGRID_WORKSPACE_ALIAS=/workspace
-NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/user_envs,/home/ddltm/envs/miniconda3
+NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/miniconda3
+NEBULAGRID_CONDA_ENV_ROOT=/home/ddltm/envs/miniconda3/envs
 NEBULAGRID_TASK_LOG_ROOT=/home/ddltm/data/logs/task_logs
 NEBULAGRID_ENV_PACKAGE_ROOT=/home/ddltm/envs/packages
 NEBULAGRID_ENV_INSTALL_LOG_ROOT=/home/ddltm/data/logs/env_install_logs

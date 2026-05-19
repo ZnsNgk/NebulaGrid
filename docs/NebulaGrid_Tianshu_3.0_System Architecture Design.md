@@ -177,7 +177,7 @@ flowchart TB
 ├── postgresql.service             # 主数据库
 ├── redis.service                  # 实时事件与缓存
 ├── /home/ddltm/data/                         # NFS 共享：用户 home、任务日志、环境安装日志、运行时文件
-├── /home/ddltm/data/user/<user_id>/          # master 子账户 home，只在主节点创建对应 Linux 账户
+├── /home/ddltm/data/user/<user_name>/        # master 子账户 home，只在主节点创建对应 Linux 账户
 └── /home/ddltm/envs/                         # NFS 共享：miniconda、用户环境、节点监控/远端执行代码
 
 计算节点 node-01/node-02/...
@@ -188,7 +188,7 @@ flowchart TB
 └── /home/ddltm/envs                          # 通过 NFS 挂载 master 的 /home/ddltm/envs，包含环境与 runner/monitor/env_installer
 ```
 
-部署约定：master 作为 NFS server，共享 `/home/ddltm/data` 和 `/home/ddltm/envs` 到所有计算节点。`/home/ddltm/data/user/<user_id>` 是平台用户在 master 上的 home 目录；`/home/ddltm/data/logs` 存放任务日志和环境安装日志；`/home/ddltm/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台为用户创建的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/home/ddltm/data/user/<user_id>` 下的文件执行必要的增删查改，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
+部署约定：master 作为 NFS server，共享 `/home/ddltm/data` 和 `/home/ddltm/envs` 到所有计算节点。`/home/ddltm/data/user/<user_name>` 是平台用户在 master 上的 home 目录；`/home/ddltm/data/logs` 存放任务日志和环境安装日志；`/home/ddltm/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台为学生和导师创建的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；管理员用户复用部署前已存在的主账户，不额外创建管理员子账户。计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/home/ddltm/data/user/<user_name>` 下的文件执行必要的增删查改，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
 
 中期可演进为：数据库独立部署，Redis 独立部署，API 多实例，Scheduler/Monitor/Executor 保持单实例或通过 leader election 控制。
 
@@ -316,7 +316,7 @@ erDiagram
 | supervisor1_id | fk users.id | 第一导师 |
 | supervisor2_id | fk users.id | 第二导师 |
 | avatar_path | varchar | 头像路径 |
-| home_path | varchar | 用户真实 home 路径，固定映射为 `/home/ddltm/data/user/<user_id>`，仅管理员可见 |
+| home_path | varchar | 用户真实 home 路径，固定映射为 `/home/ddltm/data/user/<user_name>`，仅管理员可见 |
 | linux_account_name | varchar | master 上对应的 Linux 子账户名；该账户只在 master 创建，用于用户 SSH 登录 |
 | linux_uid | int nullable | master 子账户 UID；用于审计和排障，不要求同步到计算节点 |
 | linux_gid | int nullable | master 子账户 GID；用于审计和排障，不要求同步到计算节点 |
@@ -1047,7 +1047,7 @@ running install job exists -> reject new install job or queue it
 
 ```text
 /workspace/project/train.py
-/home/ddltm/envs/user_envs/torch201
+/home/ddltm/envs/miniconda3/envs/torch201
 /logs/2026051809201250.log
 ```
 
@@ -1236,7 +1236,7 @@ MVP 推荐 Session Cookie + CSRF 防护，原因是管理后台操作多，主�
 
 用户任务命令本身具有执行能力，不能完全当作普通文本处理。需要通过制度和技术边界共同控制：
 
-1. 用户只能在自己的工作目录运行，真实目录为 `/home/ddltm/data/user/<user_id>`；
+1. 用户只能在自己的工作目录运行，真实目录为 `/home/ddltm/data/user/<user_name>`；
 2. 系统统一拼接环境激活和 CUDA 前缀；
 3. 任务命令保存原文和最终命令；
 4. 管理员可查看最终命令；
@@ -1291,13 +1291,13 @@ storage:
   nfs_data_root: /home/ddltm/data
   nfs_env_root: /home/ddltm/envs
   user_home_root: /home/ddltm/data/user
-  user_home_template: /home/ddltm/data/user/{user_id}
+  user_home_template: /home/ddltm/data/user/{user_name}
   task_log_root: /home/ddltm/data/logs/task_logs
   env_package_root: /home/ddltm/envs/packages
   env_install_log_root: /home/ddltm/data/logs/env_install_logs
   runtime_root: /home/ddltm/data/runtime
   miniconda_root: /home/ddltm/envs/miniconda3
-  user_env_root: /home/ddltm/envs/user_envs
+  user_env_root: /home/ddltm/envs/miniconda3/envs
   remote_code_root: /home/ddltm/envs/nebulagrid_remote
 
 metrics:
@@ -1314,7 +1314,7 @@ accounts:
   main_group: ddltm
   require_same_uid_gid_on_nodes: true
   create_child_accounts_on_master_only: true
-  child_home_template: /home/ddltm/data/user/{user_id}
+  child_home_template: /home/ddltm/data/user/{user_name}
 
 scheduler:
   enabled: true

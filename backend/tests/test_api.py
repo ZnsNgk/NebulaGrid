@@ -88,3 +88,113 @@ def login_as_admin(client: TestClient) -> str:
         json={"identity": "admin", "password": "admin123"},
     )
     return response.json()["data"]["access_token"]
+
+
+def test_envs_are_globally_usable_but_owner_modified() -> None:
+    """验证环境可被所有用户选择使用，但包安装和删除等修改动作只允许环境所有者执行。"""
+    client = make_client()
+    admin_token = login_as_admin(client)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    create_user_response = client.post(
+        "/api/users",
+        headers=admin_headers,
+        json={
+            "username": "env-student",
+            "real_name": "Env Student",
+            "role": "student",
+            "state": "enabled",
+            "password": "student123",
+        },
+    )
+    student_token = login_user(client, "env-student", "student123")
+    student_headers = {"Authorization": f"Bearer {student_token}"}
+
+    env_response = client.post(
+        "/api/envs/register",
+        headers=admin_headers,
+        json={"name": "shared-torch", "python_version": "3.11"},
+    )
+    env = env_response.json()["data"]
+    task_response = client.post(
+        "/api/tasks",
+        headers=student_headers,
+        json={"command": "python train.py", "workdir": "/workspace", "env_id": env["id"]},
+    )
+    forbidden_upload = client.post(
+        f"/api/envs/{env['id']}/packages/upload",
+        headers=student_headers,
+        json={"filename": "pkg.whl"},
+    )
+
+    assert create_user_response.status_code == 200
+    assert env_response.status_code == 200
+    assert env["path"] == "/home/ddltm/envs/miniconda3/envs/shared-torch"
+    assert client.get("/api/envs", headers=student_headers).json()["data"][0]["can_modify"] is False
+    assert task_response.status_code == 200
+    assert forbidden_upload.status_code == 403
+
+
+def test_env_name_cannot_create_nested_conda_directory() -> None:
+    """验证环境名只能映射为 miniconda envs 下的一级目录，避免 conda 无法识别。"""
+    client = make_client()
+    token = login_as_admin(client)
+    response = client.post(
+        "/api/envs/register",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": "owner/nested"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_user_management_maps_linux_accounts_and_deletes_children() -> None:
+    """验证管理员映射主账户，教学用户映射子账户，删除用户后账号不可再登录。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    admin_list = client.get("/api/users", headers=headers).json()["data"]
+    create_response = client.post(
+        "/api/users",
+        headers=headers,
+        json={
+            "username": "delete-student",
+            "real_name": "Delete Student",
+            "role": "student",
+            "state": "enabled",
+            "password": "student123",
+        },
+    )
+    created = create_response.json()["data"]
+    delete_response = client.delete(f"/api/users/{created['id']}", headers=headers)
+    login_response = client.post(
+        "/api/auth/login",
+        json={"identity": "delete-student", "password": "student123"},
+    )
+
+    assert admin_list[0]["linux_account_name"] == "ddltm"
+    assert admin_list[0]["home_path"] == "/home/ddltm"
+    assert create_response.status_code == 200
+    assert created["linux_account_name"] == "delete-student"
+    assert created["home_path"] == "/home/ddltm/data/user/delete-student"
+    assert delete_response.status_code == 200
+    assert login_response.status_code == 401
+
+
+def test_last_admin_user_cannot_be_deleted() -> None:
+    """验证用户删除流程保护最后一个管理员，避免系统失去管理入口。"""
+    client = make_client()
+    token = login_as_admin(client)
+    response = client.delete("/api/users/1", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 403
+
+
+def login_user(client: TestClient, identity: str, password: str) -> str:
+    """使用指定账号登录，并返回后续测试可复用的 Bearer token。"""
+    response = client.post(
+        "/api/auth/login",
+        json={"identity": identity, "password": password},
+    )
+    return response.json()["data"]["access_token"]
