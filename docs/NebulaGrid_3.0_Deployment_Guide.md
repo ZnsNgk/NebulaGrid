@@ -476,7 +476,7 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 - 环境导入：用户从自己的文件根目录选择 zip 包，后端解压到临时目录，复制到 `miniconda3/envs/<env_name>`，修复路径和权限，测试通过后设为可用。
 - 环境副本：用户可基于任意可用环境创建自己的副本，后端复制 `miniconda3/envs/<old_env_name>` 到 `miniconda3/envs/<new_env_name>`，并执行路径修复、权限修复和检测。
 - 环境删除：普通用户只能删除自己的环境，管理员可以删除所有环境；删除会同时清理数据库记录和 `miniconda3/envs/<env_name>` 目录。
-- 环境日志：每个环境一个日志文件，位于 `NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`。管理员可查看全部日志，普通用户只能查看自己的日志。
+- 环境日志：每个环境一个 JSON Lines 日志文件，位于 `NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`，同时结构化写入 PostgreSQL `env_operation_logs` 表。管理员可查看全部日志，普通用户只能查看自己的日志；页面会自动解析 JSON 行和其中的换行符。
 
 路径修复不是只处理 conda 元数据。当前实现会扫描环境内所有文本文件，提取旧环境前缀并替换为新路径，覆盖 `pip` shebang、`.pth`、包配置、metadata、conda 记录等常见残留；含空字节或明显二进制的文件会跳过，避免误改 `.so`、`.pyd` 等二进制包。
 

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any
 
@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.errors import unauthorized
 from app.core.rbac import Role, list_permissions, require_permission
 from app.core.security import create_session_token, hash_password, verify_password, verify_session_token
+from app.core.time_utils import ensure_local_datetime, local_datetime, local_now, parse_datetime_local
 from app.db.models import LoginSession, User, UserSupervisor
 from app.db.session import SessionLocal
 from app.schemas.auth import AdminOnlineUserInfo, AdminUserLoginSessions, LoginResult, LoginSessionInfo, PublicUser
@@ -304,7 +305,7 @@ def list_admin_online_users(actor: UserRecord) -> list[AdminOnlineUserInfo]:
             user_sessions = [session for session in online_sessions if session.user_id == user.id]
             if not user_sessions:
                 continue
-            last_seen = max(user_sessions, key=lambda item: parse_datetime(item.last_seen_at) or datetime.min.replace(tzinfo=timezone.utc)).last_seen_at
+            last_seen = max(user_sessions, key=lambda item: parse_datetime(item.last_seen_at) or local_datetime().replace(year=1, month=1, day=1)).last_seen_at
             login_ips = sorted({session.login_ip for session in user_sessions if session.login_ip})
             login_devices = sorted({session.login_device for session in user_sessions if session.login_device})
             result.append(AdminOnlineUserInfo(
@@ -491,8 +492,8 @@ def aggregate_login_sessions(sessions: list[LoginSessionRecord], current_token: 
         key=lambda item: (
             item.token_hash == current_hash,
             session_is_active(item),
-            parse_datetime(item.last_seen_at) or datetime.min.replace(tzinfo=timezone.utc),
-            parse_datetime(item.login_time) or datetime.min.replace(tzinfo=timezone.utc),
+            parse_datetime(item.last_seen_at) or local_datetime().replace(year=1, month=1, day=1),
+            parse_datetime(item.login_time) or local_datetime().replace(year=1, month=1, day=1),
             item.id,
         ),
         reverse=True,
@@ -567,15 +568,7 @@ def session_model_is_active(session: LoginSession) -> bool:
 
 def parse_datetime(value: str | None) -> datetime | None:
     """解析 ISO 时间字符串，失败时返回 None。"""
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parse_datetime_local(value)
 
 
 def normalize_device_id(value: str | None) -> str:
@@ -714,16 +707,14 @@ def datetime_to_iso(value: datetime | None) -> str:
     """把数据库时间统一转成带时区的 ISO 字符串。"""
     if value is None:
         return utc_now()
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
+    return ensure_local_datetime(value).isoformat()
 
 
 def utc_datetime() -> datetime:
-    """返回 UTC 当前时间，供数据库和响应模型共用。"""
-    return datetime.now(timezone.utc)
+    """返回系统本地时区当前时间；保留旧函数名以兼容现有调用点。"""
+    return local_datetime()
 
 
 def utc_now() -> str:
-    """返回 UTC ISO 时间字符串。"""
-    return utc_datetime().isoformat()
+    """返回系统本地时区 ISO 时间字符串。"""
+    return local_now()

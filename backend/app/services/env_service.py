@@ -18,7 +18,8 @@ from app.core.config import get_settings
 from app.core.errors import forbidden, not_found, validation_error
 from app.core.path_resolver import normalize_virtual_path, resolve_user_visible_path
 from app.core.rbac import Role, require_permission
-from app.db.models import Env, EnvInstallJob, EnvPackage, EnvPackageManifest, Task, User
+from app.core.time_utils import ensure_local_datetime
+from app.db.models import Env, EnvInstallJob, EnvOperationLog, EnvPackage, EnvPackageManifest, Task, User
 from app.db.session import SessionLocal
 from app.schemas.envs import (
     EnvArchiveImportRequest,
@@ -26,6 +27,11 @@ from app.schemas.envs import (
     EnvFrameworkInfo,
     EnvInfo,
     EnvInstallJobInfo,
+    EnvInstalledPackageDeletePreview,
+    EnvInstalledPackageDeleteRequest,
+    EnvInstalledPackageDeleteResult,
+    EnvLocalPackageInstallRequest,
+    EnvLocalPackageInstallResult,
     EnvPackageInfo,
     EnvPackageInstallRequest,
     EnvPackageVersion,
@@ -41,6 +47,25 @@ _JOB_ID = count(1)
 _PACKAGES: list[EnvPackageInfo] = []
 _JOBS: list[EnvInstallJobInfo] = []
 ENV_IMPORT_ACTIVE_STATES = {"copying", "importing", "fixing", "testing"}
+PROTECTED_ENV_PACKAGE_NAMES = {
+    "python",
+    "pip",
+    "setuptools",
+    "wheel",
+    "conda",
+    "conda-package-handling",
+    "conda-package-streaming",
+    "openssl",
+    "sqlite",
+    "tk",
+    "xz",
+    "zlib",
+    "libffi",
+    "ncurses",
+    "readline",
+    "ca-certificates",
+    "certifi",
+}
 
 
 def list_envs(user: UserRecord) -> list[EnvInfo]:
@@ -260,6 +285,223 @@ def install_package(
     return job
 
 
+def install_local_package(user: UserRecord, env_id: int, payload: EnvLocalPackageInstallRequest) -> EnvLocalPackageInstallResult:
+    """在主节点目标 conda 环境中执行离线安装。"""
+    env = get_env_for_user(user, env_id)
+    require_env_owner(user, env)
+    if not is_env_usable_for_mutation(env):
+        raise validation_error("environment is not available")
+    write_env_operation_log(env, "package_install", "开始本机安装包操作", user.id, payload.model_dump())
+    if payload.method == "conda":
+        result = install_conda_archive_package(user, env, payload)
+    elif payload.method == "pip":
+        result = install_pip_package(user, env, payload)
+    else:
+        raise validation_error("unsupported install method")
+    write_env_operation_log(
+        env,
+        "package_install",
+        "本机安装包操作完成" if result.ok else "本机安装包操作失败",
+        user.id,
+        {"method": result.method, "return_code": result.return_code, "stdout": tail_text(result.stdout), "stderr": tail_text(result.stderr)},
+    )
+    record_audit(user.id, "env.package.install_local", "env", str(env.id), result="success" if result.ok else "failed", detail_json={"method": result.method, "return_code": result.return_code})
+    return result
+
+
+def install_conda_archive_package(user: UserRecord, env: EnvInfo, payload: EnvLocalPackageInstallRequest) -> EnvLocalPackageInstallResult:
+    """执行 conda install --offline 安装 .tar.bz2 包。"""
+    package_path = resolve_required_user_file(user, payload.package_path, {".tar.bz2"})
+    command = f"conda install --offline -y {shlex.quote(str(package_path))}"
+    return run_env_install_command(env, "conda", command)
+
+
+def install_pip_package(user: UserRecord, env: EnvInfo, payload: EnvLocalPackageInstallRequest) -> EnvLocalPackageInstallResult:
+    """执行 pip 离线安装，支持单 whl、requirements 批量和文件夹安装。"""
+    if payload.pip_mode == "wheel":
+        if payload.batch:
+            folder = resolve_required_user_directory(user, payload.folder_path)
+            requirements = resolve_required_user_file(user, payload.requirements_path, {".txt"})
+            command = f"python -m pip install --no-index --find-links={shlex.quote(str(folder))} -r {shlex.quote(str(requirements))}"
+            return run_env_install_command(env, "pip_batch", command)
+        package_path = resolve_required_user_file(user, payload.package_path, {".whl"})
+        command = f"python -m pip install --no-index {shlex.quote(str(package_path))}"
+        return run_env_install_command(env, "pip_wheel", command)
+    if payload.pip_mode == "folder":
+        folder = resolve_required_user_directory(user, payload.folder_path)
+        command = "python setup.py install" if payload.folder_command == "setup_py" else "python -m pip install ."
+        return run_env_install_command(env, "pip_folder", command, cwd=folder)
+    raise validation_error("pip mode is required")
+
+
+def run_env_install_command(env: EnvInfo, method: str, command: str, cwd: Path | None = None, log_action: str = "package_install_output") -> EnvLocalPackageInstallResult:
+    """激活目标环境后执行受控安装命令，并把输出追加到单环境日志。"""
+    shell_command = build_conda_shell_command(env, command)
+    completed = subprocess.run(["bash", "-lc", shell_command], cwd=str(cwd) if cwd else None, check=False, capture_output=True, text=True, timeout=1800)
+    result = EnvLocalPackageInstallResult(
+        ok=completed.returncode == 0,
+        env_id=env.id,
+        env_name=env.name,
+        method=method,
+        command=command,
+        return_code=completed.returncode,
+        stdout=tail_text(completed.stdout or "", 12000),
+        stderr=tail_text(completed.stderr or "", 12000),
+        log_path=str(env_operation_log_path(env)),
+    )
+    with env_operation_log_path(env).open("a", encoding="utf-8") as file:
+        file.write(json.dumps({"time": utc_now(), "env_id": env.id, "env_name": env.name, "action": log_action, "method": method, "command": command, "return_code": completed.returncode, "stdout": completed.stdout or "", "stderr": completed.stderr or ""}, ensure_ascii=False) + "\n")
+    persist_env_operation_record(
+        env,
+        log_action,
+        "环境命令执行完成" if completed.returncode == 0 else "环境命令执行失败",
+        status="success" if completed.returncode == 0 else "failed",
+        command=command,
+        return_code=completed.returncode,
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+        detail={"method": method},
+    )
+    return result
+
+
+def build_conda_shell_command(env: EnvInfo, command: str) -> str:
+    """复用 conda activate 方式构造环境内命令，保持与检测逻辑一致。"""
+    activate_path = Path(get_settings().miniconda_python).parent / "activate"
+    return f"source {shlex.quote(str(activate_path))} && conda activate {shlex.quote(env.name)} && {command}"
+
+
+def resolve_required_user_file(user: UserRecord, path: str | None, allowed_suffixes: set[str]) -> Path:
+    """解析用户选择的文件并按后缀校验，防止绕过文件根目录。"""
+    if not path:
+        raise validation_error("package file is required")
+    real_path = resolve_user_visible_path(normalize_virtual_path(path), user.username, user.role.value)
+    if not real_path.is_file():
+        raise validation_error("selected path is not a file")
+    lowered = real_path.name.lower()
+    if not any(lowered.endswith(suffix) for suffix in allowed_suffixes):
+        raise validation_error("unsupported package file type")
+    return real_path
+
+
+def resolve_required_user_directory(user: UserRecord, path: str | None) -> Path:
+    """解析用户选择的目录并确认存在。"""
+    if not path:
+        raise validation_error("package folder is required")
+    real_path = resolve_user_visible_path(normalize_virtual_path(path), user.username, user.role.value)
+    if not real_path.is_dir():
+        raise validation_error("selected path is not a directory")
+    return real_path
+
+
+def is_env_usable_for_mutation(env: EnvInfo) -> bool:
+    """只有可用/登记环境允许执行安装类修改操作。"""
+    return env.state in {"available", "registered"}
+
+
+def tail_text(value: str, limit: int = 4000) -> str:
+    """日志 detail 只保留尾部摘要，完整输出已写入单环境日志。"""
+    return value[-limit:] if value and len(value) > limit else value
+
+
+def preview_delete_installed_packages(user: UserRecord, env_id: int, payload: EnvInstalledPackageDeleteRequest) -> EnvInstalledPackageDeletePreview:
+    """生成已安装包删除确认内容；执行前必须重新检测包来源和保护状态。"""
+    env = get_env_for_user(user, env_id)
+    require_env_owner(user, env)
+    if not is_env_usable_for_mutation(env):
+        raise validation_error("environment is not available")
+    packages = resolve_delete_target_packages(env, payload.package_names)
+    commands = build_delete_package_commands(packages)
+    lines = [
+        f"即将从环境 {env.name} 删除以下包：",
+        *[f"- {item.name} {item.version}（{package_source_label(item.source)}）" for item in packages],
+        "",
+        "将执行以下命令：",
+        *commands,
+        "",
+        "系统不会自动修复依赖关系，删除后可能导致依赖该包的程序不可用。是否继续？",
+    ]
+    return EnvInstalledPackageDeletePreview(env_id=env.id, env_name=env.name, packages=packages, commands=commands, prompt="\n".join(lines))
+
+
+def delete_installed_packages(user: UserRecord, env_id: int, payload: EnvInstalledPackageDeleteRequest) -> EnvInstalledPackageDeleteResult:
+    """删除目标环境内已安装包，并把卸载命令输出写入单环境日志。"""
+    env = get_env_for_user(user, env_id)
+    require_env_owner(user, env)
+    if not is_env_usable_for_mutation(env):
+        raise validation_error("environment is not available")
+    preview = preview_delete_installed_packages(user, env_id, payload)
+    write_env_operation_log(env, "package_delete", "开始删除已安装包", user.id, {"packages": [item.name for item in preview.packages], "commands": preview.commands})
+    results = [run_env_install_command(env, "package_delete", command, log_action="package_delete_output") for command in preview.commands]
+    ok = all(result.ok for result in results)
+    return_code = next((result.return_code for result in results if result.return_code != 0), 0)
+    stdout = tail_text("\n".join(result.stdout for result in results if result.stdout), 12000)
+    stderr = tail_text("\n".join(result.stderr for result in results if result.stderr), 12000)
+    write_env_operation_log(
+        env,
+        "package_delete",
+        "已安装包删除完成" if ok else "已安装包删除失败",
+        user.id,
+        {"packages": [item.name for item in preview.packages], "return_code": return_code, "stdout": tail_text(stdout), "stderr": tail_text(stderr)},
+    )
+    record_audit(user.id, "env.package.delete_installed", "env", str(env.id), result="success" if ok else "failed", detail_json={"packages": [item.name for item in preview.packages], "return_code": return_code})
+    return EnvInstalledPackageDeleteResult(
+        ok=ok,
+        env_id=env.id,
+        env_name=env.name,
+        packages=preview.packages,
+        commands=preview.commands,
+        return_code=return_code,
+        stdout=stdout,
+        stderr=stderr,
+        log_path=str(env_operation_log_path(env)),
+    )
+
+
+def resolve_delete_target_packages(env: EnvInfo, package_names: list[str]) -> list[EnvPackageVersion]:
+    """根据当前环境真实包列表解析待删除包，并拒绝核心包和不存在的包。"""
+    requested = {normalize_package_name(name): name for name in package_names if name and name.strip()}
+    if not requested:
+        raise validation_error("package name is required")
+    runtime = inspect_env_runtime(env)
+    by_name = {normalize_package_name(item.name): item for item in runtime.packages}
+    missing = [original for key, original in requested.items() if key not in by_name]
+    if missing:
+        raise validation_error("package not found", data={"packages": missing})
+    packages = [by_name[key] for key in requested]
+    protected = [item.name for item in packages if item.protected or is_protected_package_name(item.name)]
+    if protected:
+        raise validation_error("protected package cannot be deleted", data={"packages": protected})
+    return sorted(packages, key=lambda item: item.name.lower())
+
+
+def build_delete_package_commands(packages: list[EnvPackageVersion]) -> list[str]:
+    """按包来源分组生成卸载命令，conda/pip 包分别使用对应工具。"""
+    conda_names = [item.name for item in packages if item.source != "pip"]
+    pip_names = [item.name for item in packages if item.source == "pip"]
+    commands = []
+    if conda_names:
+        commands.append("conda remove -y " + " ".join(shlex.quote(name) for name in conda_names))
+    if pip_names:
+        commands.append("python -m pip uninstall -y " + " ".join(shlex.quote(name) for name in pip_names))
+    return commands
+
+
+def normalize_package_name(name: str) -> str:
+    """归一化包名，兼容 Python 包名中横线、下划线和点号的等价写法。"""
+    return re.sub(r"[-_.]+", "-", name.strip().lower())
+
+
+def is_protected_package_name(name: str) -> bool:
+    """判断是否为环境基础包；该判断与远端探测脚本保持一致但以后端为准。"""
+    return normalize_package_name(name) in PROTECTED_ENV_PACKAGE_NAMES
+
+
+def package_source_label(source: str) -> str:
+    """把包来源转换为中文确认文案。"""
+    return "pip" if source == "pip" else "conda"
+
+
 def delete_package(user: UserRecord, env_id: int, package_id: int) -> EnvPackageInfo:
     """删除环境包登记记录并写入环境日志；真实卸载流程接入后继续复用该日志入口。"""
     env = get_env_for_user(user, env_id)
@@ -361,6 +603,8 @@ def require_env_owner(user: UserRecord, env: EnvInfo) -> None:
     """断言用户可以修改该环境；管理员可修改全部环境，普通用户只修改自己的环境。"""
     if user.role == Role.ADMIN:
         return
+    if env.source_type == "system_imported":
+        raise forbidden("admin required for system env")
     if env.owner_user_id != user.id:
         raise forbidden("env owner required")
 
@@ -615,7 +859,45 @@ def write_env_operation_log(env: EnvInfo, action: str, message: str, actor_user_
     }
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    persist_env_operation_record(env, action, message, actor_user_id, detail or {}, log_path=str(path))
     return path
+
+
+def persist_env_operation_record(
+    env: EnvInfo,
+    action: str,
+    message: str,
+    actor_user_id: int | None = None,
+    detail: dict | None = None,
+    status: str = "info",
+    command: str | None = None,
+    return_code: int | None = None,
+    stdout: str | None = None,
+    stderr: str | None = None,
+    log_path: str | None = None,
+) -> None:
+    """把环境操作同步写入数据库；落库失败不应覆盖真实环境操作结果。"""
+    try:
+        with SessionLocal() as db:
+            db.add(
+                EnvOperationLog(
+                    env_id=env.id,
+                    env_name=env.name,
+                    action=action,
+                    message=message,
+                    actor_user_id=actor_user_id,
+                    status=status,
+                    command=command,
+                    return_code=return_code,
+                    stdout=tail_text(stdout or "", 12000) if stdout is not None else None,
+                    stderr=tail_text(stderr or "", 12000) if stderr is not None else None,
+                    detail_json=detail or {},
+                    log_path=log_path or str(env_operation_log_path(env)),
+                )
+            )
+            db.commit()
+    except Exception:
+        return
 
 
 def env_operation_log_path(env: EnvInfo) -> Path:
@@ -865,7 +1147,7 @@ def env_model_to_info(env: Env, db=None) -> EnvInfo:
         state=env.state,
         python_version=env.python_version,
         size_bytes=env.size_bytes,
-        created_at=env.created_at.isoformat() if env.created_at else utc_now(),
+        created_at=ensure_local_datetime(env.created_at).isoformat() if env.created_at else utc_now(),
     )
 
 
@@ -952,5 +1234,5 @@ def empty_env_test_result(env: EnvInfo, error: str, python_executable: str | Non
 def mark_env_permissions(user: UserRecord, env: EnvInfo) -> EnvInfo:
     """返回带当前用户修改权限标记的副本，避免把权限状态写回全局环境元数据。"""
     data = env.model_dump()
-    data["can_modify"] = user.role == Role.ADMIN or env.owner_user_id == user.id
+    data["can_modify"] = user.role == Role.ADMIN or (env.source_type != "system_imported" and env.owner_user_id == user.id)
     return EnvInfo(**data)

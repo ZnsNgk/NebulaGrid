@@ -4,6 +4,38 @@ import subprocess
 import sys
 
 
+CORE_PACKAGE_NAMES = {
+    "python",
+    "pip",
+    "setuptools",
+    "wheel",
+    "conda",
+    "conda-package-handling",
+    "conda-package-streaming",
+    "openssl",
+    "sqlite",
+    "tk",
+    "xz",
+    "zlib",
+    "libffi",
+    "ncurses",
+    "readline",
+    "ca-certificates",
+    "certifi",
+}
+
+
+def package_source(item):
+    """根据 conda list 的 channel/manager 字段判断包来源，用于页面区分卸载命令。"""
+    channel = str(item.get("channel") or item.get("manager") or "").lower()
+    return "pip" if channel == "pypi" or channel == "pip" else "conda"
+
+
+def is_core_package(name):
+    """标记不应由页面删除的环境基础包，后端服务会再做一次强校验。"""
+    return str(name or "").lower().replace("_", "-") in CORE_PACKAGE_NAMES
+
+
 def framework_missing(error=None):
     """返回统一的框架缺失结构，避免主服务为导入失败再做特殊解析。"""
     return {"installed": False, "error": error}
@@ -62,7 +94,12 @@ def list_packages():
             timeout=20,
         )
         return [
-            {"name": item.get("name", ""), "version": item.get("version", "")}
+            {
+                "name": item.get("name", ""),
+                "version": item.get("version", ""),
+                "source": package_source(item),
+                "protected": is_core_package(item.get("name", "")),
+            }
             for item in json.loads(conda_list.stdout)
             if item.get("name")
         ]
@@ -73,7 +110,12 @@ def list_packages():
     except Exception:
         return []
     return [
-        {"name": item.metadata.get("Name", item.name), "version": item.version}
+        {
+            "name": item.metadata.get("Name", item.name),
+            "version": item.version,
+            "source": "pip",
+            "protected": is_core_package(item.metadata.get("Name", item.name)),
+        }
         for item in importlib_metadata.distributions()
     ]
 

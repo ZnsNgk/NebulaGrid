@@ -510,7 +510,7 @@ erDiagram
 | package_path | varchar | 上传包路径 |
 | package_sha256 | varchar | 文件哈希 |
 | package_type | enum | wheel/archive/source_dir |
-| install_mode | enum | pip_install/direct_copy/compile_install |
+| install_mode | enum | conda_offline/pip_install/compile_install/package_delete |
 | target_node_id | fk nodes.id nullable | 编译安装节点 |
 | visible_gpu_indices | jsonb | 编译安装可见 GPU |
 | state | enum | pending/running/succeeded/failed/cancelled |
@@ -524,7 +524,28 @@ erDiagram
 | started_at | timestamp | 开始时间 |
 | ended_at | timestamp | 结束时间 |
 
-#### 6.2.10 audit_logs
+#### 6.2.10 env_operation_logs
+
+环境操作日志表与 `env_install_logs` 下的单环境 JSON Lines 日志同源。文件日志用于运维直接排查和离线留存，数据库日志用于后台检索、审计聚合和后续页面分页。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | bigint / uuid | 主键 |
+| env_id | fk environments.id | 目标环境 |
+| env_name | varchar | 记录时的环境名 |
+| action | varchar | import/fix/test/package_install/package_delete/delete 等 |
+| message | text | 操作摘要 |
+| actor_user_id | fk users.id nullable | 操作者 |
+| status | enum | info/success/failed |
+| command | text nullable | 实际执行命令 |
+| return_code | int nullable | 命令返回码 |
+| stdout | text nullable | 标准输出摘要 |
+| stderr | text nullable | 标准错误摘要 |
+| detail_json | jsonb | 结构化详情 |
+| log_path | varchar | 对应落盘日志文件 |
+| created_at | timestamp | 时间 |
+
+#### 6.2.11 audit_logs
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -662,7 +683,11 @@ API Router
 | POST | /api/envs/import-conda-pack | 上传 conda-pack 环境 |
 | GET | /api/envs/{env_id} | 环境详情 |
 | DELETE | /api/envs/{env_id} | 删除环境 |
-| POST | /api/envs/{env_id}/packages/install | 上传并安装 whl 或压缩包 |
+| POST | /api/envs/{env_id}/test | 检测 Python/PyTorch/TensorFlow/包列表 |
+| GET | /api/envs/{env_id}/log | 查看环境操作日志 |
+| POST | /api/envs/{env_id}/packages/install | 本机离线安装 conda `.tar.bz2`、pip whl、requirements 批量包或源码目录 |
+| POST | /api/envs/{env_id}/packages/delete-preview | 生成删除已安装包的确认提示 |
+| POST | /api/envs/{env_id}/packages/delete | 删除已安装 conda/pip 包 |
 | POST | /api/envs/{env_id}/packages/compile-install | 指定节点/GPU 编译安装 |
 | GET | /api/envs/{env_id}/install-jobs | 安装作业列表 |
 | GET | /api/env-install-jobs/{job_id}/log | 安装日志 |
@@ -1045,7 +1070,7 @@ sequenceDiagram
 3. 检查路径安全：禁止绝对路径、`..`、软链接逃逸、超大文件；
 4. 判断包结构：
    - 若存在 `pyproject.toml/setup.py/setup.cfg`，执行 `pip install --no-index <unpacked_path>`；
-   - 若为纯 Python 包目录，复制到目标环境 `site-packages`；
+   - 若为用户选择的源码目录，进入目录后执行 `pip install .` 或 `python setup.py install`；
 5. 写入安装清单 `env_package_manifests`；
 6. 执行 `pip check` 与可选 import test；
 7. 更新安装作业状态。
@@ -1614,7 +1639,9 @@ while True:
 - 环境副本由 API 后台线程完成，状态为 `copying -> fixing -> testing -> available/error`，副本归创建用户所有。
 - 修复阶段统一处理路径、权限和文件属主。路径修复扫描所有文本文件，覆盖 `pip` shebang、`.pth`、包配置和 conda metadata。
 - 检测阶段通过 `conda activate <env_name>` 后运行 `remote/env_probe.py`，采集 Python、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
-- 每个环境对应一个 JSON Lines 日志文件，位于 `NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`。
+- 环境包安装支持 conda `.tar.bz2` 离线安装、pip 单 whl、pip requirements 批量安装、源码目录 `pip install .` / `python setup.py install`；页面显示“就绪/安装中”，安装中提示不要关闭页面。
+- 环境包删除先区分包来源 `conda/pip` 并生成确认提示；`python`、`pip`、`setuptools`、`conda` 等环境默认包不可删除。
+- 每个环境对应一个 JSON Lines 日志文件，位于 `NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`；同一条环境操作也写入 PostgreSQL `env_operation_logs` 表，命令输出保留换行并可在页面结构化解析展示。
 - 管理员可查看、修改、删除全部环境；普通用户只可修改、删除和查看自己的环境日志。
 
 这部分能力目前由 API 服务内的后台线程承担，适合 MVP 联调和单主节点部署。后续如果环境导入和复制耗时很长，可将同一状态机迁移到独立 Env Worker 或任务队列，但数据库状态、日志文件和权限模型应保持不变。

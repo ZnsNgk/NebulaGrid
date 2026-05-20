@@ -6,7 +6,7 @@ import subprocess
 import tarfile
 import threading
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
@@ -16,6 +16,7 @@ from app.core.config import get_settings
 from app.core.errors import not_found, validation_error
 from app.core.path_resolver import normalize_virtual_path, resolve_user_visible_path
 from app.core.rbac import require_permission
+from app.core.time_utils import ensure_local_datetime, local_datetime
 from app.db.models import FileJob as FileJobModel
 from app.db.session import SessionLocal
 from app.schemas.files import FileEntry, FileJobData, FileListData, FilePreviewData
@@ -650,15 +651,13 @@ def file_job_to_data(job: FileJobModel) -> FileJobData:
 
 
 def utc_datetime() -> datetime:
-    """返回带时区的 UTC 时间，统一文件任务数据库时间字段。"""
-    return datetime.now(timezone.utc)
+    """返回系统本地时区时间，统一文件任务数据库时间字段。"""
+    return local_datetime()
 
 
 def datetime_to_iso(value: datetime) -> str:
     """把数据库时间转换为前端稳定消费的 ISO 字符串。"""
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
+    return ensure_local_datetime(value).isoformat()
 
 
 def record_file_audit(user: UserRecord, action: str, path: str, target_path: str | None = None) -> None:
@@ -677,7 +676,7 @@ def build_file_entry(path: Path, parent_virtual_path: str) -> FileEntry:
     stat = path.stat()
     virtual_parent = parent_virtual_path.rstrip("/")
     virtual_path = f"{virtual_parent}/{path.name}" if virtual_parent else f"/{path.name}"
-    modified = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
+    modified = datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat()
     return FileEntry(
         name=path.name,
         path=virtual_path,

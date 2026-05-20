@@ -3,12 +3,13 @@ from fastapi.responses import PlainTextResponse
 
 from app.api.deps import get_current_user
 from app.core.responses import api_success
-from app.schemas.envs import EnvArchiveImportRequest, EnvCloneRequest, EnvPackageInstallRequest, EnvPackageUploadRequest, EnvUploadRequest
+from app.schemas.envs import EnvArchiveImportRequest, EnvCloneRequest, EnvInstalledPackageDeleteRequest, EnvLocalPackageInstallRequest, EnvPackageInstallRequest, EnvPackageUploadRequest, EnvUploadRequest
 from app.services.auth_service import UserRecord
 from app.services.env_service import (
     cancel_install_job,
     clone_env,
     delete_env,
+    delete_installed_packages,
     delete_package,
     get_env_operation_log,
     get_install_job,
@@ -16,7 +17,9 @@ from app.services.env_service import (
     import_env_archive,
     import_detected_envs,
     install_package,
+    install_local_package,
     list_envs,
+    preview_delete_installed_packages,
     test_env,
     upload_env_pack,
     upload_package,
@@ -106,6 +109,42 @@ def post_package_upload(
     """登记 whl 或源码包上传元数据。"""
     package = upload_package(current_user, env_id, payload)
     return api_success(data=package.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/{env_id}/packages/install")
+def post_local_package_install(
+    env_id: int,
+    payload: EnvLocalPackageInstallRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """在主节点目标环境中执行离线安装。"""
+    result = install_local_package(current_user, env_id, payload)
+    return api_success(data=result.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/{env_id}/packages/delete-preview")
+def post_installed_package_delete_preview(
+    env_id: int,
+    payload: EnvInstalledPackageDeleteRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """返回已安装包删除确认内容，前端需让用户确认后再执行删除。"""
+    preview = preview_delete_installed_packages(current_user, env_id, payload)
+    return api_success(data=preview.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/{env_id}/packages/delete")
+def post_installed_package_delete(
+    env_id: int,
+    payload: EnvInstalledPackageDeleteRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """删除目标环境内已安装的 conda/pip 包。"""
+    result = delete_installed_packages(current_user, env_id, payload)
+    return api_success(data=result.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
 @router.post("/{env_id}/packages/{package_id}/install")

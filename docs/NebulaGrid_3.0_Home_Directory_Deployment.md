@@ -233,7 +233,7 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 环境管理功能依赖 `/home/ddltm/envs/miniconda3/envs` 和 `/home/ddltm/data/logs/env_install_logs` 在主节点和计算节点路径一致。导入环境、创建环境副本、修复路径、检测环境和删除环境都会围绕这两个目录工作：
 
 - 环境目录：`/home/ddltm/envs/miniconda3/envs/<env_name>`
-- 环境日志：`/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`
+- 环境日志：`/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，并同步写入数据库 `env_operation_logs`
 
 用户导入 zip 环境包或创建副本后，系统会把环境复制到 `miniconda3/envs` 下，修复所有文本文件中的旧环境前缀，并整理权限。目录应为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。
 
@@ -243,4 +243,4 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2>/dev/null | head
 ```
 
-管理员可以查看全部环境日志；普通用户只能查看自己导入或复制的环境日志。
+管理员可以查看全部环境日志；普通用户只能查看自己导入或复制的环境日志。日志文件采用 JSON Lines 格式，页面查看时会自动解析 JSON 字段和 `\n` 换行。

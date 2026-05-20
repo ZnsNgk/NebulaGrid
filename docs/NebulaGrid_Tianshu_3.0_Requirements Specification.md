@@ -354,7 +354,7 @@ nebulagrid/
 
 除完整环境导入外，3.0 还应支持“环境内包安装”能力。用户可在环境详情页上传 .whl 文件或压缩的 Python 包（.zip/.tar/.tar.gz/.tgz），选择目标环境后由系统自动安装或导入。该功能用于解决主控节点不联网、用户无法直接 SSH 维护环境时的增量更新问题。
 
-环境包安装规则如下：若上传文件为 .whl，则系统在目标环境中执行 pip install <wheel_path>；若上传文件为压缩 Python 包，则系统先解压到受控临时目录，进行路径安全检查，再根据包结构选择安装方式。若包含 pyproject.toml、setup.py 或 setup.cfg，优先执行 pip install --no-index <unpacked_path>；若只是纯 Python 包目录，则导入到目标环境 site-packages，并生成安装清单，便于后续卸载和审计。
+环境包安装规则如下：若选择 conda `.tar.bz2` 包，则系统在目标环境中执行 `conda install --offline`；若选择 `.whl`，则执行 `pip install --no-index <wheel_path>`；若选择批量 whl，则执行 `pip install --no-index --find-links=<folder> -r requirements.txt`；若选择源码目录，则进入目录后执行 `pip install .` 或 `python setup.py install`。系统不自动解析或下载依赖，用户需自行准备依赖包。安装期间前端显示“安装中”并提示不要关闭页面。
 
 对于需要本地编译或 CUDA 编译的包，用户可选择“编译安装”模式，并指定编译节点及可见 GPU。编译安装属于环境维护作业，不进入普通任务等待队列，不由任务调度器分配资源，也不计入任务资源占用；但系统必须记录编译作业、执行节点、可见 GPU、远端 PID、日志和审计事件，管理员可查看或中止。
 
@@ -369,7 +369,7 @@ nebulagrid/
 | ENV-005      | 管理员可查看和删除所有环境；导师可查看学生环境，是否可删除由配置决定。                                                              | P1         |
 | ENV-006      | 支持环境包版本记录，避免同名环境被覆盖后历史任务无法复现。                                                                          | P1         |
 | ENV-007      | 用户可在环境详情页上传 .whl、.zip、.tar、.tar.gz、.tgz 等 Python 包文件，并选择安装到指定环境。                                     | P0         |
-| ENV-008      | 系统识别 .whl 后执行 pip install；识别压缩 Python 包后先安全解压，再按 pyproject/setup.py 或纯包目录规则安装/导入到 site-packages。 | P0         |
+| ENV-008      | 系统支持 conda `.tar.bz2` 离线安装、pip whl 单包安装、requirements 批量安装和源码目录安装；不再提供直接复制到 site-packages 的安装方式。 | P0         |
 | ENV-009      | 支持环境包编译安装作业：用户可指定节点和可见 GPU，作业不进入任务调度队列、不占用任务调度资源，但必须记录日志、PID、返回码和审计。   | P1         |
 | ENV-010      | 环境包安装完成后应执行 python -c import 校验、pip freeze 差异记录和可选 CUDA 可见性测试。                                           | P1         |
 | ENV-011      | 环境包安装必须防止路径穿越、软链接逃逸、覆盖系统文件和跨用户环境写入；压缩包中的危险路径应直接拒绝。                                | P0         |
@@ -477,7 +477,8 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | settings              | key, value, updated_by, updated_at                                                                                                                | 系统配置。                                                      |
 | env_packages          | id, env_id, owner_user_id, filename, package_type, file_path, size_bytes, sha256, status, created_at                                              | 用户上传的 wheel 或压缩 Python 包元数据。                       |
 | env_install_jobs      | id, package_id, env_id, mode, target_node_id, visible_gpu_indices, status, remote_pid, log_path, return_code, created_by, started_at, finished_at | 环境包安装/编译作业。该表独立于 tasks，不进入普通调度队列。     |
-| env_package_manifests | id, job_id, env_id, path, action, file_hash, created_at                                                                                           | 记录安装或导入到 site-packages 的文件清单，便于审计和可选卸载。 |
+| env_package_manifests | id, job_id, env_id, path, action, file_hash, created_at                                                                                           | 记录安装作业产生的文件清单，便于审计和可选卸载。 |
+| env_operation_logs    | id, env_id, env_name, action, message, actor_user_id, status, command, return_code, stdout, stderr, detail_json, log_path, created_at             | 记录环境导入、复制、修复、检测、包安装、包删除和环境删除等结构化操作日志。 |
 | task_runtime_guards   | id, task_id, node_id, root_pid, process_group_id, allocated_gpu_ids, observed_gpu_uuids, violation_count, last_check_at, state                    | 运行中任务守护检测记录，用于 PID/GPU 使用一致性校验。           |
 
 ## 7.2 任务状态枚举
@@ -749,7 +750,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 3. 若文件为 .whl，系统读取 wheel 文件名标签并与目标环境 Python 版本、平台架构进行基本兼容性检查；检查通过后执行 <env_python> -m pip install <wheel_path>。主控节点不联网时默认增加 --no-index，依赖包需由用户一并上传或提前存在于环境中。
 
-4. 若文件为压缩 Python 包，系统解压到隔离临时目录，拒绝绝对路径、..、软链接逃逸和超大文件；若包含 pyproject.toml/setup.py/setup.cfg，则执行 <env_python> -m pip install --no-index <unpacked_path>；若为纯 Python 包目录，则复制到目标环境 site-packages，并写入 manifest。
+4. 若用户选择源码目录，系统进入目标目录执行 `<env_python> -m pip install .` 或 `python setup.py install`；若选择批量 whl，则必须同时选择包目录和 requirements.txt。系统不直接复制文件夹到 site-packages。
 
 5. 安装完成后执行 pip check、pip freeze、可选 import_test，并将安装前后差异写入 env_install_jobs。失败时保留临时日志，不删除用户上传包，方便用户重新选择安装模式。
 
@@ -771,7 +772,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 | 任务事件            | task_events 表                       | 任务可见者                       | 随任务永久保留。                               |
 | 系统日志            | server_log_path 或 logging 服务      | 管理员                           | 按大小/日期轮转。                              |
 | 审计日志            | audit_logs 表                        | 管理员；用户可查看自己的登录记录 | 建议长期保留，不随任务删除。                   |
-| 环境操作日志        | /home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log | 环境所有者/管理员                | 记录导入、复制、修复、检测、包操作和删除；随环境保留或归档。 |
+| 环境操作日志        | /home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log；同步写入 env_operation_logs 表 | 环境所有者/管理员                | 记录导入、复制、修复、检测、包操作和删除；文件用于运维排查，数据库用于检索和审计。 |
 | 环境包安装/编译日志 | /home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log | 环境所有者/导师可见范围/管理员   | 当前复用单环境日志；后续可扩展 job 级日志索引。 |
 
 # 11. 安全、审计与运维需求
@@ -899,7 +900,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 | 文件路径越权       | 用户 A 登录               | 请求用户 B 文件路径                  | 返回 403 或 404，不泄露真实路径。                                        |
 | 环境包导入         | 上传 Linux conda-pack     | 导入并测试                           | 状态变为 available，测试结果可见。                                       |
 | 上传 wheel 安装    | 存在可用环境              | 上传 .whl 并安装到指定环境           | 系统执行 pip install，记录安装日志和 pip freeze 差异，环境仍可通过校验。 |
-| 压缩 Python 包导入 | 存在可用环境              | 上传 .tar.gz/.zip 包并安装           | 系统安全解压并按包结构安装或导入 site-packages，生成 manifest。          |
+| 离线 Python 包安装 | 存在可用环境              | 选择 whl、批量包目录或源码目录并安装 | 系统按用户选择执行离线 pip 安装；不自动处理依赖，不直接写入 site-packages。 |
 | 编译安装作业       | 存在可 SSH 节点和目标环境 | 选择节点/GPU 后执行编译安装          | 作业进入 env_install_jobs，不进入任务队列，日志可查看，完成后状态正确。  |
 
 ## 14.2 异常测试
@@ -955,7 +956,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 | NFS 共享目录不一致或主账户 UID/GID 不一致 | 任务在节点上找不到项目路径、日志路径或环境，或写入文件属主异常。 | master 与所有计算节点必须用一致路径挂载 `/home/ddltm/data` 和 `/home/ddltm/envs`，并在上线前检查主账户 UID/GID、文件属主和读写权限。 |
 | 导师权限过大                 | 可能误操作学生任务或文件。                           | 默认导师只读学生任务与文件，写权限显式配置。                                     |
 | 节点异常恢复语义不清         | 任务重复运行或资源不释放。                           | 使用任务事件和节点状态机，危险操作二次确认。                                     |
-| 环境包直接写入 site-packages | 可能污染环境、覆盖已有包或导致难以卸载。             | 优先 pip install；纯 Python 目录导入时必须生成 manifest，并提供安装前后差异。    |
+| 环境包直接写入 site-packages | 可能污染环境、覆盖已有包或导致难以卸载。             | 当前版本不提供直接复制到 site-packages 的入口，统一走 conda/pip 安装命令。    |
 | 编译安装绕过调度             | 可能与训练任务争抢节点资源。                         | 作为环境维护作业单独记录，前端提示风险，管理员可限制繁忙节点或仅允许管理员执行。 |
 
 ## 15.2 后续路线图
@@ -1130,6 +1131,7 @@ offline --> [*]
 - 删除目标必须是 `NEBULAGRID_CONDA_ENV_ROOT` 的一级子目录，禁止删除 `base`、根目录、软链接或异常路径。
 - 每个环境一个落盘日志文件：`NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`。
 - 日志记录导入、复制、修复、检测、安装包、删除包和删除环境等操作。
+- 环境日志以 JSON Lines 落盘，并同步写入 env_operation_logs 表；页面查看时自动解析 JSON 和换行符。
 - 管理员可以查看所有环境日志，普通用户只能查看自己的环境日志。
 
 # 结语：开发时最重要的三条底线

@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import String, cast, func, or_, select
 
 from app.core.rbac import require_permission
+from app.core.time_utils import ensure_local_datetime, local_datetime, local_now, parse_datetime_local
 from app.db.models import AuditLog, Setting, User
 from app.db.session import SessionLocal
 from app.schemas.admin import AuditLogInfo, SettingInfo
@@ -19,8 +20,8 @@ AUDIT_CATEGORIES = {"all", "system", "user", "archive", "file", "task", "env", "
 
 
 def utc_now() -> str:
-    """返回 UTC ISO 时间字符串，统一审计和设置更新时间格式。"""
-    return datetime.now(timezone.utc).isoformat()
+    """返回系统本地时区 ISO 时间字符串；保留旧函数名以兼容现有调用点。"""
+    return local_now()
 
 
 def record_audit(
@@ -102,18 +103,7 @@ def list_audit_logs(
 
 def parse_audit_time(value: str | None) -> datetime | None:
     """解析前端时间范围；无效时间直接忽略，避免一次错误输入阻断审计页面。"""
-    if not value:
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parse_datetime_local(value)
 
 
 def audit_category_conditions(category: str):
@@ -170,9 +160,7 @@ def audit_category(action: str, target_type: str) -> str:
 
 def audit_log_to_info(entry: AuditLog) -> AuditLogInfo:
     """将数据库审计行转换成 API 响应，统一时间格式和分类字段。"""
-    created_at = entry.created_at or datetime.now(timezone.utc)
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
+    created_at = ensure_local_datetime(entry.created_at) or local_datetime()
     return AuditLogInfo(
         id=entry.id,
         actor_user_id=entry.actor_user_id,
@@ -181,7 +169,7 @@ def audit_log_to_info(entry: AuditLog) -> AuditLogInfo:
         target_id=entry.target_id,
         ip=entry.ip,
         result=entry.result,
-        created_at=created_at.astimezone(timezone.utc).isoformat(),
+        created_at=created_at.isoformat(),
         detail_json=entry.detail_json or {},
         category=audit_category(entry.action, entry.target_type),
     )
@@ -200,7 +188,7 @@ def update_settings(user: UserRecord, values: dict[str, str]) -> list[SettingInf
     """把系统配置更新到数据库，并记录最后修改人和审计日志。"""
     require_permission(user.role, "admin:settings:write")
     cleaned_values = {key.strip(): value for key, value in values.items() if key and key.strip()}
-    now = datetime.now(timezone.utc)
+    now = local_datetime()
     with SessionLocal() as db:
         ensure_default_settings(db)
         for key, value in cleaned_values.items():
@@ -233,11 +221,10 @@ def ensure_default_settings(db) -> None:
 def setting_to_info(row: Setting) -> SettingInfo:
     """把设置表记录转换为 API 响应，隐藏数据库对象并统一时间格式。"""
     updated_at = row.updated_at
-    if updated_at is not None and updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    updated_at = ensure_local_datetime(updated_at)
     return SettingInfo(
         key=row.key,
         value=row.value,
         updated_by=row.updated_by,
-        updated_at=updated_at.astimezone(timezone.utc).isoformat() if updated_at else None,
+        updated_at=updated_at.isoformat() if updated_at else None,
     )

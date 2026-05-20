@@ -1090,7 +1090,7 @@ sudo systemctl reload nginx
 3. 对一个已有环境点击“检测”，确认返回 Python 版本、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
 4. 用普通用户从自己的文件根目录选择打包好的环境 zip，点击导入并确认。页面应显示 `导入中 -> 修复中 -> 测试中 -> 可用`。
 5. 导入后的环境目录应位于 `/home/ddltm/envs/miniconda3/envs/<env_name>`，目录权限为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。
-6. 检查 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，确认导入、修复、检测记录已经落盘。
+6. 检查 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，确认导入、修复、检测记录已经落盘；同时可在 PostgreSQL `env_operation_logs` 表中看到对应结构化记录。
 7. 点击“创建副本”，输入新环境名，确认系统复制 `/home/ddltm/envs/miniconda3/envs/<old_env_name>` 到 `/home/ddltm/envs/miniconda3/envs/<new_env_name>`，并显示 `复制中 -> 修复中 -> 测试中 -> 可用`。
 8. 在副本里运行 `pip --version` 或 `python -m pip --version`，确认 `pip` shebang 不再指向旧路径。路径修复应覆盖所有文本文件里的旧环境前缀，而不只是 conda metadata。
 9. 普通用户只能删除自己导入或复制的环境；管理员可以删除所有环境。删除后数据库记录和 `miniconda3/envs/<env_name>` 目录应同时消失。
@@ -1117,7 +1117,7 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 - PostgreSQL 中能看到 NebulaGrid 数据表。
 - PostgreSQL 中能看到 `file_jobs` 表；打包/解压后 `/api/files/jobs/latest` 能返回最近任务状态。
 - PostgreSQL 中能看到 `envs` 表；环境导入、复制、检测和删除后状态与真实目录一致。
-- `/home/ddltm/data/logs/env_install_logs/` 中能看到单环境日志文件。
+- `/home/ddltm/data/logs/env_install_logs/` 中能看到单环境 JSON Lines 日志文件，数据库 `env_operation_logs` 中能看到同源结构化日志。
 - InfluxDB 中能查询到 `node_metrics` / `gpu_metrics` 监控点。
 - systemd 中 API 和 worker 服务为 running。
 

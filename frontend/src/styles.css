@@ -1301,6 +1301,263 @@ td {
   min-width: 420px;
 }
 
+.env-package-panel {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.92fr) minmax(260px, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.env-package-form,
+.env-package-list,
+.env-install-section {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(7, 16, 33, 0.58);
+}
+
+.env-package-form,
+.env-package-list {
+  padding: 12px;
+}
+
+.env-package-form {
+  display: grid;
+  gap: 12px;
+}
+
+.env-install-warning {
+  border: 1px solid rgba(251, 191, 36, 0.34);
+  border-radius: 8px;
+  background: rgba(120, 53, 15, 0.22);
+  color: #fde68a;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.env-install-state {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(5, 9, 20, 0.32);
+  padding: 10px 12px;
+}
+
+.env-install-state.installing {
+  border-color: rgba(251, 191, 36, 0.34);
+  background: rgba(120, 53, 15, 0.18);
+}
+
+.env-install-state strong {
+  color: #e8f0ff;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.env-install-methods {
+  display: grid;
+  gap: 8px;
+}
+
+.env-install-methods.compact {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.env-install-methods label,
+.checkline {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #e8f0ff;
+}
+
+.env-install-methods input,
+.checkline input {
+  width: auto;
+  min-height: 0;
+}
+
+.env-install-section {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.env-install-section h3,
+.env-package-list h3,
+.env-install-result h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.env-install-section p {
+  margin: 0;
+}
+
+.env-install-subsection {
+  display: grid;
+  gap: 10px;
+}
+
+.path-pick-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.path-pick {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.path-pick code {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(5, 9, 20, 0.34);
+  word-break: break-all;
+}
+
+.env-package-list {
+  max-height: calc(100vh - 132px);
+  overflow: auto;
+}
+
+.env-package-list .table-wrap table {
+  min-width: 360px;
+}
+
+.env-install-result {
+  display: grid;
+  gap: 12px;
+}
+
+.env-package-delete-panel {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 12px;
+  min-height: calc(100vh - 92px);
+}
+
+.env-package-delete-list {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.env-package-delete-list .table-wrap {
+  border: 0;
+  border-radius: 0;
+}
+
+.env-package-delete-list .table-wrap table {
+  min-width: 520px;
+}
+
+.env-package-delete-panel input[type="checkbox"] {
+  width: auto;
+  min-height: 0;
+}
+
+.package-delete-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.98);
+  box-shadow: 0 -10px 24px rgba(2, 8, 23, 0.28);
+}
+
+.package-source {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.package-source.conda {
+  color: #a7f3d0;
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(110, 231, 183, 0.28);
+}
+
+.package-source.pip {
+  color: #bfdbfe;
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(147, 197, 253, 0.28);
+}
+
+.env-log-viewer {
+  display: grid;
+  gap: 10px;
+}
+
+.env-log-entry {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(7, 16, 33, 0.58);
+  padding: 12px;
+}
+
+.env-log-entry-head {
+  display: grid;
+  gap: 4px;
+}
+
+.env-log-entry-head strong {
+  color: #f8fbff;
+}
+
+.env-log-entry-head span,
+.env-log-detail span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.env-log-details {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.env-log-detail {
+  display: grid;
+  gap: 4px;
+}
+
+.env-log-detail pre {
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #050914;
+  color: #d7f6e5;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .env-kv {
   grid-template-columns: 82px minmax(0, 1fr);
 }
@@ -1531,6 +1788,7 @@ td {
   .admin-stats,
   .admin-grid,
   .metrics,
+  .env-package-panel,
   .framework-grid,
   .form-grid,
   .task-form,
@@ -1555,6 +1813,10 @@ td {
 
   .file-actions-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .env-package-list {
+    max-height: none;
   }
 
   .wide,

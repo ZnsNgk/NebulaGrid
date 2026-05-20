@@ -1,15 +1,16 @@
-from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from fastapi.responses import JSONResponse
+
+from app.core.time_utils import local_datetime
 
 
 def build_request_id(request_id: str | None = None) -> str:
     """生成或复用请求 ID，方便串联前端、Nginx 和后端日志。"""
     if request_id:
         return request_id
-    now = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    now = local_datetime().strftime("%Y%m%d%H%M%S")
     return f"{now}-{uuid4().hex[:8]}"
 
 
@@ -46,4 +47,3 @@ def api_error(
             "request_id": build_request_id(request_id),
         },
     )
-

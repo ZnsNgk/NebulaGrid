@@ -260,6 +260,26 @@ class EnvPackageManifest(Base, TimestampMixin):
     file_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
+class EnvOperationLog(Base, TimestampMixin):
+    """环境操作日志表，与落盘 JSON Lines 日志保持同源记录，便于后续检索和审计。"""
+
+    __tablename__ = "env_operation_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    env_id: Mapped[int] = mapped_column(ForeignKey("envs.id", ondelete="CASCADE"), index=True)
+    env_name: Mapped[str] = mapped_column(String(128), default="")
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    message: Mapped[str] = mapped_column(Text, default="")
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="info", index=True)
+    command: Mapped[str | None] = mapped_column(Text, nullable=True)
+    return_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stdout: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stderr: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detail_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    log_path: Mapped[str] = mapped_column(String(1024), default="")
+
+
 class FileJob(Base):
     """文件打包和解压任务表，用于跨刷新、重启和多 worker 共享进度状态。"""
 

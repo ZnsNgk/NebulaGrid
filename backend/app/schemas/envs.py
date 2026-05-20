@@ -35,6 +35,8 @@ class EnvPackageVersion(BaseModel):
 
     name: str
     version: str
+    source: str = "conda"
+    protected: bool = False
 
 
 class EnvTestResult(BaseModel):
@@ -107,6 +109,62 @@ class EnvPackageInstallRequest(BaseModel):
     mode: str = Field(default="normal", pattern="^(normal|compile)$")
     target_node_id: int | None = None
     visible_gpu_indices: list[int] = []
+
+
+class EnvLocalPackageInstallRequest(BaseModel):
+    """本机环境包安装请求；路径均为用户可见虚拟路径，后端负责安全解析。"""
+
+    method: str = Field(pattern="^(conda|pip)$")
+    pip_mode: str | None = Field(default=None, pattern="^(wheel|folder)$")
+    package_path: str | None = Field(default=None, max_length=1024)
+    folder_path: str | None = Field(default=None, max_length=1024)
+    requirements_path: str | None = Field(default=None, max_length=1024)
+    batch: bool = False
+    folder_command: str = Field(default="pip", pattern="^(pip|setup_py)$")
+
+
+class EnvLocalPackageInstallResult(BaseModel):
+    """本机环境包安装结果，返回命令输出摘要并指向单环境日志。"""
+
+    ok: bool
+    env_id: int
+    env_name: str
+    method: str
+    command: str
+    return_code: int
+    stdout: str = ""
+    stderr: str = ""
+    log_path: str
+
+
+class EnvInstalledPackageDeleteRequest(BaseModel):
+    """环境内已安装包删除请求；后端会再次检测来源并拒绝删除核心包。"""
+
+    package_names: list[str] = Field(min_length=1, max_length=100)
+
+
+class EnvInstalledPackageDeletePreview(BaseModel):
+    """删除已安装包前的确认内容，前端用 prompt 弹窗展示给用户确认。"""
+
+    env_id: int
+    env_name: str
+    packages: list[EnvPackageVersion]
+    commands: list[str]
+    prompt: str
+
+
+class EnvInstalledPackageDeleteResult(BaseModel):
+    """删除已安装包的执行结果，返回命令输出摘要并指向单环境日志。"""
+
+    ok: bool
+    env_id: int
+    env_name: str
+    packages: list[EnvPackageVersion]
+    commands: list[str]
+    return_code: int
+    stdout: str = ""
+    stderr: str = ""
+    log_path: str
 
 
 class EnvInstallJobInfo(BaseModel):
