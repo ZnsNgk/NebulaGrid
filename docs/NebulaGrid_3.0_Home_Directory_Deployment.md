@@ -227,3 +227,20 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 文件管理中的目录打包和压缩包解压任务会写入 PostgreSQL 的 `file_jobs` 表，而不是保存在 API 进程内存中。页面刷新、重新登录、API 重启或多 worker 部署后，前端仍可通过 `/api/files/jobs/latest` 读取当前用户最近一次任务状态。API 启动时会把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
 
 当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。同一用户同时只能运行一个文件打包/解压任务，系统也会限制全局并发，避免共享盘 IO 被大量压缩任务打满。
+
+## 10. 环境目录与日志
+
+环境管理功能依赖 `/home/ddltm/envs/miniconda3/envs` 和 `/home/ddltm/data/logs/env_install_logs` 在主节点和计算节点路径一致。导入环境、创建环境副本、修复路径、检测环境和删除环境都会围绕这两个目录工作：
+
+- 环境目录：`/home/ddltm/envs/miniconda3/envs/<env_name>`
+- 环境日志：`/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`
+
+用户导入 zip 环境包或创建副本后，系统会把环境复制到 `miniconda3/envs` 下，修复所有文本文件中的旧环境前缀，并整理权限。目录应为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。
+
+如果出现 `bad interpreter`、`错误的解释器` 或 `pip` 指向旧路径，优先检查环境日志和环境目录中的残留旧路径：
+
+```bash
+grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2>/dev/null | head
+```
+
+管理员可以查看全部环境日志；普通用户只能查看自己导入或复制的环境日志。

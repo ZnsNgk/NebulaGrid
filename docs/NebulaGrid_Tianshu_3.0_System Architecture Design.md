@@ -1179,7 +1179,7 @@ MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在
 |---|---|---|
 | 服务日志 | /var/log/nebulagrid/ | API、scheduler、monitor 等服务自身日志 |
 | 任务日志 | /home/ddltm/data/logs/task_logs/<task_no>.log | 用户训练 stdout/stderr，master 与计算节点通过 NFS 共享 |
-| 环境安装日志 | /home/ddltm/data/logs/env_install_logs/<job_no>.log | whl/源码包/编译安装日志 |
+| 环境操作日志 | /home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log | 环境导入、复制、修复、检测、包安装和删除日志 |
 | 审计日志 | PostgreSQL audit_logs | 谁在何时做了什么 |
 | 任务事件 | PostgreSQL task_events | 任务状态机事件 |
 | 节点/GPU 历史指标 | InfluxDB node_metrics/gpu_metrics | CPU/GPU 使用率、内存/显存、上传/下载、GPU 调用进程数 |
@@ -1600,8 +1600,24 @@ while True:
 | master 重启 | running 任务状态丢失 | 数据库持久化、pid_file、恢复扫描 |
 | 多调度器重复派发 | 资源冲突 | MVP 单调度器；未来使用 DB 锁或 leader election |
 | 环境安装污染 | 任务环境不可用 | 环境锁、pip freeze diff、安装日志、失败状态 |
+| 环境复制后残留旧路径 | `pip`、脚本或包配置继续指向原始解释器，导致 bad interpreter | 副本创建后扫描所有文本文件，提取旧环境前缀并替换为新环境根路径；检测阶段必须执行 `conda activate` 后的真实探针 |
+| 环境删除误删共享目录 | 破坏 miniconda 或其他用户环境 | 仅允许删除 `NEBULAGRID_CONDA_ENV_ROOT` 下一级子目录，拒绝 base、根目录、软链接和异常路径 |
 
 ---
+
+## 23.1 环境管理实现同步（2026-05-20）
+
+当前环境管理已从占位接口推进到可联调的后台流程：
+
+- 环境列表以 `conda env list --json` 为准，同步到 PostgreSQL `envs` 表，`base` 环境不展示。
+- 环境导入由 API 后台线程完成，状态为 `importing -> fixing -> testing -> available/error`。
+- 环境副本由 API 后台线程完成，状态为 `copying -> fixing -> testing -> available/error`，副本归创建用户所有。
+- 修复阶段统一处理路径、权限和文件属主。路径修复扫描所有文本文件，覆盖 `pip` shebang、`.pth`、包配置和 conda metadata。
+- 检测阶段通过 `conda activate <env_name>` 后运行 `remote/env_probe.py`，采集 Python、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
+- 每个环境对应一个 JSON Lines 日志文件，位于 `NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`。
+- 管理员可查看、修改、删除全部环境；普通用户只可修改、删除和查看自己的环境日志。
+
+这部分能力目前由 API 服务内的后台线程承担，适合 MVP 联调和单主节点部署。后续如果环境导入和复制耗时很长，可将同一状态机迁移到独立 Env Worker 或任务队列，但数据库状态、日志文件和权限模型应保持不变。
 
 ## 24. 结论
 

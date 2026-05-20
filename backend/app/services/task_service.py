@@ -43,7 +43,9 @@ def create_task(user: UserRecord, payload: TaskCreateRequest) -> TaskInfo:
         raise forbidden("disabled user cannot submit tasks")
     resolve_user_visible_path(payload.workdir, user.username, user.role.value)
     if payload.env_id is not None:
-        get_env_for_user(user, payload.env_id)
+        env = get_env_for_user(user, payload.env_id)
+        if env.state not in {"available", "registered"}:
+            raise validation_error("environment is not available")
     numeric_id = next(_TASK_ID)
     task = TaskInfo(
         id=numeric_id,
@@ -87,7 +89,9 @@ def update_task(user: UserRecord, task_id: str, payload: TaskUpdateRequest) -> T
             owner.role.value if owner else user.role.value,
         )
     if "env_id" in data and data["env_id"] is not None:
-        get_env_for_user(user, data["env_id"])
+        env = get_env_for_user(user, data["env_id"])
+        if env.state not in {"available", "registered"}:
+            raise validation_error("environment is not available")
     for key, value in data.items():
         if key == "requirement" and payload.requirement is not None:
             task.requirement = payload.requirement

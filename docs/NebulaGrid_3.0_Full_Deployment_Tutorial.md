@@ -1081,7 +1081,30 @@ sudo systemctl reload nginx
 
 不要给 `ddltm` 配置宽泛的 `NOPASSWD: ALL`，这样会扩大系统风险。
 
-## 22. 最小验收清单
+## 22. 环境管理验收补充
+
+部署完成后，环境管理建议按以下顺序验收：
+
+1. 登录管理员账号，进入环境管理页面，确认页面会自动刷新环境列表，且 `base` 环境不展示。
+2. 点击“刷新环境列表”，确认 `conda env list --json` 中的非 base 环境被同步到数据库。
+3. 对一个已有环境点击“检测”，确认返回 Python 版本、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
+4. 用普通用户从自己的文件根目录选择打包好的环境 zip，点击导入并确认。页面应显示 `导入中 -> 修复中 -> 测试中 -> 可用`。
+5. 导入后的环境目录应位于 `/home/ddltm/envs/miniconda3/envs/<env_name>`，目录权限为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。
+6. 检查 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，确认导入、修复、检测记录已经落盘。
+7. 点击“创建副本”，输入新环境名，确认系统复制 `/home/ddltm/envs/miniconda3/envs/<old_env_name>` 到 `/home/ddltm/envs/miniconda3/envs/<new_env_name>`，并显示 `复制中 -> 修复中 -> 测试中 -> 可用`。
+8. 在副本里运行 `pip --version` 或 `python -m pip --version`，确认 `pip` shebang 不再指向旧路径。路径修复应覆盖所有文本文件里的旧环境前缀，而不只是 conda metadata。
+9. 普通用户只能删除自己导入或复制的环境；管理员可以删除所有环境。删除后数据库记录和 `miniconda3/envs/<env_name>` 目录应同时消失。
+10. 普通用户只能查看自己的环境日志；管理员可以查看所有环境日志。
+
+如果出现 `bad interpreter` 或 “错误的解释器”，优先检查环境日志中的修复阶段记录，并在环境目录中搜索旧路径：
+
+```bash
+grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2>/dev/null | head
+```
+
+如果仍有旧路径残留，说明该文件被识别为二进制或超过修复大小上限，需要单独确认文件类型，避免误改二进制包。
+
+## 23. 最小验收清单
 
 部署完成后，至少确认以下项目：
 
@@ -1093,16 +1116,18 @@ sudo systemctl reload nginx
 - 计算节点可以看到 `/home/ddltm/envs/nebulagrid_remote/monitor.py`。
 - PostgreSQL 中能看到 NebulaGrid 数据表。
 - PostgreSQL 中能看到 `file_jobs` 表；打包/解压后 `/api/files/jobs/latest` 能返回最近任务状态。
+- PostgreSQL 中能看到 `envs` 表；环境导入、复制、检测和删除后状态与真实目录一致。
+- `/home/ddltm/data/logs/env_install_logs/` 中能看到单环境日志文件。
 - InfluxDB 中能查询到 `node_metrics` / `gpu_metrics` 监控点。
 - systemd 中 API 和 worker 服务为 running。
 
-## 23. 当前版本边界
+## 24. 当前版本边界
 
 当前代码适合部署后开始真实机器联调。以下能力还需要继续开发完善：
 
-- 任务、用户、环境等 API 服务从内存仓库完全切换到数据库 CRUD。
+- 任务服务从内存仓库完全切换到数据库 CRUD。
 - 调度器执行真实 GPU 选择和 allocation 事务。
 - 执行器通过 SSH 调用远端 runner 启动任务。
 - runtime guard 检查实际 PID/GPU 使用并处理 `alloc_error`。
-- env install worker 执行真实包安装、日志回收和状态更新。
+- env install worker 执行真实包安装、manifest 和状态更新；环境导入、复制、检测、删除和单环境日志已经接入 API。
 - Alembic 数据库迁移；当前初始化使用 ORM `create_all`，适合 MVP 部署和测试。

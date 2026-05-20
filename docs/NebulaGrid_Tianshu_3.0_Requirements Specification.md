@@ -771,8 +771,8 @@ def resolve_virtual_path(user, virtual_path, mode):
 | 任务事件            | task_events 表                       | 任务可见者                       | 随任务永久保留。                               |
 | 系统日志            | server_log_path 或 logging 服务      | 管理员                           | 按大小/日期轮转。                              |
 | 审计日志            | audit_logs 表                        | 管理员；用户可查看自己的登录记录 | 建议长期保留，不随任务删除。                   |
-| 环境导入日志        | /home/ddltm/data/logs/env_logs/<env_id>.log  | 环境所有者/管理员                | 随环境保留或归档。                             |
-| 环境包安装/编译日志 | /home/ddltm/data/logs/env_install_logs/<job_id>.log | 环境所有者/导师可见范围/管理员   | 随 env_install_jobs 保留；管理员可按时间归档。 |
+| 环境操作日志        | /home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log | 环境所有者/管理员                | 记录导入、复制、修复、检测、包操作和删除；随环境保留或归档。 |
+| 环境包安装/编译日志 | /home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log | 环境所有者/导师可见范围/管理员   | 当前复用单环境日志；后续可扩展 job 级日志索引。 |
 
 # 11. 安全、审计与运维需求
 
@@ -1087,6 +1087,50 @@ offline --> [*]
 | 前驱任务           | 当前任务开始前必须完成的依赖任务。                       |
 | 审计日志           | 记录用户对系统资源执行的关键操作，用于追溯和排障。       |
 | PathResolver       | 后端统一路径解析组件，负责虚拟路径到真实路径的安全转换。 |
+
+# 附录 D. 环境管理实现同步（2026-05-20）
+
+本节记录当前代码已经落地的环境管理行为，用于同步需求文档和实现状态。
+
+## D.1 环境列表与落库
+
+- 环境管理页面进入时会触发后端扫描，后端优先执行 `conda env list --json`。
+- `base` 环境不展示。
+- 发现的非 base 环境写入 `envs` 表，已有同名同路径记录保持原来源和归属。
+- 环境状态包括 `available`、`registered`、`copying`、`importing`、`fixing`、`testing`、`error`。
+
+## D.2 环境导入
+
+- 用户从自己的文件根目录选择 zip 环境包。
+- 后端先解压到 `NEBULAGRID_RUNTIME_ROOT/env_import/<uuid>/extract`，拒绝绝对路径、`..` 路径逃逸和软链接成员。
+- 解压后识别真正的环境根目录，再复制到 `NEBULAGRID_CONDA_ENV_ROOT/<env_name>`。
+- 导入状态流转为 `importing -> fixing -> testing -> available/error`。
+- 修复阶段会处理路径、归属和权限；测试阶段通过 `conda activate <env_name>` 后运行 `remote/env_probe.py`。
+
+## D.3 环境副本
+
+- 任意具备 `envs:write` 权限的用户可以基于一个可用环境创建自己的副本。
+- 后端检查新环境名是否为单级目录名，并确认 `NEBULAGRID_CONDA_ENV_ROOT/<new_env_name>` 和数据库记录均不存在。
+- 后端复制 `NEBULAGRID_CONDA_ENV_ROOT/<old_env_name>` 到 `NEBULAGRID_CONDA_ENV_ROOT/<new_env_name>`。
+- 副本状态流转为 `copying -> fixing -> testing -> available/error`。
+- 副本 `owner_user_id` 为创建用户，`source_type=user_clone`。
+
+## D.4 路径修复
+
+- 路径修复不只处理 conda metadata，而是扫描环境内所有文本文件。
+- 系统会从 shebang、`pip` 脚本、`.pth`、包配置、metadata、conda history 等文本里提取包含环境名的旧前缀。
+- 典型旧路径如 `/home/zrh/下载/yes/envs/openclip/bin/python` 会归一化为 `/home/zrh/下载/yes/envs/openclip`，再替换为新环境根路径。
+- 含空字节或明显二进制的文件会跳过，避免误改 `.so`、`.pyd` 等二进制包。
+- 替换按旧路径长度从长到短执行，避免短路径先替换导致长路径漏修。
+
+## D.5 权限、删除和日志
+
+- 普通用户只能修改、删除自己的环境；管理员可以修改和删除所有环境。
+- 删除环境会同时删除 `envs` 表记录和 `NEBULAGRID_CONDA_ENV_ROOT/<env_name>` 目录。
+- 删除目标必须是 `NEBULAGRID_CONDA_ENV_ROOT` 的一级子目录，禁止删除 `base`、根目录、软链接或异常路径。
+- 每个环境一个落盘日志文件：`NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`。
+- 日志记录导入、复制、修复、检测、安装包、删除包和删除环境等操作。
+- 管理员可以查看所有环境日志，普通用户只能查看自己的环境日志。
 
 # 结语：开发时最重要的三条底线
 

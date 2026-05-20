@@ -465,7 +465,31 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 
 当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。系统限制同一用户同时只能运行一个文件打包/解压任务，并设置全局并发上限，避免共享盘 IO 被大量压缩任务打满。
 
-## 18. 当前实现边界
+## 18. 环境管理当前实现
+
+环境管理页面会在进入页面和点击“刷新环境列表”时执行 `conda env list --json`，并把 `NEBULAGRID_CONDA_ENV_ROOT` 下除 `base` 外的环境同步到 `envs` 表。当前环境元数据已经落库，页面刷新和 API 重启不会丢失环境记录。
+
+当前已经支持：
+
+- 环境列表：展示来源、状态、路径、Python 版本、所有人和操作按钮。
+- 环境检测：后端通过 `source <miniconda>/bin/activate && conda activate <env_name>` 激活环境，再运行 `remote/env_probe.py`，返回 Python、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
+- 环境导入：用户从自己的文件根目录选择 zip 包，后端解压到临时目录，复制到 `miniconda3/envs/<env_name>`，修复路径和权限，测试通过后设为可用。
+- 环境副本：用户可基于任意可用环境创建自己的副本，后端复制 `miniconda3/envs/<old_env_name>` 到 `miniconda3/envs/<new_env_name>`，并执行路径修复、权限修复和检测。
+- 环境删除：普通用户只能删除自己的环境，管理员可以删除所有环境；删除会同时清理数据库记录和 `miniconda3/envs/<env_name>` 目录。
+- 环境日志：每个环境一个日志文件，位于 `NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`。管理员可查看全部日志，普通用户只能查看自己的日志。
+
+路径修复不是只处理 conda 元数据。当前实现会扫描环境内所有文本文件，提取旧环境前缀并替换为新路径，覆盖 `pip` shebang、`.pth`、包配置、metadata、conda 记录等常见残留；含空字节或明显二进制的文件会跳过，避免误改 `.so`、`.pyd` 等二进制包。
+
+导入或复制后的权限规则：
+
+- 目录：`755`
+- 普通文件：`644`
+- `bin/` 和 `Scripts/` 下入口文件：`755`
+- 如果 API 以 root 运行，环境属主会调整为 `NEBULAGRID_MAIN_LINUX_USER`；如果 API 以普通用户运行，则只执行 chmod，不强行 chown。
+
+环境管理相关日志和真实环境目录都在 NFS 共享路径中，因此主节点和计算节点必须看到完全一致的 `/home/ddltm/envs/miniconda3/envs` 路径。否则环境检测可能通过，但计算节点执行任务时仍会找不到解释器或包路径。
+
+## 19. 当前实现边界
 
 当前后端已经具备：
 
@@ -479,12 +503,12 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 
 仍需在真实机器上继续完善：
 
-- API service 从内存仓库切换为数据库 CRUD。
+- 任务服务从内存仓库切换为数据库 CRUD。
 - scheduler 的事务化 GPU 选择和 allocation 写入。
 - executor 的 SSH 调用、远端 runner 启动、停止和返回码回收。
 - monitor 的 SSH 指标采集写入 InfluxDB，PostgreSQL 不再保存 node/gpu metrics 表。
 - runtime guard 的 PID/GPU 越权检测和 alloc_error 状态流转。
-- env worker 的上传文件落盘、sha256 校验、normal/compile 安装执行。
+- env worker 的上传文件落盘、sha256 校验、normal/compile 安装执行仍需继续打通；环境导入、复制、检测、日志和删除已经由 API 服务实现。
 - Alembic 迁移脚本；当前 `create_all` 适合 MVP 初始化，不适合长期生产演进。
 
 建议真实机器测试顺序：

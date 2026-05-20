@@ -22,6 +22,8 @@ const state = {
   sessionRefreshBusy: false,
   fileJobRefreshTimer: null,
   fileJobRefreshBusy: false,
+  envRefreshTimer: null,
+  envRefreshBusy: false,
   authWatchTimer: null,
   authWatchBusy: false,
   lastDashboardRefreshAt: null,
@@ -363,6 +365,7 @@ async function refreshPage() {
     },
     envs: async () => {
       state.data.envs = (await api("/envs")).data;
+      updateEnvRefreshTimer();
     },
     manual: async () => {
       state.data.manual = (await api("/manual/current")).data;
@@ -417,6 +420,7 @@ function updateRealtimeTimers() {
   updateAutoRefreshTimer();
   updateSessionRefreshTimer();
   updateFileJobTimer();
+  updateEnvRefreshTimer();
   updateAuthWatchTimer();
 }
 
@@ -479,6 +483,33 @@ function updateFileJobTimer() {
   }
   if (!state.user || state.page !== "files" || !fileJobIsActive(state.data.fileJob)) return;
   state.fileJobRefreshTimer = window.setInterval(refreshFileJobLive, FILE_JOB_REFRESH_MS);
+}
+
+function updateEnvRefreshTimer() {
+  if (state.envRefreshTimer) {
+    window.clearInterval(state.envRefreshTimer);
+    state.envRefreshTimer = null;
+  }
+  if (!state.user || state.page !== "envs" || !hasActiveEnvImport()) return;
+  state.envRefreshTimer = window.setInterval(refreshEnvsLive, 2000);
+}
+
+function hasActiveEnvImport() {
+  return (state.data.envs || []).some((env) => ["copying", "importing", "fixing", "testing"].includes(env.state));
+}
+
+async function refreshEnvsLive() {
+  if (!state.user || state.page !== "envs" || state.envRefreshBusy) return;
+  state.envRefreshBusy = true;
+  try {
+    state.data.envs = (await api("/envs")).data;
+    render();
+  } catch (error) {
+    if (!isAuthExpiredMessage(error.message)) console.warn("env refresh failed", error);
+  } finally {
+    state.envRefreshBusy = false;
+    updateEnvRefreshTimer();
+  }
 }
 
 async function refreshFileJobLive() {
@@ -596,29 +627,64 @@ async function showTaskLog(taskId) {
   state.drawer = { title: `任务日志 ${taskId}`, body: `<pre class="drawer-log">${escapeHtml(log)}</pre>` };
 }
 
-async function submitEnv(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  await api("/envs/register", {
-    method: "POST",
-    body: JSON.stringify({
-      name: formValue(form, "name"),
-      description: formValue(form, "description"),
-      python_version: formValue(form, "python_version") || null,
-    }),
-  });
-  form.reset();
-  await refreshPage();
+async function importEnvs() {
+  state.fileTargetPicker = {
+    mode: "env-import",
+    sourcePath: "",
+    currentPath: "/",
+    items: [],
+  };
+  await loadFileTargetPickerPath("/");
+  render();
 }
 
 async function testEnv(envId) {
   const payload = await api(`/envs/${envId}/test`, { method: "POST" });
-  state.drawer = { title: `环境检测 #${envId}`, body: `<pre class="drawer-log">${escapeHtml(JSON.stringify(payload.data, null, 2))}</pre>` };
+  state.drawer = { title: `环境检测 #${envId}`, body: renderEnvTestResult(payload.data) };
+}
+
+async function showEnvLog(envId) {
+  const env = (state.data.envs || []).find((item) => String(item.id) === String(envId));
+  const log = await api(`/envs/${envId}/log`);
+  state.drawer = { title: `环境日志 ${env?.name || `#${envId}`}`, body: `<pre class="drawer-log">${escapeHtml(log)}</pre>` };
+}
+
+async function cloneEnv(envId) {
+  const env = (state.data.envs || []).find((item) => String(item.id) === String(envId));
+  const sourceName = env?.name || `#${envId}`;
+  const suggested = env?.name ? `${env.name}_copy` : "";
+  const name = window.prompt(`请输入 ${sourceName} 的新环境名`, suggested);
+  if (name === null) return;
+  const cleaned = name.trim();
+  if (!cleaned) {
+    showToast("请输入新环境名", "error");
+    return;
+  }
+  await api(`/envs/${envId}/clone`, { method: "POST", body: JSON.stringify({ name: cleaned }) });
+  showToast("已开始创建环境副本", "success");
+  await refreshPage();
 }
 
 async function deleteEnv(envId) {
   await api(`/envs/${envId}`, { method: "DELETE" });
   await refreshPage();
+}
+
+function confirmDeleteEnv(envId) {
+  const env = (state.data.envs || []).find((item) => String(item.id) === String(envId));
+  const name = env?.name || `#${envId}`;
+  const path = env?.path || "";
+  return window.confirm(`确认删除环境 ${name}？\n\n该操作会同时删除 miniconda/envs 下的对应环境文件夹。\n${path}`);
+}
+
+function showEnvPackageDrawer(envId, mode) {
+  const env = (state.data.envs || []).find((item) => String(item.id) === String(envId));
+  const action = mode === "install" ? "安装包" : "删除包";
+  state.drawer = {
+    title: `${action} · ${env?.name || `#${envId}`}`,
+    body: `<div class="empty">${action}流程将在环境安装作业接入后启用。</div>`,
+  };
+  render();
 }
 
 async function openPath(path) {
@@ -716,7 +782,11 @@ async function loadFileTargetPickerPath(path) {
   if (!state.fileTargetPicker) return;
   const payload = await api(`/files/list?path=${encodeURIComponent(path || "/")}`);
   state.fileTargetPicker.currentPath = payload.data.path || "/";
-  state.fileTargetPicker.items = (payload.data.items || []).filter((item) => item.type === "directory");
+  const items = payload.data.items || [];
+  state.fileTargetPicker.items = state.fileTargetPicker.mode === "env-import"
+    ? items.filter((item) => item.type === "directory" || (item.type === "file" && item.path.toLowerCase().endsWith(".zip")))
+    : items.filter((item) => item.type === "directory");
+  if (state.fileTargetPicker.mode === "env-import") state.fileTargetPicker.sourcePath = "";
 }
 
 async function navigateFileTargetPicker(path) {
@@ -732,6 +802,17 @@ function closeFileTargetPicker() {
 async function confirmFileTargetPicker() {
   const picker = state.fileTargetPicker;
   if (!picker) return;
+  if (picker.mode === "env-import") {
+    if (!picker.sourcePath) throw new Error("请选择环境 zip 包");
+    if (!confirm(`确认导入环境包 ${picker.sourcePath}？`)) return;
+    const selectedPath = picker.sourcePath;
+    state.fileTargetPicker = null;
+    render();
+    await api("/envs/import-archive", { method: "POST", body: JSON.stringify({ path: selectedPath }) });
+    showToast("已开始导入环境", "success");
+    await refreshPage();
+    return;
+  }
   if (picker.mode === "extract") {
     const payload = await api("/files/extract", { method: "POST", body: JSON.stringify({ path: picker.sourcePath, target_path: picker.currentPath }) });
     state.data.fileJob = payload.data;
@@ -871,6 +952,7 @@ function isSameOrChildPath(path, parent) {
 }
 
 function fileTargetActionText(mode) {
+  if (mode === "env-import") return "导入环境";
   if (mode === "extract") return "解压到";
   return mode === "move" ? "移动到" : "复制到";
 }
@@ -1298,7 +1380,10 @@ function renderNodeCard(node) {
 
 function renderTasks() {
   const tasks = state.data.tasks.items || [];
-  const envOptions = state.data.envs.map((env) => `<option value="${env.id}">${escapeHtml(env.name)}</option>`).join("");
+  const envOptions = state.data.envs
+    .filter(isEnvUsable)
+    .map((env) => `<option value="${env.id}">${escapeHtml(env.name)}</option>`)
+    .join("");
   const zones = [
     ["wait", "等待区", "已提交但尚未执行的任务"],
     ["running", "运行区", "正在执行或准备执行的任务"],
@@ -1448,22 +1533,23 @@ function renderFileJobProgressOnly() {
 
 function renderFileTargetPicker() {
   const picker = state.fileTargetPicker;
-  const folders = picker.items || [];
+  const items = picker.items || [];
   const action = fileTargetActionText(picker.mode);
-  const targetPath = buildPickedTargetPath(picker.sourcePath, picker.currentPath, picker.mode);
-  const invalidTarget = !targetPath;
+  const isEnvImport = picker.mode === "env-import";
+  const targetPath = isEnvImport ? picker.sourcePath : buildPickedTargetPath(picker.sourcePath, picker.currentPath, picker.mode);
+  const invalidTarget = isEnvImport ? !picker.sourcePath : !targetPath;
   return `
     <div class="modal-backdrop">
       <section class="file-picker-modal" role="dialog" aria-modal="true" aria-labelledby="filePickerTitle">
         <div class="file-picker-head">
           <div>
             <h2 id="filePickerTitle">${action}</h2>
-            <span>${escapeHtml(baseName(picker.sourcePath))}</span>
+            <span>${escapeHtml(isEnvImport ? "请选择用户根目录下的环境 zip 包" : baseName(picker.sourcePath))}</span>
           </div>
           <button class="secondary" data-file-picker-close>关闭</button>
         </div>
         <div class="file-picker-current">
-          <span>目标目录</span>
+          <span>${isEnvImport ? "当前目录" : "目标目录"}</span>
           <strong>${escapeHtml(picker.currentPath)}</strong>
         </div>
         <div class="file-picker-nav">
@@ -1471,20 +1557,25 @@ function renderFileTargetPicker() {
           <button class="secondary" data-file-picker-up>上级</button>
         </div>
         <div class="file-picker-list">
-          ${folders.length ? folders.map((item) => `
+          ${items.length ? items.map((item) => item.type === "directory" ? `
             <button class="file-picker-row" data-file-picker-open="${escapeAttr(item.path)}">
               <span class="file-glyph">DIR</span>
               <span>${escapeHtml(item.name)}</span>
             </button>
-          `).join("") : `<div class="file-empty">当前目录下没有子文件夹</div>`}
+          ` : `
+            <button class="file-picker-row ${picker.sourcePath === item.path ? "active" : ""}" data-file-picker-select="${escapeAttr(item.path)}">
+              <span class="file-glyph">ZIP</span>
+              <span>${escapeHtml(item.name)}</span>
+            </button>
+          `).join("") : `<div class="file-empty">${isEnvImport ? "当前目录下没有 zip 包或子文件夹" : "当前目录下没有子文件夹"}</div>`}
         </div>
         <div class="file-picker-target">
-          <span>将生成</span>
-          <code>${escapeHtml(targetPath || "不能选择当前目标目录")}</code>
+          <span>${isEnvImport ? "已选择" : "将生成"}</span>
+          <code>${escapeHtml(targetPath || (isEnvImport ? "请选择 zip 包" : "不能选择当前目标目录"))}</code>
         </div>
         <div class="file-picker-actions">
           <button class="secondary" data-file-picker-close>取消</button>
-          <button data-file-picker-confirm ${invalidTarget ? "disabled" : ""}>选择此文件夹</button>
+          <button data-file-picker-confirm ${invalidTarget ? "disabled" : ""}>${isEnvImport ? "导入此环境" : "选择此文件夹"}</button>
         </div>
       </section>
     </div>
@@ -1495,25 +1586,119 @@ function renderEnvs() {
   const envs = state.data.envs || [];
   return shell(`
     <section class="panel">
-      <div class="panel-head"><div><h2>登记环境</h2><span>当前表单登记已有 conda 环境，后续环境包安装会接入同一页面。</span></div></div>
-      <form method="post" id="envForm" class="form-grid">
-        <label>环境名称<input name="name" placeholder="torch-cu121" required></label>
-        <label>Python 版本<input name="python_version" placeholder="3.11"></label>
-        <label class="full-row">说明<input name="description" placeholder="PyTorch CUDA 12.1"></label>
-        <div class="form-actions"><button type="submit">登记环境</button></div>
-      </form>
-    </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>环境列表</h2><span>可对环境执行连通性检测。</span></div></div>
-      ${envs.length ? renderTable(["名称", "状态", "路径", "版本", "操作"], envs.map((env) => [
-        `<strong>${escapeHtml(env.name)}</strong><br><span class="muted">${escapeHtml(env.description || "")}</span>`,
+      <div class="panel-head">
+        <div><h2>环境管理</h2><span>刷新读取数据库中的环境；导入会扫描 conda envs 目录并写入数据库，base 环境不显示。</span></div>
+        <div class="top-actions">
+          <button class="secondary" data-action="refresh">刷新环境列表</button>
+          <button data-import-envs ${can("envs:write") ? "" : "disabled"}>导入环境</button>
+        </div>
+      </div>
+      ${envs.length ? renderTable(["名称", "来源", "状态", "路径", "版本", "操作"], envs.map((env) => [
+        renderEnvName(env),
+        escapeHtml(envSourceText(env.source_type)),
         `<span class="status ${env.state}">${stateText(env.state)}</span>`,
         `<code>${escapeHtml(env.path)}</code>`,
         escapeHtml(env.python_version || "-"),
-        `<button class="small secondary" data-test-env="${env.id}">检测</button>${env.can_modify ? `<button class="small danger" data-delete-env="${env.id}">删除</button>` : ""}`,
+        renderEnvActions(env),
       ])) : renderEmpty("暂无环境")}
     </section>
   `);
+}
+
+function renderEnvActions(env) {
+  const usable = isEnvUsable(env);
+  const testAttrs = usable ? "" : "disabled title=\"环境尚不可用\"";
+  const logAttrs = canViewEnvLog(env) ? "" : "disabled title=\"无日志查看权限\"";
+  const cloneAttrs = can("envs:write") && usable ? "" : "disabled title=\"环境尚不可用或无创建权限\"";
+  const modifyAttrs = can("envs:write") && env.can_modify && usable ? "" : "disabled title=\"无修改权限或环境尚不可用\"";
+  const deleteAttrs = canDeleteEnv(env) && !isEnvBusy(env) ? "" : "disabled title=\"无删除权限或环境正在处理\"";
+  return `
+    <button class="small secondary" data-test-env="${env.id}" ${testAttrs}>检测</button>
+    <button class="small secondary" data-env-log="${env.id}" ${logAttrs}>查看日志</button>
+    <button class="small secondary" data-clone-env="${env.id}" ${cloneAttrs}>创建副本</button>
+    <button class="small secondary" data-install-package-env="${env.id}" ${modifyAttrs}>安装包</button>
+    <button class="small secondary" data-delete-package-env="${env.id}" ${modifyAttrs}>删除包</button>
+    <button class="small danger" data-delete-env="${env.id}" ${deleteAttrs}>删除环境</button>
+  `;
+}
+
+function renderEnvName(env) {
+  const ownerLine = env.owner_name ? `<br><span class="muted">所有人：${escapeHtml(env.owner_name)}</span>` : "";
+  const descriptionLine = env.description ? `<br><span class="muted">${escapeHtml(env.description)}</span>` : "";
+  return `<strong>${escapeHtml(env.name)}</strong>${ownerLine}${descriptionLine}`;
+}
+
+function canDeleteEnv(env) {
+  return state.user?.role === "admin" || Boolean(env.can_modify);
+}
+
+function canViewEnvLog(env) {
+  return state.user?.role === "admin" || String(env?.owner_user_id) === String(state.user?.id);
+}
+
+function isEnvUsable(env) {
+  return ["available", "registered"].includes(env?.state);
+}
+
+function isEnvBusy(env) {
+  return ["copying", "importing", "fixing", "testing"].includes(env?.state);
+}
+
+function envSourceText(value) {
+  const map = {
+    system_imported: "系统导入",
+    user_imported: "用户导入",
+    user_clone: "环境副本",
+    conda_pack: "conda-pack",
+    registered: "登记",
+  };
+  return map[value] || value || "-";
+}
+
+function renderEnvTestResult(result = {}) {
+  const packages = result.packages || [];
+  const topPackages = packages.slice(0, 300);
+  return `
+    <div class="env-test">
+      ${result.ok ? "" : `<div class="env-test-error">${escapeHtml(result.error || "检测失败")}</div>`}
+      <dl class="kv env-kv">
+        <dt>环境</dt><dd><strong>${escapeHtml(result.env_name || "-")}</strong></dd>
+        <dt>路径</dt><dd><code>${escapeHtml(result.env_path || "-")}</code></dd>
+        <dt>Python</dt><dd>${escapeHtml(result.python_version || "-")}</dd>
+        <dt>解释器</dt><dd><code>${escapeHtml(result.python_executable || "-")}</code></dd>
+      </dl>
+      <div class="framework-grid">
+        ${renderFrameworkCard("PyTorch", result.pytorch)}
+        ${renderFrameworkCard("TensorFlow", result.tensorflow)}
+      </div>
+      <div class="panel-head compact">
+        <div><h3>包列表</h3><span>共 ${escapeHtml(result.package_count ?? packages.length)} 个包${packages.length > topPackages.length ? "，当前仅展示前 300 个" : ""}</span></div>
+      </div>
+      ${topPackages.length ? renderTable(["包名", "版本"], topPackages.map((item) => [
+        escapeHtml(item.name || "-"),
+        escapeHtml(item.version || "-"),
+      ])) : renderEmpty("暂无包信息")}
+    </div>
+  `;
+}
+
+function renderFrameworkCard(name, info = {}) {
+  const installed = Boolean(info?.installed);
+  return `
+    <article class="framework-card ${installed ? "installed" : "missing"}">
+      <div class="framework-head">
+        <h3>${escapeHtml(name)}</h3>
+        <span class="status ${installed ? "available" : "disabled"}">${installed ? "已安装" : "未安装"}</span>
+      </div>
+      <dl class="kv">
+        <dt>版本</dt><dd>${escapeHtml(info?.version || "-")}</dd>
+        <dt>CUDA</dt><dd>${escapeHtml(info?.cuda || "-")}</dd>
+        <dt>cuDNN</dt><dd>${escapeHtml(info?.cudnn ?? "-")}</dd>
+        <dt>GPU</dt><dd>${info?.cuda_available === null || info?.cuda_available === undefined ? "-" : (info.cuda_available ? `可用，${escapeHtml(info.gpu_count ?? 0)} 张` : "不可用")}</dd>
+      </dl>
+      ${info?.error ? `<p class="framework-error">${escapeHtml(info.error)}</p>` : ""}
+    </article>
+  `;
 }
 
 function renderManual() {
@@ -2183,9 +2368,15 @@ function stateText(value) {
     dispatching: "派发中",
     available: "可用",
     registered: "已登记",
+    copying: "复制中",
+    importing: "导入中",
+    fixing: "修复中",
+    testing: "测试中",
+    error: "错误",
     enabled: "启用",
     disabled: "停用",
     pending: "等待中",
+    detected: "自动发现",
   };
   return map[value] || value || "-";
 }
@@ -2262,7 +2453,6 @@ function bindEvents() {
   document.querySelector("#loginForm")?.addEventListener("submit", (event) => run(() => login(event), "登录成功"));
   document.querySelector("#nodeForm")?.addEventListener("submit", (event) => run(() => submitNode(event), "节点已登记"));
   document.querySelector("#taskForm")?.addEventListener("submit", (event) => run(() => submitTask(event), "任务已提交"));
-  document.querySelector("#envForm")?.addEventListener("submit", (event) => run(() => submitEnv(event), "环境已登记"));
   document.querySelector("#profileForm")?.addEventListener("submit", (event) => run(() => submitProfile(event), "资料已保存"));
   document.querySelector("#passwordForm")?.addEventListener("submit", (event) => run(() => changePassword(event), "密码已更新"));
   document.querySelector("#userForm")?.addEventListener("submit", (event) => run(() => submitUser(event), "账号已创建"));
@@ -2310,11 +2500,20 @@ function bindEvents() {
   document.querySelector("[data-file-picker-root]")?.addEventListener("click", () => run(() => navigateFileTargetPicker("/")));
   document.querySelector("[data-file-picker-up]")?.addEventListener("click", () => run(() => navigateFileTargetPicker(parentPath(state.fileTargetPicker?.currentPath || "/"))));
   document.querySelector("[data-file-picker-confirm]")?.addEventListener("click", () => {
-    const successText = state.fileTargetPicker?.mode === "move" ? "已移动" : (state.fileTargetPicker?.mode === "extract" ? "已开始解压" : "已复制");
+    const successText = state.fileTargetPicker?.mode === "env-import"
+      ? ""
+      : (state.fileTargetPicker?.mode === "move" ? "已移动" : (state.fileTargetPicker?.mode === "extract" ? "已开始解压" : "已复制"));
     run(confirmFileTargetPicker, successText);
   });
   document.querySelectorAll("[data-file-picker-open]").forEach((button) => {
     button.addEventListener("click", () => run(() => navigateFileTargetPicker(button.dataset.filePickerOpen)));
+  });
+  document.querySelectorAll("[data-file-picker-select]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (!state.fileTargetPicker) return;
+      state.fileTargetPicker.sourcePath = button.dataset.filePickerSelect;
+      render();
+    });
   });
   document.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.nav)));
   document.querySelector("[data-action='logout']")?.addEventListener("click", () => run(logout));
@@ -2341,7 +2540,15 @@ function bindEvents() {
   }));
   document.querySelectorAll("[data-preview]").forEach((button) => button.addEventListener("click", () => run(() => previewFile(button.dataset.preview))));
   document.querySelectorAll("[data-test-env]").forEach((button) => button.addEventListener("click", () => run(() => testEnv(button.dataset.testEnv))));
-  document.querySelectorAll("[data-delete-env]").forEach((button) => button.addEventListener("click", () => run(() => deleteEnv(button.dataset.deleteEnv), "环境已删除")));
+  document.querySelectorAll("[data-env-log]").forEach((button) => button.addEventListener("click", () => run(() => showEnvLog(button.dataset.envLog))));
+  document.querySelectorAll("[data-clone-env]").forEach((button) => button.addEventListener("click", () => run(() => cloneEnv(button.dataset.cloneEnv))));
+  document.querySelector("[data-import-envs]")?.addEventListener("click", () => run(importEnvs));
+  document.querySelectorAll("[data-install-package-env]").forEach((button) => button.addEventListener("click", () => showEnvPackageDrawer(button.dataset.installPackageEnv, "install")));
+  document.querySelectorAll("[data-delete-package-env]").forEach((button) => button.addEventListener("click", () => showEnvPackageDrawer(button.dataset.deletePackageEnv, "delete")));
+  document.querySelectorAll("[data-delete-env]").forEach((button) => button.addEventListener("click", () => {
+    if (!confirmDeleteEnv(button.dataset.deleteEnv)) return;
+    run(() => deleteEnv(button.dataset.deleteEnv), "环境已删除");
+  }));
   document.querySelectorAll("[data-edit-user]").forEach((button) => button.addEventListener("click", () => fillUserEditForm(button.dataset.editUser)));
   document.querySelectorAll("[data-reset-user]").forEach((button) => button.addEventListener("click", () => fillPasswordResetForm(button.dataset.resetUser)));
   document.querySelectorAll("[data-delete-user]").forEach((button) => button.addEventListener("click", () => run(() => deleteUser(button.dataset.deleteUser), "账号已删除")));

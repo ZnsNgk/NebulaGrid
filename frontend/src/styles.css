@@ -742,7 +742,8 @@ nav {
 .status.offline_error,
 .status.node_lost,
 .status.manual_offline,
-.status.disabled {
+.status.disabled,
+.status.error {
   background: rgba(239, 68, 68, 0.12);
   color: var(--red);
   border-color: rgba(252, 165, 165, 0.28);
@@ -753,7 +754,11 @@ nav {
 .status.preparing,
 .status.dispatching,
 .status.reconnecting,
-.status.registered {
+.status.registered,
+.status.copying,
+.status.importing,
+.status.fixing,
+.status.testing {
   background: rgba(245, 158, 11, 0.12);
   color: var(--yellow);
   border-color: rgba(251, 191, 36, 0.28);
@@ -1230,7 +1235,8 @@ nav {
   text-align: left;
 }
 
-.file-picker-row:hover {
+.file-picker-row:hover,
+.file-picker-row.active {
   background: rgba(34, 211, 238, 0.1);
   border-color: rgba(34, 211, 238, 0.32);
 }
@@ -1284,6 +1290,73 @@ td {
 
 .kv dd {
   margin: 0;
+}
+
+.env-test {
+  display: grid;
+  gap: 14px;
+}
+
+.env-test .table-wrap table {
+  min-width: 420px;
+}
+
+.env-kv {
+  grid-template-columns: 82px minmax(0, 1fr);
+}
+
+.env-kv code,
+.framework-card code {
+  word-break: break-all;
+}
+
+.env-test-error,
+.framework-error {
+  border: 1px solid rgba(252, 165, 165, 0.34);
+  border-radius: 8px;
+  background: rgba(127, 29, 29, 0.24);
+  color: #fecaca;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.framework-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.framework-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(7, 16, 33, 0.58);
+  padding: 12px;
+}
+
+.framework-card.installed {
+  border-color: rgba(134, 239, 172, 0.22);
+}
+
+.framework-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.framework-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.framework-card .kv {
+  grid-template-columns: 62px minmax(0, 1fr);
+}
+
+.framework-error {
+  margin: 10px 0 0;
 }
 
 .permission-list {
@@ -1458,6 +1531,7 @@ td {
   .admin-stats,
   .admin-grid,
   .metrics,
+  .framework-grid,
   .form-grid,
   .task-form,
   .path-bar,

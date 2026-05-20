@@ -6,6 +6,7 @@ class EnvInfo(BaseModel):
 
     id: int
     owner_user_id: int
+    owner_name: str | None = None
     name: str
     path: str
     can_modify: bool = False
@@ -17,6 +18,41 @@ class EnvInfo(BaseModel):
     created_at: str
 
 
+class EnvFrameworkInfo(BaseModel):
+    """记录深度学习框架的检测结果；缺失或导入失败时保留错误信息，便于页面直接展示。"""
+
+    installed: bool
+    version: str | None = None
+    cuda: str | None = None
+    cudnn: str | int | None = None
+    cuda_available: bool | None = None
+    gpu_count: int | None = None
+    error: str | None = None
+
+
+class EnvPackageVersion(BaseModel):
+    """保存环境内 Python 包的名称和版本，包列表由目标环境自身解释器采集。"""
+
+    name: str
+    version: str
+
+
+class EnvTestResult(BaseModel):
+    """环境检测响应模型，覆盖 Python、PyTorch、TensorFlow 和包清单。"""
+
+    ok: bool
+    env_id: int
+    env_name: str
+    env_path: str
+    python_executable: str | None = None
+    python_version: str | None = None
+    pytorch: EnvFrameworkInfo
+    tensorflow: EnvFrameworkInfo
+    packages: list[EnvPackageVersion] = Field(default_factory=list)
+    package_count: int = 0
+    error: str | None = None
+
+
 class EnvUploadRequest(BaseModel):
     """环境导入占位请求体，MVP 阶段记录元数据而不处理真实包文件。"""
 
@@ -24,6 +60,21 @@ class EnvUploadRequest(BaseModel):
     path: str | None = Field(default=None, max_length=1024)
     description: str = Field(default="", max_length=512)
     python_version: str | None = Field(default=None, max_length=32)
+
+
+class EnvArchiveImportRequest(BaseModel):
+    """从用户根目录导入打包环境的请求体，path 指向用户选择的 zip 包虚拟路径。"""
+
+    path: str = Field(min_length=1, max_length=1024)
+    name: str | None = Field(default=None, max_length=128)
+    description: str = Field(default="", max_length=512)
+
+
+class EnvCloneRequest(BaseModel):
+    """创建环境副本请求体，name 是复制后的新 conda 环境目录名。"""
+
+    name: str = Field(min_length=1, max_length=128)
+    description: str = Field(default="", max_length=512)
 
 
 class EnvPackageInfo(BaseModel):

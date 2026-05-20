@@ -584,7 +584,7 @@ curl -f http://127.0.0.1:8000/api/health
 |---|---|---|
 | 服务日志 | `/var/log/nebulagrid/` 或 `journalctl` | API、scheduler、monitor 等服务自身日志 |
 | 任务日志 | `/home/ddltm/data/logs/task_logs/<task_no>.log` | 用户训练 stdout/stderr，通过 NFS 对 master 和计算节点可见 |
-| 环境安装日志 | `/home/ddltm/data/logs/env_install_logs/<job_no>.log` | whl、源码包、编译安装日志 |
+| 环境操作日志 | `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log` | 环境导入、复制、修复、检测、安装包、删除包和删除环境日志 |
 | 审计日志 | PostgreSQL `audit_logs` | 谁在何时做了什么 |
 | 任务事件 | PostgreSQL `task_events` | 任务状态机事件 |
 | 节点/GPU 历史指标 | InfluxDB `node_metrics` / `gpu_metrics` measurements | CPU/GPU 使用率、内存/显存、上传/下载、GPU 调用进程数 |
@@ -677,6 +677,17 @@ Runtime Guard 应检查任务进程树实际使用的 GPU UUID：
 - 失败时保留失败原因和可回滚信息。
 - 生产环境不建议自动安装未知来源包，至少要求用户确认风险。
 
+### 13.6 环境导入、复制和路径修复
+
+- 环境管理页面进入时会执行 `conda env list --json` 同步当前 `miniconda3/envs` 下的环境，`base` 环境不展示。
+- 用户导入 zip 环境包时，系统先解压到运行时临时目录，再复制到 `NEBULAGRID_CONDA_ENV_ROOT/<env_name>`，状态依次为 `导入中 -> 修复中 -> 测试中 -> 可用`。
+- 用户可以对可用环境创建副本。副本复制到 `NEBULAGRID_CONDA_ENV_ROOT/<new_env_name>`，状态依次为 `复制中 -> 修复中 -> 测试中 -> 可用`，副本所有者为创建用户。
+- 路径修复会扫描环境内所有文本文件，提取旧环境前缀并替换为新路径，覆盖 `pip` shebang、`.pth`、包配置、metadata 和 conda 记录；含空字节或明显二进制的文件会跳过。
+- 修复阶段会整理权限：目录 `755`，普通文件 `644`，`bin`/`Scripts` 下入口文件 `755`。若 API 以 root 运行，会把环境属主调整为 `NEBULAGRID_MAIN_LINUX_USER`。
+- 环境检测会通过 `conda activate <env_name>` 激活环境后运行 `remote/env_probe.py`，采集 Python、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
+- 管理员可删除所有环境；普通用户只能删除自己导入或复制的环境。删除会同时删除数据库记录和 `miniconda3/envs/<env_name>` 下的对应目录。
+- 每个环境对应一个落盘日志文件：`/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`。管理员可查看全部环境日志，普通用户只能查看自己的环境日志。
+
 ## 14. 安全基线
 
 - 后端服务层必须执行 RBAC 和资源归属校验，前端隐藏按钮不能作为权限依据。
@@ -725,5 +736,4 @@ Runtime Guard 应检查任务进程树实际使用的 GPU UUID：
 - [ ] master 重启后不会重复派发任务。
 - [ ] 节点 offline 后任务状态、资源释放和审计记录正确。
 - [ ] 数据库、配置、用户文件和任务日志均有备份策略。
-
 
