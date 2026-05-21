@@ -7,7 +7,7 @@ from app.core.security import parse_authorization_header
 from app.db.session import get_db
 from app.schemas.admin import SettingsUpdateRequest
 from app.schemas.auth import AdminLoginSessionOfflineRequest, AdminLoginSessionQuery
-from app.schemas.nodes import NodeCreateRequest
+from app.schemas.nodes import NodeCreateRequest, NodeUpdateRequest
 from app.services.audit_service import list_audit_logs, list_settings, update_settings
 from app.services.auth_service import (
     UserRecord,
@@ -15,7 +15,7 @@ from app.services.auth_service import (
     list_admin_user_login_sessions,
     offline_login_session_as_admin,
 )
-from app.services.node_service import create_node, force_offline_node, reconnect_node
+from app.services.node_service import create_node, delete_node, force_offline_node, reconnect_node, update_node
 
 router = APIRouter()
 
@@ -29,6 +29,31 @@ def post_admin_node(
 ):
     """管理员新增计算节点。"""
     node = create_node(current_user, payload, db)
+    return api_success(data=node.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.put("/nodes/{node_id}")
+def put_admin_node(
+    node_id: int,
+    payload: NodeUpdateRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """管理员修改计算节点登记信息和 GPU 顺序清单。"""
+    node = update_node(current_user, node_id, payload, db)
+    return api_success(data=node.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.delete("/nodes/{node_id}")
+def delete_admin_node(
+    node_id: int,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """管理员删除计算节点，并清理调度引用。"""
+    node = delete_node(current_user, node_id, db)
     return api_success(data=node.model_dump(), request_id=request.headers.get("x-request-id"))
 
 

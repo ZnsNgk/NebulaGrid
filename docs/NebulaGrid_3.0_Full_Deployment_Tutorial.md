@@ -461,11 +461,27 @@ psql 'postgresql://nebulagrid:replace-with-strong-password@127.0.0.1:5432/nebula
 
 ## 13. 同步远端脚本到 NFS
 
-以下命令在主节点以 `ddltm` 身份执行。
+以下命令在主节点以 `ddltm` 身份执行。远端脚本位于 `backend/app/remote/*.py`，使用同步工具可以避免新增脚本后只复制了部分文件：
 
 ```bash
-rsync -av /home/ddltm/master/backend/app/remote/ /home/ddltm/envs/nebulagrid_remote/
-chmod +x /home/ddltm/envs/nebulagrid_remote/*.py
+cd /home/ddltm/master/backend
+env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py
+```
+
+如果你的计算节点不是通过 NFS 读取同一个 `/home/ddltm/envs/nebulagrid_remote`，或者需要把脚本主动推送到每个已登记节点，先完成节点登记，再执行：
+
+```bash
+cd /home/ddltm/master/backend
+env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py --all-db-nodes
+```
+
+也可以先 dry-run，确认脚本清单和目标节点：
+
+```bash
+env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py --all-db-nodes --dry-run
 ```
 
 在计算节点上验证：

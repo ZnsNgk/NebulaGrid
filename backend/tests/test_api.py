@@ -268,3 +268,70 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
         assert not (user_root / "project" / "renamed.txt").exists()
     finally:
         get_settings.cache_clear()
+
+
+def test_mentor_can_browse_assigned_student_files_readonly(monkeypatch, tmp_path: Path) -> None:
+    """验证导师学生文件视图只展示名下学生，并通过只读 scope 访问学生 home。"""
+    user_home_root = tmp_path / "user"
+    monkeypatch.setenv("NEBULAGRID_USER_HOME_ROOT", str(user_home_root))
+    monkeypatch.setenv("NEBULAGRID_VISIBLE_ROOTS", str(user_home_root))
+    get_settings.cache_clear()
+    try:
+        client = make_client()
+        admin_token = login_as_admin(client)
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        mentor = client.post(
+            "/api/users",
+            headers=admin_headers,
+            json={
+                "username": "mentor-files",
+                "real_name": "Mentor Files",
+                "role": "mentor",
+                "state": "enabled",
+                "password": "mentor123",
+            },
+        ).json()["data"]
+        assigned = client.post(
+            "/api/users",
+            headers=admin_headers,
+            json={
+                "username": "assigned-student",
+                "real_name": "Assigned Student",
+                "role": "student",
+                "state": "enabled",
+                "password": "student123",
+                "supervisor_ids": [mentor["id"]],
+            },
+        ).json()["data"]
+        client.post(
+            "/api/users",
+            headers=admin_headers,
+            json={
+                "username": "other-student",
+                "real_name": "Other Student",
+                "role": "student",
+                "state": "enabled",
+                "password": "student123",
+            },
+        )
+        project_dir = user_home_root / assigned["username"] / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "note.txt").write_text("mentor-visible", encoding="utf-8")
+
+        mentor_token = login_user(client, "mentor-files", "mentor123")
+        headers = {"Authorization": f"Bearer {mentor_token}"}
+        root_response = client.get("/api/files/list?scope=students&path=/", headers=headers)
+        student_response = client.get("/api/files/list?scope=students&path=/assigned-student/project", headers=headers)
+        preview_response = client.get("/api/files/preview?scope=students&path=/assigned-student/project/note.txt", headers=headers)
+        forbidden_response = client.get("/api/files/list?scope=students&path=/other-student", headers=headers)
+
+        root_names = [item["name"] for item in root_response.json()["data"]["items"]]
+        assert root_response.status_code == 200
+        assert root_names == ["Assigned Student"]
+        assert student_response.status_code == 200
+        assert student_response.json()["data"]["display_path"] == "/Assigned Student/project"
+        assert student_response.json()["data"]["items"][0]["path"] == "/assigned-student/project/note.txt"
+        assert preview_response.json()["data"]["content"] == "mentor-visible"
+        assert forbidden_response.status_code == 403
+    finally:
+        get_settings.cache_clear()

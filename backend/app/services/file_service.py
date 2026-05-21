@@ -13,11 +13,11 @@ from uuid import uuid4
 from sqlalchemy import func, select
 
 from app.core.config import get_settings
-from app.core.errors import not_found, validation_error
+from app.core.errors import forbidden, not_found, validation_error
 from app.core.path_resolver import normalize_virtual_path, resolve_user_visible_path
-from app.core.rbac import require_permission
+from app.core.rbac import Role, require_permission
 from app.core.time_utils import ensure_local_datetime, local_datetime
-from app.db.models import FileJob as FileJobModel
+from app.db.models import FileJob as FileJobModel, User, UserSupervisor
 from app.db.session import SessionLocal
 from app.schemas.files import FileEntry, FileJobData, FileListData, FilePreviewData
 from app.services.audit_service import record_audit
@@ -45,12 +45,15 @@ EDITABLE_TEXT_TYPES = {
     ".yaml",
     ".yml",
 }
+STUDENT_FILES_SCOPE = "students"
 
 
-def list_files(user: UserRecord, path: str) -> FileListData:
+def list_files(user: UserRecord, path: str, scope: str = "") -> FileListData:
     """列出用户可见目录，路径解析统一经过 PathResolver。"""
     require_permission(user.role, "files:read")
     normalized = normalize_virtual_path(path)
+    if is_student_files_scope(scope):
+        return list_student_files(user, normalized)
     real_path = resolve_user_visible_path(normalized, user.username, user.role.value)
     if not real_path.exists():
         return FileListData(path=normalized, items=[])
@@ -60,11 +63,15 @@ def list_files(user: UserRecord, path: str) -> FileListData:
     return FileListData(path=normalized, items=items)
 
 
-def preview_file(user: UserRecord, path: str) -> FilePreviewData:
+def preview_file(user: UserRecord, path: str, scope: str = "") -> FilePreviewData:
     """按文件类型返回预览内容，大文件只返回前段内容避免拖垮页面。"""
     require_permission(user.role, "files:read")
     normalized = normalize_virtual_path(path)
-    real_path = resolve_user_visible_path(normalized, user.username, user.role.value)
+    real_path = (
+        resolve_student_readable_existing_path(user, normalized)
+        if is_student_files_scope(scope)
+        else resolve_user_visible_path(normalized, user.username, user.role.value)
+    )
     if not real_path.exists() or not real_path.is_file():
         raise validation_error("path is not a file")
 
@@ -283,9 +290,13 @@ def extract_archive(user: UserRecord, path: str, target_path: str | None = None)
     return {"accepted": True, "action": "extract", "path": normalize_virtual_path(path), "target_path": normalize_virtual_path(target_virtual)}
 
 
-def build_download_path(user: UserRecord, path: str) -> Path:
+def build_download_path(user: UserRecord, path: str, scope: str = "") -> Path:
     """为下载接口解析真实路径，目录下载需先打包，避免隐式流式遍历目录。"""
-    real_path = resolve_readable_existing_path(user, path)
+    real_path = (
+        resolve_student_readable_existing_path(user, path)
+        if is_student_files_scope(scope)
+        else resolve_readable_existing_path(user, path)
+    )
     if not real_path.is_file():
         raise validation_error("path is not a file")
     return real_path
@@ -320,6 +331,132 @@ def resolve_readable_existing_path(user: UserRecord, path: str) -> Path:
     if not real_path.exists():
         raise not_found("path not found")
     return real_path
+
+
+def is_student_files_scope(scope: str | None) -> bool:
+    """判断是否进入导师查看学生文件的只读视图，避免把学生路径误交给个人文件解析器。"""
+    return (scope or "").strip().lower() == STUDENT_FILES_SCOPE
+
+
+def list_student_files(user: UserRecord, normalized: str) -> FileListData:
+    """列出导师名下学生文件；展示名用真实姓名，实际 path 仍保留用户名目录。"""
+    ensure_student_files_scope_allowed(user)
+    if normalized == "/":
+        return FileListData(path=normalized, display_path="/", items=list_student_root_entries(user))
+    real_path = resolve_student_visible_path(user, normalized)
+    if not real_path.exists():
+        return FileListData(path=normalized, display_path=student_display_path(user, normalized), items=[])
+    if not real_path.is_dir():
+        raise validation_error("path is not a directory")
+    items = [build_file_entry(child, normalized) for child in sorted(real_path.iterdir(), key=file_sort_key)]
+    return FileListData(path=normalized, display_path=student_display_path(user, normalized), items=items)
+
+
+def list_student_root_entries(user: UserRecord) -> list[FileEntry]:
+    """用真实姓名生成虚拟学生根目录，path 仍指向用户名，供后端安全解析。"""
+    settings = get_settings()
+    user_home_root = Path(settings.user_home_root)
+    entries: list[FileEntry] = []
+    with SessionLocal() as db:
+        students = db.scalars(
+            select(User)
+            .join(UserSupervisor, UserSupervisor.student_id == User.id)
+            .where(UserSupervisor.supervisor_id == user.id)
+            .where(User.role == Role.STUDENT.value)
+            .order_by(User.real_name, User.username)
+        ).all()
+    for student in students:
+        home_path = (user_home_root / student.username).resolve(strict=False)
+        modified_at = None
+        if home_path.exists():
+            modified_at = datetime.fromtimestamp(home_path.stat().st_mtime).astimezone().isoformat()
+        entries.append(
+            FileEntry(
+                name=student.real_name or student.username,
+                path=f"/{student.username}",
+                type="directory",
+                size_bytes=0,
+                modified_at=modified_at,
+            )
+        )
+    return entries
+
+
+def student_display_path(user: UserRecord, path: str) -> str:
+    """把 /username/subdir 转成 /真实姓名/subdir；仅用于页面展示，不参与后端路径解析。"""
+    normalized = normalize_virtual_path(path)
+    parts = PurePosixPath(normalized).parts
+    if len(parts) < 2:
+        return normalized
+    student_username = parts[1]
+    real_name = assigned_student_real_name(user, student_username)
+    suffix = "/".join(parts[2:])
+    return f"/{real_name}/{suffix}" if suffix else f"/{real_name}"
+
+
+def assigned_student_real_name(user: UserRecord, student_username: str) -> str:
+    """查询已分配学生真实姓名，显示名缺失时回退用户名以免前端出现空目录名。"""
+    with SessionLocal() as db:
+        student = db.scalar(
+            select(User)
+            .join(UserSupervisor, UserSupervisor.student_id == User.id)
+            .where(UserSupervisor.supervisor_id == user.id)
+            .where(User.username == student_username)
+            .where(User.role == Role.STUDENT.value)
+        )
+    if student is None:
+        raise forbidden("mentor can only view assigned student files")
+    return student.real_name or student.username
+
+
+def resolve_student_readable_existing_path(user: UserRecord, path: str) -> Path:
+    """解析导师查看学生文件的真实路径，并强制限制在已分配学生 home 内。"""
+    real_path = resolve_student_visible_path(user, path)
+    if not real_path.exists():
+        raise not_found("path not found")
+    return real_path
+
+
+def resolve_student_visible_path(user: UserRecord, path: str) -> Path:
+    """把 /学生用户名/子路径 映射到对应学生目录，避免导师通过 .. 或绝对路径越界。"""
+    ensure_student_files_scope_allowed(user)
+    normalized = normalize_virtual_path(path)
+    parts = PurePosixPath(normalized).parts
+    if len(parts) < 2:
+        raise validation_error("path is not a directory")
+    student_username = parts[1]
+    if not student_username or student_username in {".", ".."}:
+        raise validation_error("path must include student username")
+    ensure_assigned_student(user, student_username)
+
+    settings = get_settings()
+    student_root = (Path(settings.user_home_root) / student_username).resolve(strict=False)
+    candidate = student_root.joinpath(*parts[2:]).resolve(strict=False)
+    if candidate != student_root and student_root not in candidate.parents:
+        raise forbidden("path is outside assigned student home")
+    return candidate
+
+
+def ensure_student_files_scope_allowed(user: UserRecord) -> None:
+    """学生文件视图只开放给导师，管理员仍通过自身已有文件边界访问。"""
+    require_permission(user.role, "files:read")
+    if user.role != Role.MENTOR:
+        raise forbidden("student file scope requires mentor role")
+
+
+def ensure_assigned_student(user: UserRecord, student_username: str) -> None:
+    """确认目标学生属于当前导师，防止手写路径访问其他学生目录。"""
+    with SessionLocal() as db:
+        exists = db.scalar(
+            select(func.count())
+            .select_from(User)
+            .join(UserSupervisor, UserSupervisor.student_id == User.id)
+            .where(UserSupervisor.supervisor_id == user.id)
+            .where(User.username == student_username)
+            .where(User.role == Role.STUDENT.value)
+        ) or 0
+    if not exists:
+        raise forbidden("mentor can only view assigned student files")
 
 
 def resolve_writable_path(user: UserRecord, path: str) -> Path:

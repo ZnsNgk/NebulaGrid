@@ -83,6 +83,19 @@ def migrate_existing_schema() -> None:
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_created_at ON audit_logs (created_at)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_action ON audit_logs (action)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_target_type ON audit_logs (target_type)"))
+        if "nodes" in tables:
+            ensure_columns(
+                connection,
+                "nodes",
+                {
+                    # 节点可见性从单 owner 过渡到多 owner；旧字段继续保留，避免历史逻辑失效。
+                    "owner_user_ids": "JSON DEFAULT '[]'::json",
+                    "access_scope": "VARCHAR(32) DEFAULT 'public'",
+                    "sharing_scope": "VARCHAR(32) DEFAULT 'public'",
+                },
+            )
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_nodes_access_scope ON nodes (access_scope)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_nodes_sharing_scope ON nodes (sharing_scope)"))
 
 
 def ensure_columns(connection, table_name: str, columns: dict[str, str]) -> None:

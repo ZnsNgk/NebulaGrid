@@ -275,11 +275,27 @@ sudo -u ddltm env $(cat /etc/nebulagrid/backend.env | xargs) \
 
 ## 11. 下发远端脚本
 
-将远端脚本同步到 NFS 共享目录，计算节点会通过同一路径访问：
+远端脚本位于 `backend/app/remote/*.py`，包括节点监控、任务 runner、环境探针和环境安装器。优先使用同步工具统一下发，避免手工 `rsync` 时漏掉新增脚本：
 
 ```bash
-sudo -u ddltm rsync -av /home/ddltm/master/backend/app/remote/ /home/ddltm/envs/nebulagrid_remote/
-sudo -u ddltm chmod +x /home/ddltm/envs/nebulagrid_remote/*.py
+cd /home/ddltm/master/backend
+sudo -u ddltm env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py
+```
+
+如果 `/home/ddltm/envs` 没有通过 NFS 正确共享到计算节点，或需要主动推送到每台计算节点本地目录，可在登记节点后执行：
+
+```bash
+cd /home/ddltm/master/backend
+sudo -u ddltm env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py --all-db-nodes
+```
+
+上线前可先 dry-run 检查脚本清单和目标节点：
+
+```bash
+sudo -u ddltm env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py --all-db-nodes --dry-run
 ```
 
 计算节点验证：
@@ -420,8 +436,36 @@ TOKEN='<access_token>'
 curl -s http://127.0.0.1:8000/api/admin/nodes \
   -H "Authorization: Bearer ${TOKEN}" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"node-a","ip":"192.168.1.21","ssh_user":"ddltm","gpu_models":["A100","A100"]}'
+  -d '{
+    "name":"node-a",
+    "ip":"192.168.1.21",
+    "ssh_user":"ddltm",
+    "max_speed_mbps":10000,
+    "gpu_count":2,
+    "gpu_models":["NVIDIA A100","NVIDIA A100"],
+    "owner_user_ids":[310001],
+    "access_scope":"private",
+    "sharing_scope":"group"
+  }'
 ```
+
+字段说明：
+
+- `gpu_count` 必须等于 `gpu_models` 的条数。
+- `gpu_models` 必须严格按照该节点 `nvidia-smi` 显示顺序填写，调度器会按这个顺序维护 GPU index。
+- `owner_user_ids` 是节点所有人 ID 列表，可填写多个用户；管理员后台也提供搜索按钮和复选下拉框选择所有人。
+- `access_scope=public` 表示公开使用，`private` 表示私有使用。
+- `sharing_scope=none` 表示不共享，仅所有人和管理员可见；`group` 表示组内共享；`public` 表示所有用户可见可用。
+- 共享范围只影响普通用户总览页中可用 GPU 和节点卡片的可见性，不影响节点总数、在线节点、GPU 总数和运行任务等全局统计。
+
+节点登记后可用以下接口检查：
+
+```bash
+curl -s http://127.0.0.1:8000/api/nodes \
+  -H "Authorization: Bearer ${TOKEN}"
+```
+
+管理员后台的节点列表提供“修改”“强制下线”“重连”“删除”操作。修改节点时复用新增节点卡片，提交成功后卡片标题会恢复为“新增节点”。强制下线和删除都会写入审计日志，生产环境操作前应确认该节点上没有需要保留的运行任务。
 
 ## 16. SSH 子账户同步
 

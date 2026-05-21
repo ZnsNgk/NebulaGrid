@@ -31,10 +31,11 @@ router = APIRouter()
 def get_file_list(
     request: Request,
     path: str = "/",
+    scope: str = "",
     current_user: UserRecord = Depends(get_current_user),
 ):
     """列出虚拟路径下的文件和目录。"""
-    data = list_files(current_user, path)
+    data = list_files(current_user, path, scope)
     return api_success(data=data.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
@@ -42,20 +43,22 @@ def get_file_list(
 def get_file_preview(
     request: Request,
     path: str,
+    scope: str = "",
     current_user: UserRecord = Depends(get_current_user),
 ):
     """预览文本、图片、音视频等文件；文本内容可被前端编辑保存。"""
-    data = preview_file(current_user, path)
+    data = preview_file(current_user, path, scope)
     return api_success(data=data.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
 @router.get("/download")
 def get_file_download(
     path: str,
+    scope: str = "",
     current_user: UserRecord = Depends(get_current_user),
 ):
     """下载单个文件；目录需要先通过 archive 接口打包，避免隐式遍历。"""
-    real_path = build_download_path(current_user, path)
+    real_path = build_download_path(current_user, path, scope)
     return FileResponse(real_path, filename=real_path.name)
 
 

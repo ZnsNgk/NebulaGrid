@@ -404,7 +404,7 @@ nebulagrid/
 | 用户资料       | 修改密码、修改头像、查看登录记录、查看当前设备、退出其他会话。                        |
 | 导师管理       | 导师可添加学生、编辑学生资料、停用/启用学生账号、查看学生任务/文件/环境。             |
 | 管理员用户管理 | 添加/删除/停用用户、重置密码、修改角色、绑定导师、设置用户根目录。                    |
-| 管理员节点管理 | 节点增删改查、GPU 可用性、维护模式、重连、强制下线、节点备注。                        |
+| 管理员节点管理 | 节点增删改查、GPU 可用性、所有人多选、使用权/共享范围、维护模式、重连、强制下线、节点备注。 |
 | 管理员系统配置 | 日志刷新间隔、上传大小、GPU 复用阈值、最大复用数、watchdog 超时、可见目录、系统公告。 |
 | 审计日志       | 查看用户登录、任务操作、文件操作、节点操作、配置修改等记录。                          |
 
@@ -463,7 +463,7 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | users                 | id, username, real_name, role, password_hash, state, home_path, linux_account_name, linux_uid, linux_gid, created_at                              | 用户基础信息与 master 子账户映射。                              |
 | user_supervisors      | student_id, supervisor_id                                                                                                                         | 学生与导师多对多关系，限制每名学生 1-2 位导师。                 |
 | login_sessions        | user_id, token_hash, ip, user_agent, login_device, device_id, last_seen_at, logout_at, expires_at, revoked_at, created_at                        | 登录设备与在线状态；只保存 token 摘要，不保存原始令牌。         |
-| nodes                 | id, name, ip, ssh_user, owner_type, owner_user_id, is_public, max_speed_mbps, state, scheduling_enabled                                           | 计算节点。                                                      |
+| nodes                 | id, name, ip, ssh_user, owner_type, owner_user_id, owner_user_ids, access_scope, sharing_scope, is_public, max_speed_mbps, state, scheduling_enabled | 计算节点；`owner_user_ids` 保存多个所有人，`access_scope` 控制公开/私有使用权，`sharing_scope` 控制普通用户总览中可用 GPU 的可见范围。 |
 | gpus                  | id, node_id, gpu_index, model, total_vram_mb, schedulable, remark                                                                                 | 节点 GPU 子资源。                                               |
 | node_metrics          | InfluxDB measurement：node_id, cpu_usage, avail_ram_mb, upload_mbps, download_mbps, collected_at                                                   | 节点监控快照和历史曲线，不再保存为 PostgreSQL 表。              |
 | gpu_metrics           | InfluxDB measurement：gpu_id, gpu_usage, free_vram_mb, process_count, called, collected_at                                                         | GPU 监控快照和历史曲线，不再保存为 PostgreSQL 表。              |
@@ -552,6 +552,8 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | Dashboard | GET /api/dashboard/summary                            | 获取节点、GPU、任务统计。                                                 | 所有角色，展示者脱敏             |
 | Nodes     | GET /api/nodes                                        | 节点列表，按角色过滤字段。                                                | 登录用户                         |
 | Nodes     | POST /api/admin/nodes                                 | 新增节点。                                                                | 管理员                           |
+| Nodes     | PUT /api/admin/nodes/{id}                             | 修改节点基础信息、所有人、共享策略和 GPU 顺序清单。                        | 管理员                           |
+| Nodes     | DELETE /api/admin/nodes/{id}                          | 删除退役节点，并清理调度直接引用。                                         | 管理员                           |
 | Nodes     | POST /api/admin/nodes/{id}/reconnect                  | 重新连接节点。                                                            | 管理员                           |
 | Nodes     | POST /api/admin/nodes/{id}/force-offline              | 强制下线并处理任务。                                                      | 管理员                           |
 | Tasks     | GET /api/tasks                                        | 任务分页列表，支持 state/user/node/date/search。                          | 按角色过滤                       |
@@ -581,7 +583,35 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | Envs      | POST /api/env-install-jobs/{job_id}/cancel            | 中止正在执行的环境包安装/编译作业。                                       | 作业创建者/管理员                |
 | Tasks     | GET /api/tasks/{task_id}/guard                        | 查看运行时守护线程检测摘要，包括 PID、进程组、分配 GPU 和最近观测 GPU。   | 任务可见者；普通用户脱敏         |
 
-## 8.3 实时推送
+## 8.3 管理员节点保存字段
+
+管理员后台“节点管理”页面应把节点列表和节点表单分开展示。节点列表展示所有计算节点，并在操作列提供“修改”“强制下线”“重连”“删除”按钮；新增节点使用独立卡片。点击某个节点的“修改”后，复用新增节点卡片完成编辑，但卡片标题应临时变为“修改节点”，提交成功后恢复为“新增节点”。
+
+新增或修改节点时，前端应提交以下字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| name | string | 节点名称，管理员可读的唯一名称。 |
+| ip | string | 节点 IP 地址或 hostname。 |
+| ssh_user | string | master 登录该节点使用的主账户，实验室默认 `ddltm`。 |
+| max_speed_mbps | int nullable | 与主节点最大连接带宽，单位 Mbps。 |
+| gpu_count | int | 节点实际 NVIDIA GPU 数量，包括亮机卡。 |
+| gpu_models | string[] | GPU 型号列表，必须严格按 `nvidia-smi` 显示顺序保存；只填写型号后半部分，如 `RTX 2080 Ti`、`RTX 4090`、`Tesla V100`、`NVIDIA A100`。 |
+| owner_user_ids | int[] | 节点所有人 ID 列表，可多选；前端应提供带搜索按钮的复选下拉框，也允许管理员直接输入 ID 兜底。 |
+| access_scope | enum | `public` 表示公开使用，`private` 表示私有使用。 |
+| sharing_scope | enum | `none` 不共享，`group` 组内共享，`public` 公开共享。 |
+
+后端必须校验 `gpu_count` 与 `gpu_models` 条数一致，避免调度器按 GPU index 分配时出现错位。校验失败时应返回 `VALIDATION_ERROR`，HTTP 状态建议为 422，前端提示“GPU 数量必须与 GPU 型号列表条数一致”。
+
+共享范围只影响普通用户在总览页“可用 GPU”和节点卡片中的可见资源，不应影响系统总览中的节点总数、在线节点、GPU 总数、运行任务等全局统计。具体规则如下：
+
+| sharing_scope | 可见/可用范围 |
+|---|---|
+| none | 仅节点所有人和管理员可查看与使用。 |
+| group | 若所有人为学生，则该学生导师名下学生可查看与使用；若所有人为导师，则该导师名下学生可查看与使用。 |
+| public | 所有登录用户可查看与使用。 |
+
+## 8.4 实时推送
 
 - 节点状态：/ws/nodes 或 /sse/nodes，推送节点和 GPU 指标变化。
 

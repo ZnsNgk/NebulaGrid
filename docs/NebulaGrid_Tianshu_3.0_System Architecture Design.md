@@ -375,20 +375,25 @@ erDiagram
 |---|---|---|
 | id | bigint / uuid | 节点主键 |
 | name | varchar unique | 节点显示名称 |
-| host | varchar | IP 或 hostname，仅管理员可见 |
+| ip | varchar | IP 或 hostname，仅管理员可见 |
 | ssh_port | int | 默认 22 |
-| ssh_username | varchar | master 登录该节点使用的主账户，默认 `ddltm` |
+| ssh_user | varchar | master 登录该节点使用的主账户，默认 `ddltm` |
 | ssh_uid | int | 该主账户在节点上的 UID，必须与 master 主账户一致 |
 | ssh_gid | int | 该主账户在节点上的 GID，必须与 master 主账户一致 |
-| ownership | enum | public/private |
-| owner_user_id | fk users.id | 私人节点所有人 |
-| open_to_group | bool | 私人节点是否开放给同导师组使用 |
-| max_link_mbps | int | 与主节点最大连接速度 |
-| state | enum | online/offline/disabled/maintenance |
-| schedulable | bool | 是否允许调度 |
+| owner_type | enum | 兼容字段，取值与 `access_scope` 保持一致 |
+| owner_user_id | fk users.id nullable | 兼容旧版单所有人字段，保存 `owner_user_ids` 中第一个用户 |
+| owner_user_ids | jsonb/list | 节点所有人 ID 列表，允许多个所有人，顺序按管理员提交保存 |
+| access_scope | enum | 使用权，`public` 公开使用，`private` 私有使用 |
+| sharing_scope | enum | 共享范围，`none` 不共享、`group` 组内共享、`public` 公开共享 |
+| is_public | bool | 兼容字段，由 `access_scope == public` 派生 |
+| max_speed_mbps | int nullable | 与主节点最大连接带宽，单位 Mbps |
+| state | enum | online/offline/disabled/maintenance/reconnecting/manual_offline |
+| scheduling_enabled | bool | 是否允许调度 |
 | last_heartbeat_at | timestamp | 最近心跳时间 |
 | watchdog_seconds | int | watchdog 计数或等价时间差 |
 | created_at | timestamp | 创建时间 |
+
+节点所有人与共享范围由服务层统一解释。管理员始终可以看到所有计算节点；普通用户只看到自己可用的节点。`sharing_scope=none` 时只有所有人和管理员可见；`sharing_scope=group` 时，学生所有人共享给其导师名下学生，导师所有人共享给其学生；`sharing_scope=public` 时所有登录用户可见。该共享规则只影响普通用户可用 GPU 和节点卡片可见性，不影响管理员后台和全局统计口径。
 
 #### 6.2.3 gpu_devices
 
@@ -1465,7 +1470,7 @@ Nginx 负责：
 6. `nvidia-smi` 可用；
 7. 通过 NFS 挂载 master 共享的 `/home/ddltm/data`，用于访问用户 home、任务日志、环境安装日志、运行时文件、miniconda、用户环境和节点监控/远端执行代码；
 8. `/home/ddltm/data` 在 master 和所有计算节点上的路径必须一致；
-9. `runner.py`、`monitor.py`、`env_installer.py` 由 master 统一维护在 `/home/ddltm/envs/nebulagrid_remote/`，计算节点通过 NFS 读取并以主账户执行。
+9. `runner.py`、`monitor.py`、`env_probe.py`、`env_installer.py` 由 master 通过 `backend/scripts/sync_remote_scripts.py` 统一同步到 `/home/ddltm/envs/nebulagrid_remote/`；计算节点优先通过 NFS 读取并以主账户执行，未共享 NFS 的部署可使用 `--all-db-nodes` 主动推送到每个已登记节点。
 
 ---
 

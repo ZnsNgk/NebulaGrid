@@ -3,15 +3,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.errors import not_found, validation_error
+from app.core.rbac import Role
 from app.core.rbac import require_permission
-from app.db.models import Gpu, Node, TaskAllocation
-from app.schemas.nodes import GpuInfo, NodeCreateRequest, NodeInfo
+from app.db.models import EnvInstallJob, Gpu, Node, TaskAllocation, TaskRequirement, TaskRuntimeGuard, User, UserSupervisor
+from app.schemas.nodes import GpuInfo, NodeCreateRequest, NodeInfo, NodeSaveRequest, NodeUpdateRequest
 from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
 from app.services.metrics_service import LatestMetrics, get_latest_metrics
 
 
-def list_nodes(user: UserRecord, db: Session) -> list[NodeInfo]:
+def list_nodes(user: UserRecord, db: Session, visible_only: bool = True) -> list[NodeInfo]:
     """返回数据库中的计算节点，并从 InfluxDB 附带最新监控快照。"""
     require_permission(user.role, "nodes:read")
     nodes = db.scalars(
@@ -20,6 +21,8 @@ def list_nodes(user: UserRecord, db: Session) -> list[NodeInfo]:
         .order_by(Node.id)
     ).all()
     compute_nodes = [node for node in nodes if not is_control_plane_node(node)]
+    if visible_only and user.role != Role.ADMIN:
+        compute_nodes = [node for node in compute_nodes if can_user_access_node(user, node, db)]
     latest_metrics = load_latest_metrics(compute_nodes)
     occupied_gpu_ids = load_occupied_gpu_ids(compute_nodes, db)
     return [build_node_info(node, latest_metrics, occupied_gpu_ids) for node in compute_nodes]
@@ -30,20 +33,22 @@ def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> No
     require_permission(user.role, "nodes:write")
     if is_control_plane_identity(payload.name, payload.ip):
         raise validation_error("master/control-plane node should not be registered as compute node")
+    owner_ids = validate_owner_ids(payload.owner_user_ids, db)
     node = Node(
         name=payload.name.strip(),
         ip=payload.ip.strip(),
         ssh_user=payload.ssh_user.strip(),
-        is_public=payload.is_public,
+        owner_type=payload.access_scope,
+        owner_user_id=owner_ids[0] if owner_ids else None,
+        owner_user_ids=owner_ids,
+        access_scope=payload.access_scope,
+        sharing_scope=payload.sharing_scope,
+        is_public=payload.access_scope == "public",
         max_speed_mbps=payload.max_speed_mbps,
         state="offline",
         scheduling_enabled=False,
     )
-    node.gpus = [
-        Gpu(gpu_index=index, model=model.strip() or "Unknown", total_vram_mb=0)
-        for index, model in enumerate(payload.gpu_models)
-        if model.strip()
-    ]
+    sync_node_gpus(node, payload)
     db.add(node)
     try:
         db.commit()
@@ -53,6 +58,50 @@ def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> No
     db.refresh(node)
     node_info = build_node_info(node, LatestMetrics())
     record_audit(user.id, "node.create", "node", str(node.id), detail_json=node_info.model_dump())
+    return node_info
+
+
+def update_node(user: UserRecord, node_id: int, payload: NodeUpdateRequest, db: Session) -> NodeInfo:
+    """修改节点基础信息和 GPU 顺序清单，保留相同 index 的历史监控关联。"""
+    require_permission(user.role, "nodes:write")
+    node = require_node_model(node_id, db)
+    if is_control_plane_identity(payload.name, payload.ip):
+        raise validation_error("master/control-plane node should not be registered as compute node")
+    owner_ids = validate_owner_ids(payload.owner_user_ids, db)
+    node.name = payload.name.strip()
+    node.ip = payload.ip.strip()
+    node.ssh_user = payload.ssh_user.strip()
+    node.owner_type = payload.access_scope
+    node.owner_user_id = owner_ids[0] if owner_ids else None
+    node.owner_user_ids = owner_ids
+    node.access_scope = payload.access_scope
+    node.sharing_scope = payload.sharing_scope
+    node.is_public = payload.access_scope == "public"
+    node.max_speed_mbps = payload.max_speed_mbps
+    sync_node_gpus(node, payload)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise validation_error("node name already exists") from exc
+    db.refresh(node)
+    node_info = build_node_info(node, load_latest_metrics([node]), load_occupied_gpu_ids([node], db))
+    record_audit(user.id, "node.update", "node", str(node.id), detail_json=node_info.model_dump())
+    return node_info
+
+
+def delete_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
+    """删除计算节点并清理直接外键引用，避免历史任务记录阻塞节点退役。"""
+    require_permission(user.role, "nodes:write")
+    node = require_node_model(node_id, db)
+    node_info = build_node_info(node, load_latest_metrics([node]), load_occupied_gpu_ids([node], db))
+    db.query(TaskRequirement).filter(TaskRequirement.node_id == node.id).update({TaskRequirement.node_id: None}, synchronize_session=False)
+    db.query(EnvInstallJob).filter(EnvInstallJob.target_node_id == node.id).update({EnvInstallJob.target_node_id: None}, synchronize_session=False)
+    db.query(TaskAllocation).filter(TaskAllocation.node_id == node.id).delete(synchronize_session=False)
+    db.query(TaskRuntimeGuard).filter(TaskRuntimeGuard.node_id == node.id).delete(synchronize_session=False)
+    db.delete(node)
+    db.commit()
+    record_audit(user.id, "node.delete", "node", str(node_info.id), detail_json=node_info.model_dump())
     return node_info
 
 
@@ -117,6 +166,9 @@ def build_node_info(
         ssh_user=node.ssh_user,
         owner_type=node.owner_type,
         owner_user_id=node.owner_user_id,
+        owner_user_ids=normalize_owner_ids(node),
+        access_scope=getattr(node, "access_scope", None) or ("public" if node.is_public else "private"),
+        sharing_scope=getattr(node, "sharing_scope", None) or ("public" if node.is_public else "none"),
         is_public=node.is_public,
         max_speed_mbps=node.max_speed_mbps,
         state=node.state,
@@ -132,6 +184,84 @@ def build_node_info(
         download_mbps=metric.download_mbps if metric else None,
         metric_collected_at=metric.collected_at if metric else None,
     )
+
+
+def sync_node_gpus(node: Node, payload: NodeSaveRequest) -> None:
+    """按 nvidia-smi 顺序同步 GPU 列表，同 index 更新可保留已有监控与调度引用。"""
+    existing_by_index = {gpu.gpu_index: gpu for gpu in node.gpus}
+    desired_indices = set(range(payload.gpu_count or 0))
+    for index, model in enumerate(payload.gpu_models):
+        gpu = existing_by_index.get(index)
+        if gpu is None:
+            node.gpus.append(Gpu(gpu_index=index, model=model, total_vram_mb=0))
+        else:
+            gpu.model = model
+    for gpu in list(node.gpus):
+        if gpu.gpu_index not in desired_indices:
+            node.gpus.remove(gpu)
+
+
+def validate_owner_ids(owner_ids: list[int], db: Session) -> list[int]:
+    """校验节点所有人必须来自用户表，防止保存悬空 owner 导致共享判断错误。"""
+    deduped: list[int] = []
+    for owner_id in owner_ids:
+        if owner_id not in deduped:
+            deduped.append(owner_id)
+    if not deduped:
+        return []
+    found = set(db.scalars(select(User.id).where(User.id.in_(deduped))).all())
+    if found != set(deduped):
+        raise validation_error("node owner not found")
+    return deduped
+
+
+def normalize_owner_ids(node: Node) -> list[int]:
+    """兼容旧库里的单 owner 字段，统一返回多 owner 列表。"""
+    owner_ids = list(getattr(node, "owner_user_ids", None) or [])
+    if not owner_ids and node.owner_user_id is not None:
+        owner_ids = [node.owner_user_id]
+    deduped: list[int] = []
+    for owner_id in owner_ids:
+        if owner_id not in deduped:
+            deduped.append(owner_id)
+    return deduped
+
+
+def can_user_access_node(user: UserRecord, node: Node, db: Session) -> bool:
+    """按节点所有人与共享范围判断普通用户是否能在总览中看到并使用该节点。"""
+    owner_ids = normalize_owner_ids(node)
+    if user.id in owner_ids:
+        return True
+    sharing_scope = getattr(node, "sharing_scope", None) or ("public" if node.is_public else "none")
+    if sharing_scope == "public":
+        return True
+    if sharing_scope != "group" or not owner_ids:
+        return False
+    return user.id in load_group_shared_user_ids(owner_ids, db)
+
+
+def load_group_shared_user_ids(owner_ids: list[int], db: Session) -> set[int]:
+    """展开组内共享对象：学生 owner 共享给其导师名下学生，导师 owner 共享给其学生。"""
+    owners = db.scalars(select(User).where(User.id.in_(owner_ids))).all()
+    shared_user_ids: set[int] = set()
+    for owner in owners:
+        if owner.role == Role.STUDENT.value:
+            supervisor_ids = db.scalars(
+                select(UserSupervisor.supervisor_id).where(UserSupervisor.student_id == owner.id)
+            ).all()
+            if supervisor_ids:
+                shared_user_ids.update(
+                    db.scalars(
+                        select(UserSupervisor.student_id).where(UserSupervisor.supervisor_id.in_(supervisor_ids))
+                    ).all()
+                )
+        elif owner.role == Role.MENTOR.value:
+            shared_user_ids.update(
+                db.scalars(
+                    select(UserSupervisor.student_id).where(UserSupervisor.supervisor_id == owner.id)
+                ).all()
+            )
+    return shared_user_ids
 
 
 def build_gpu_info(gpu: Gpu, latest_metrics: LatestMetrics, occupied_gpu_ids: set[int] | None = None) -> GpuInfo:

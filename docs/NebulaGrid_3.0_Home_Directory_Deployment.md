@@ -103,11 +103,20 @@ NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
 
 ## 5. 同步远端脚本
 
-`/home/ddltm/data` 和 `/home/ddltm/envs` 归属应为 `ddltm:ddltm`。以 `ddltm` 执行：
+`/home/ddltm/data` 和 `/home/ddltm/envs` 归属应为 `ddltm:ddltm`。远端脚本位于 `backend/app/remote/*.py`，优先使用同步工具，确保新增的 `monitor.py`、`runner.py`、`env_probe.py`、`env_installer.py` 等脚本都会被下发：
 
 ```bash
-rsync -av /home/ddltm/master/backend/app/remote/ /home/ddltm/envs/nebulagrid_remote/
-chmod +x /home/ddltm/envs/nebulagrid_remote/*.py
+cd /home/ddltm/master/backend
+env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py
+```
+
+如果计算节点没有通过 NFS 看到同一个 `/home/ddltm/envs/nebulagrid_remote`，可在节点登记完成后主动分发到数据库中的全部计算节点：
+
+```bash
+cd /home/ddltm/master/backend
+env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py --all-db-nodes
 ```
 
 验证计算节点可读取：
@@ -178,7 +187,8 @@ cd /home/ddltm/master
 git pull
 cd backend
 /home/ddltm/envs/miniconda3/bin/python -m pip install -e .
-rsync -av /home/ddltm/master/backend/app/remote/ /home/ddltm/envs/nebulagrid_remote/
+env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py
 ```
 
 然后管理员重启服务：

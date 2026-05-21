@@ -12,9 +12,10 @@ class FileEntry(BaseModel):
 
 
 class FileListData(BaseModel):
-    """目录列表响应数据，包含当前虚拟路径和子项数组。"""
+    """目录列表响应数据，path 用于后续操作，display_path 只负责前端友好展示。"""
 
     path: str
+    display_path: str | None = None
     items: list[FileEntry]
 
 

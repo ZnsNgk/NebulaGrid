@@ -29,6 +29,7 @@
 body {
   margin: 0;
   min-width: 320px;
+  overflow-x: hidden;
   background:
     radial-gradient(circle at 18% 12%, rgba(139, 92, 246, 0.18), transparent 30%),
     radial-gradient(circle at 82% 4%, rgba(6, 182, 212, 0.16), transparent 28%),
@@ -146,37 +147,67 @@ pre {
 .login-page {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: minmax(320px, 1fr) 430px;
+  grid-template-columns: minmax(520px, 1fr) 430px;
   gap: 32px;
   align-items: center;
   padding: 48px;
 }
 
 .login-copy {
-  max-width: 720px;
+  max-width: 920px;
+  min-height: 560px;
+  display: grid;
+  grid-template-columns: 190px minmax(260px, 1fr);
+  grid-template-rows: 190px minmax(300px, auto);
+  align-items: start;
+  gap: 28px 24px;
+}
+
+.login-copy::before {
+  content: "";
+  grid-column: 1;
+  grid-row: 1;
+  width: 190px;
+  height: 190px;
+  background: url("../load_page.png") center / contain no-repeat;
 }
 
 .login-copy p {
-  margin: 0 0 10px;
+  grid-column: 2;
+  grid-row: 1;
+  align-self: center;
+  justify-self: start;
+  margin: 0;
   color: var(--brand-strong);
   font-weight: 800;
+  padding: 8px 12px;
+  border: 1px solid rgba(34, 211, 238, 0.34);
+  border-radius: 8px;
+  background: rgba(6, 182, 212, 0.08);
+  box-shadow: 0 12px 30px rgba(6, 182, 212, 0.12);
 }
 
 .login-copy h1 {
+  grid-column: 1;
+  grid-row: 2;
   margin: 0;
-  max-width: 780px;
-  font-size: 46px;
-  line-height: 1.12;
+  max-width: 190px;
+  font-size: 42px;
+  line-height: 1.15;
   letter-spacing: 0;
   color: #f8fbff;
   text-shadow: 0 18px 54px rgba(6, 182, 212, 0.2);
+  overflow-wrap: anywhere;
 }
 
 .login-stats {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: end;
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  margin-top: 28px;
+  margin: 0 0 142px;
 }
 
 .login-stats span,
@@ -229,14 +260,21 @@ pre {
 }
 
 .layout {
+  width: 100%;
+  max-width: 100vw;
   min-height: 100vh;
-  display: grid;
-  grid-template-columns: 270px minmax(0, 1fr);
+  display: block;
+  overflow-x: hidden;
 }
 
 .sidebar {
-  position: sticky;
+  width: 270px;
+  min-width: 0;
+  position: fixed;
   top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 25;
   height: 100vh;
   background: var(--nav);
   border-right: 1px solid var(--line);
@@ -244,6 +282,8 @@ pre {
   display: flex;
   flex-direction: column;
   gap: 20px;
+  overflow-x: hidden;
+  overflow-y: auto;
   backdrop-filter: blur(18px);
 }
 
@@ -251,8 +291,13 @@ pre {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
   color: #fff;
   padding: 6px 4px 10px;
+}
+
+.brand > div:last-child {
+  min-width: 0;
 }
 
 .brand-logo {
@@ -267,9 +312,31 @@ pre {
   box-shadow: 0 12px 28px rgba(6, 182, 212, 0.22);
 }
 
+.app-logo {
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+.app-logo img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.app-logo-sidebar {
+  background: rgba(3, 7, 18, 0.42);
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  padding: 2px;
+  box-shadow: 0 12px 28px rgba(139, 92, 246, 0.26);
+}
+
 .brand strong,
 .brand small {
   display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .brand small,
@@ -287,6 +354,8 @@ nav {
 }
 
 .nav-item {
+  width: 100%;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -299,6 +368,7 @@ nav {
 }
 
 .nav-item span {
+  flex: 0 0 auto;
   width: 30px;
   height: 26px;
   display: grid;
@@ -306,11 +376,15 @@ nav {
   border-radius: 7px;
   background: rgba(255, 255, 255, 0.07);
   color: #bdefff;
-  font-size: 11px;
+  font-size: 14px;
   font-weight: 800;
 }
 
 .nav-item b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 700;
 }
 
@@ -335,9 +409,11 @@ nav {
 
 .workspace {
   min-width: 0;
-  max-width: 1680px;
+  margin-left: 270px;
+  max-width: min(1680px, calc(100vw - 270px));
   width: 100%;
   padding: 26px;
+  overflow-x: hidden;
 }
 
 .topbar {
@@ -345,7 +421,13 @@ nav {
   justify-content: space-between;
   align-items: center;
   gap: 14px;
+  min-width: 0;
+  flex-wrap: wrap;
   margin-bottom: 20px;
+}
+
+.topbar > div {
+  min-width: 0;
 }
 
 .topbar h1 {
@@ -439,7 +521,7 @@ nav {
 
 .admin-stats {
   display: grid;
-  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 14px;
   margin-bottom: 18px;
 }
@@ -472,7 +554,89 @@ nav {
   gap: 16px;
 }
 
+.node-management-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.node-list-card table {
+  min-width: 1080px;
+}
+
+.node-list-card td:last-child {
+  min-width: 220px;
+}
+
+.node-form-card {
+  max-width: 1040px;
+}
+
+.node-form-card textarea {
+  min-height: 128px;
+  line-height: 1.55;
+}
+
+.node-owner-picker {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(7, 16, 33, 0.58);
+  padding: 12px;
+}
+
+.node-owner-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #c9d5f0;
+  font-size: 13px;
+}
+
+.node-owner-head strong {
+  color: var(--brand-strong);
+  font-size: 12px;
+}
+
+.owner-search-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.owner-search-row button {
+  min-width: 82px;
+}
+
+.multi-select-options {
+  display: grid;
+  gap: 6px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.multi-select-options .check {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.multi-select-options .check span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.compact-empty {
+  padding: 12px;
+}
+
 .admin-card {
+  min-width: 0;
   min-height: 320px;
 }
 
@@ -483,7 +647,7 @@ nav {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 14px;
   margin-bottom: 14px;
 }
@@ -491,6 +655,7 @@ nav {
 .metrics article,
 .panel {
   padding: 16px;
+  min-width: 0;
 }
 
 .metrics span {
@@ -526,7 +691,13 @@ nav {
   justify-content: space-between;
   align-items: end;
   gap: 16px;
+  min-width: 0;
+  flex-wrap: wrap;
   margin-bottom: 14px;
+}
+
+.panel-head > div {
+  min-width: 0;
 }
 
 .refresh-control {
@@ -766,13 +937,21 @@ nav {
 
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 12px;
   align-items: end;
 }
 
 .task-form {
-  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+
+.compact-form {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.node-form-card .form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
 .wide {
@@ -1246,15 +1425,17 @@ nav {
 }
 
 .table-wrap {
+  max-width: 100%;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(5, 9, 20, 0.28);
+  overscroll-behavior-x: contain;
 }
 
 table {
   width: 100%;
-  min-width: 760px;
+  min-width: min(760px, 100%);
   border-collapse: collapse;
 }
 
@@ -1264,6 +1445,7 @@ td {
   padding: 11px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   vertical-align: top;
+  overflow-wrap: anywhere;
 }
 
 th {
@@ -1763,7 +1945,11 @@ td {
 }
 
 @media (max-width: 1080px) {
-  .login-page,
+  .login-page {
+    grid-template-columns: 1fr;
+    padding: 32px 22px;
+    gap: 28px;
+  }
   .layout,
   .split,
   .file-manager {
@@ -1774,19 +1960,47 @@ td {
     padding: 24px;
   }
 
+  .login-copy {
+    min-height: auto;
+    grid-template-columns: 120px minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    gap: 20px;
+  }
+
+  .login-copy::before {
+    width: 120px;
+    height: 120px;
+  }
+
   .login-copy h1 {
+    grid-column: 1 / -1;
     font-size: 34px;
+    max-width: 100%;
+    overflow-wrap: normal;
+  }
+
+  .login-stats {
+    grid-column: 1 / -1;
+    margin: 0;
   }
 
   .sidebar {
     position: static;
+    width: auto;
     height: auto;
+  }
+
+  .workspace {
+    margin-left: 0;
+    max-width: 100vw;
+    padding: 18px;
   }
 
   nav,
   .admin-head,
   .admin-stats,
   .admin-grid,
+  .node-management-grid,
   .metrics,
   .env-package-panel,
   .framework-grid,

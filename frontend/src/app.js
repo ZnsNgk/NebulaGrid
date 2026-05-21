@@ -6,6 +6,7 @@ const state = {
   page: location.hash.replace("#/", "") || "dashboard",
   taskZone: localStorage.getItem("ng_task_zone") || "wait",
   adminMenu: localStorage.getItem("ng_admin_menu") || "overview",
+  adminNodeEditId: null,
   auditCategory: localStorage.getItem("ng_audit_category") || "all",
   auditPage: 1,
   auditPageSize: Number(localStorage.getItem("ng_audit_page_size") || 20),
@@ -31,6 +32,7 @@ const state = {
   fileTargetPicker: null,
   envPackageInstall: null,
   envPackageDelete: null,
+  fileViewScope: "own",
   data: {
     dashboard: null,
     nodes: [],
@@ -49,6 +51,7 @@ const state = {
     sessions: [],
     adminOnlineUsers: [],
     adminUserSessions: [],
+    nodeOwnerUsers: [],
   },
 };
 
@@ -81,12 +84,15 @@ const errorMessageMap = {
   "student can have at most two supervisors": "每名学生最多只能选择两名导师",
   "supervisor must be mentor user": "所选导师账号无效",
   "mentor can only manage assigned student users": "导师只能管理自己名下的学生",
+  "student file scope requires mentor role": "只有导师可以查看学生文件",
+  "mentor can only view assigned student files": "导师只能查看自己名下学生的文件",
   "mentor can only reset assigned student passwords": "导师只能重置自己名下学生的密码",
   "permission required: admin:login:read": "只有管理员可以查看登录管理",
   "permission required: admin:login:write": "只有管理员可以下线登录设备",
   "session not found": "登录设备不存在或已失效",
   "target already exists": "目标已存在",
   "path not found": "路径不存在",
+  "path is outside assigned student home": "路径超出学生文件目录",
   "path is not a file": "请选择文件",
   "path is not a directory": "请选择目录",
   "parent directory does not exist": "父目录不存在",
@@ -101,6 +107,9 @@ const errorMessageMap = {
   "package name is required": "请选择需要删除的包",
   "package not found": "包不存在，请刷新后重试",
   "protected package cannot be deleted": "环境默认包不能删除",
+  "node name already exists": "节点名称已存在",
+  "node owner not found": "节点所有人不存在，请刷新用户列表后重试",
+  "gpu_count must match gpu_models length": "GPU 数量必须与 GPU 型号列表条数一致",
 };
 
 const roleLabels = {
@@ -111,14 +120,14 @@ const roleLabels = {
 };
 
 const pages = [
-  { id: "dashboard", label: "总览", icon: "OV", permission: "dashboard:read" },
-  { id: "tasks", label: "任务管理", icon: "TM", permission: "tasks:read" },
-  { id: "files", label: "文件管理", icon: "FM", permission: "files:read" },
-  { id: "envs", label: "环境管理", icon: "EM", permission: "envs:read" },
-  { id: "manual", label: "使用手册", icon: "MD" },
-  { id: "account", label: "账号管理", icon: "AC" },
-  { id: "students", label: "学生管理", icon: "ST", roles: ["mentor"], permission: "users:read" },
-  { id: "admin", label: "管理员后台", icon: "AD", roles: ["admin"], permission: "admin:settings:read" },
+  { id: "dashboard", label: "总览", icon: "📊", permission: "dashboard:read" },
+  { id: "tasks", label: "任务管理", icon: "✅", permission: "tasks:read" },
+  { id: "files", label: "文件管理", icon: "📁", permission: "files:read" },
+  { id: "envs", label: "环境管理", icon: "🧪", permission: "envs:read" },
+  { id: "manual", label: "使用手册", icon: "📖" },
+  { id: "account", label: "账号管理", icon: "👤" },
+  { id: "students", label: "学生管理", icon: "🎓", roles: ["mentor"], permission: "users:read" },
+  { id: "admin", label: "管理员后台", icon: "⚙️", roles: ["admin"], permission: "admin:settings:read" },
 ];
 
 const protectedEnvPackageNames = new Set([
@@ -321,7 +330,20 @@ function cleanUserFilters(filters) {
 }
 
 function parseList(value) {
-  return value.split(",").map((item) => item.trim()).filter(Boolean);
+  return value.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean);
+}
+
+function checkedValues(containerId) {
+  return Array.from(document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)).map((input) => input.value);
+}
+
+function uniqueNumbers(values) {
+  const result = [];
+  values.forEach((value) => {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0 && !result.includes(number)) result.push(number);
+  });
+  return result;
 }
 
 async function login(event) {
@@ -367,6 +389,7 @@ async function loadMe() {
   if (!state.token) return;
   const payload = await api("/auth/me", { method: "POST" });
   state.user = payload.data;
+  if (!canViewStudentFiles()) state.fileViewScope = "own";
   ensureVisiblePage();
 }
 
@@ -384,7 +407,7 @@ async function refreshPage() {
       if (can("envs:read")) state.data.envs = (await api("/envs")).data;
     },
     files: async () => {
-      state.data.files = (await api(`/files/list?path=${encodeURIComponent(state.data.files.path || "/")}`)).data;
+      state.data.files = (await api(`/files/list?${fileQuery(state.data.files.path || "/")}`)).data;
       state.data.fileJob = (await api("/files/jobs/latest")).data;
       updateFileJobTimer();
     },
@@ -405,6 +428,9 @@ async function refreshPage() {
     admin: async () => {
       state.data.nodes = (await api("/nodes")).data;
       state.data.users = (await api("/users/list", { method: "POST", body: JSON.stringify(cleanUserFilters(state.userFilters)) })).data;
+      state.data.nodeOwnerUsers = state.adminMenu === "nodes"
+        ? (await api("/users/list", { method: "POST", body: JSON.stringify({}) })).data
+        : state.data.users;
       state.data.mentors = (await api("/users/list", { method: "POST", body: JSON.stringify({ role: "mentor" }) })).data;
       state.data.adminOnlineUsers = (await api("/admin/login-management/online-users", { method: "POST", body: JSON.stringify({}) })).data;
       const loginQuery = cleanObject(state.loginFilters);
@@ -563,12 +589,44 @@ function fileJobIsActive(job) {
   return job && ["pending", "running"].includes(job.state);
 }
 
+function isStudentFileView() {
+  return state.fileViewScope === "students";
+}
+
+function canViewStudentFiles() {
+  return state.user?.role === "mentor";
+}
+
+function fileQuery(path) {
+  const params = new URLSearchParams({ path: path || "/" });
+  if (isStudentFileView()) params.set("scope", "students");
+  return params.toString();
+}
+
+function requireOwnFileViewForWrite() {
+  if (isStudentFileView()) throw new Error("学生文件视图仅支持查看");
+}
+
+function displayFilePath(path) {
+  if (!isStudentFileView()) return path || "/";
+  const currentPath = state.data.files.path || "/";
+  const currentDisplayPath = state.data.files.display_path || currentPath;
+  const normalizedPath = normalizeClientPath(path || "/");
+  const normalizedCurrent = normalizeClientPath(currentPath);
+  if (normalizedPath === normalizedCurrent) return currentDisplayPath;
+  if (normalizedCurrent !== "/" && normalizedPath.startsWith(`${normalizedCurrent}/`)) {
+    return `${currentDisplayPath}${normalizedPath.slice(normalizedCurrent.length)}`;
+  }
+  return normalizedPath;
+}
+
 async function watchCurrentSession() {
   if (!state.user || state.authWatchBusy) return;
   state.authWatchBusy = true;
   try {
     const payload = await api("/auth/me", { method: "POST" });
     state.user = payload.data;
+    if (!canViewStudentFiles()) state.fileViewScope = "own";
   } catch (error) {
     if (!isAuthExpiredMessage(error.message)) {
       console.warn("auth watch failed", error);
@@ -590,16 +648,26 @@ function updateAuthWatchTimer() {
 async function submitNode(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  await api("/admin/nodes", {
-    method: "POST",
-    body: JSON.stringify({
-      name: formValue(form, "name"),
-      ip: formValue(form, "ip"),
-      ssh_user: formValue(form, "ssh_user") || "ddltm",
-      max_speed_mbps: formValue(form, "max_speed_mbps") ? Number(formValue(form, "max_speed_mbps")) : null,
-      gpu_models: parseList(formValue(form, "gpu_models")),
-    }),
+  const formData = new FormData(form);
+  const nodeId = state.adminNodeEditId;
+  const checkedOwnerIds = formData.getAll("owner_user_ids").map((value) => Number(value)).filter(Boolean);
+  const manualOwnerIds = parseList(formValue(form, "owner_user_ids_manual")).map((value) => Number(value)).filter(Boolean);
+  const payload = {
+    name: formValue(form, "name"),
+    ip: formValue(form, "ip"),
+    ssh_user: formValue(form, "ssh_user") || "ddltm",
+    max_speed_mbps: formValue(form, "max_speed_mbps") ? Number(formValue(form, "max_speed_mbps")) : null,
+    gpu_count: Number(formValue(form, "gpu_count") || 0),
+    gpu_models: parseList(formValue(form, "gpu_models")),
+    owner_user_ids: uniqueNumbers([...checkedOwnerIds, ...manualOwnerIds]),
+    access_scope: formValue(form, "access_scope") || "public",
+    sharing_scope: formValue(form, "sharing_scope") || "public",
+  };
+  await api(nodeId ? `/admin/nodes/${nodeId}` : "/admin/nodes", {
+    method: nodeId ? "PUT" : "POST",
+    body: JSON.stringify(payload),
   });
+  state.adminNodeEditId = null;
   form.reset();
   await refreshPage();
 }
@@ -612,6 +680,15 @@ async function reconnectNode(nodeId) {
 async function forceOfflineNode(nodeId) {
   await api(`/admin/nodes/${nodeId}/force-offline`, { method: "POST" });
   await refreshPage();
+}
+
+async function deleteNode(nodeId) {
+  const node = (state.data.nodes || []).find((item) => String(item.id) === String(nodeId));
+  if (!window.confirm(`确认删除节点 ${node?.name || nodeId}？\n该操作会删除节点和 GPU 清单，并清理调度引用。`)) return;
+  await api(`/admin/nodes/${nodeId}`, { method: "DELETE" });
+  if (String(state.adminNodeEditId || "") === String(nodeId)) state.adminNodeEditId = null;
+  await refreshPage();
+  showToast("节点已删除", "success");
 }
 
 async function submitTask(event) {
@@ -824,7 +901,8 @@ async function submitEnvPackageDelete(event) {
   render();
 }
 
-async function openPath(path) {
+async function openPath(path, scope = state.fileViewScope) {
+  state.fileViewScope = scope || "own";
   state.data.files.path = path;
   state.data.preview = null;
   state.data.selectedFilePath = "";
@@ -832,7 +910,7 @@ async function openPath(path) {
 }
 
 async function previewFile(path) {
-  const payload = await api(`/files/preview?path=${encodeURIComponent(path)}`);
+  const payload = await api(`/files/preview?${fileQuery(path)}`);
   state.data.preview = payload.data;
   state.data.selectedFilePath = path;
 }
@@ -847,7 +925,12 @@ async function openParentPath() {
   await openPath(parentPath(state.data.files.path || "/"));
 }
 
+async function toggleStudentFileView() {
+  await openPath("/", isStudentFileView() ? "own" : "students");
+}
+
 async function createFolderFromPrompt() {
+  requireOwnFileViewForWrite();
   const name = prompt("新建文件夹名称");
   if (!name) return;
   await api("/files/mkdir", { method: "POST", body: JSON.stringify({ path: joinPath(state.data.files.path || "/", name) }) });
@@ -855,6 +938,7 @@ async function createFolderFromPrompt() {
 }
 
 async function createFileFromPrompt() {
+  requireOwnFileViewForWrite();
   const name = prompt("新建文件名称");
   if (!name) return;
   const path = joinPath(state.data.files.path || "/", name);
@@ -864,6 +948,7 @@ async function createFileFromPrompt() {
 }
 
 async function renameSelectedPath() {
+  requireOwnFileViewForWrite();
   const source = requireSelectedPath();
   const name = prompt("重命名为", baseName(source));
   if (!name || name === baseName(source)) return;
@@ -874,14 +959,17 @@ async function renameSelectedPath() {
 }
 
 async function copySelectedPath() {
+  requireOwnFileViewForWrite();
   await openFileTargetPicker("copy");
 }
 
 async function moveSelectedPath() {
+  requireOwnFileViewForWrite();
   await openFileTargetPicker("move");
 }
 
 async function archiveSelectedFolder() {
+  requireOwnFileViewForWrite();
   const source = requireSelectedPath();
   const item = currentSelectedFileItem();
   if (item?.type !== "directory") throw new Error("请选择文件夹");
@@ -892,6 +980,7 @@ async function archiveSelectedFolder() {
 }
 
 async function extractSelectedZip() {
+  requireOwnFileViewForWrite();
   const source = requireSelectedPath();
   if (!isSupportedArchivePath(source)) throw new Error("请选择 zip/tar/tar.gz/tar.bz2/tar.xz 压缩包");
   await openFileTargetPicker("extract");
@@ -1001,6 +1090,7 @@ function buildPickedTargetPath(sourcePath, targetFolder, mode, strict = false) {
 }
 
 async function deleteSelectedPath() {
+  requireOwnFileViewForWrite();
   const source = requireSelectedPath();
   if (!confirm(`确认删除 ${source}？`)) return;
   await api(`/files?path=${encodeURIComponent(source)}`, { method: "DELETE" });
@@ -1010,6 +1100,7 @@ async function deleteSelectedPath() {
 }
 
 async function uploadCurrentFile(event) {
+  requireOwnFileViewForWrite();
   event.preventDefault();
   const form = event.currentTarget;
   const file = form.elements.file?.files?.[0];
@@ -1023,6 +1114,7 @@ async function uploadCurrentFile(event) {
 }
 
 async function saveCurrentFile(content) {
+  requireOwnFileViewForWrite();
   const preview = state.data.preview;
   if (!preview?.path || preview.encoding !== "text") throw new Error("当前文件不可保存");
   await api("/files/save", { method: "POST", body: JSON.stringify({ path: preview.path, content }) });
@@ -1032,6 +1124,7 @@ async function saveCurrentFile(content) {
 async function downloadSelectedPath() {
   const source = requireSelectedPath();
   const selectedItem = currentSelectedFileItem();
+  if (isStudentFileView() && selectedItem?.type === "directory") throw new Error("学生文件夹只能进入查看，不能打包下载");
   if (selectedItem?.type === "directory") {
     await archiveSelectedFolder();
     return;
@@ -1040,7 +1133,7 @@ async function downloadSelectedPath() {
 }
 
 async function downloadPath(source) {
-  const response = await fetch(`${state.apiBase.replace(/\/$/, "")}/files/download?path=${encodeURIComponent(source)}`, {
+  const response = await fetch(`${state.apiBase.replace(/\/$/, "")}/files/download?${fileQuery(source)}`, {
     headers: {
       Authorization: `Bearer ${state.token}`,
       "X-NG-Device-Id": state.deviceId,
@@ -1236,9 +1329,10 @@ function switchTaskZone(zone) {
 
 function switchAdminMenu(menu) {
   state.adminMenu = menu;
+  if (menu !== "nodes") state.adminNodeEditId = null;
   localStorage.setItem("ng_admin_menu", menu);
   updateRealtimeTimers();
-  if (menu === "audit") {
+  if (["audit", "nodes"].includes(menu)) {
     run(refreshPage);
     return;
   }
@@ -1403,7 +1497,7 @@ function shell(content) {
     <div class="layout">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-logo">NG</div>
+          <div class="brand-logo app-logo app-logo-sidebar"><img src="./load_page.png" alt="NebulaGrid 标志"></div>
           <div>
             <strong>NebulaGrid</strong>
             <small>天枢 3.0 控制台</small>
@@ -1477,7 +1571,7 @@ function renderDashboard() {
       <div class="panel-head">
         <div>
           <h2>计算节点监控</h2>
-          <span>master 节点不会显示在这里；这里只展示计算节点的实时快照。${state.lastDashboardRefreshAt ? ` 上次刷新：${formatTime(state.lastDashboardRefreshAt)}` : ""}</span>
+          <span>只展示计算节点的实时快照。${state.lastDashboardRefreshAt ? ` 上次刷新：${formatTime(state.lastDashboardRefreshAt)}` : ""}</span>
         </div>
         <label class="refresh-control">刷新间隔
           <input name="dashboard_refresh_seconds" type="number" min="0" max="3600" step="1" value="${state.autoRefreshSeconds}">
@@ -1585,8 +1679,13 @@ function renderTaskZoneTable(tasks) {
 function renderFiles() {
   const files = state.data.files.items || [];
   const currentPath = state.data.files.path || "/";
+  const currentDisplayPath = state.data.files.display_path || currentPath;
   const selected = state.data.selectedFilePath;
   const preview = state.data.preview;
+  const studentView = isStudentFileView();
+  const studentFilesButton = canViewStudentFiles()
+    ? `<button class="secondary ${studentView ? "active" : ""}" data-file-students>${studentView ? "查看我的文件" : "查看学生文件"}</button>`
+    : "";
   return shell(`
     <section class="file-manager">
       <aside class="file-sidebar-panel">
@@ -1594,8 +1693,9 @@ function renderFiles() {
           <button class="secondary" data-file-root>根目录</button>
           <button class="secondary" data-file-up>上级</button>
           <button class="secondary" data-action="refresh">刷新</button>
+          ${studentFilesButton}
         </div>
-        <div class="file-path">${escapeHtml(currentPath)}</div>
+        <div class="file-path">${escapeHtml(currentDisplayPath)}</div>
         <div class="file-list" role="list" data-preserve-scroll="file-list">
           ${files.length ? files.map((item) => `
             <div class="file-row ${selected === item.path ? "active" : ""}" data-select-file="${escapeAttr(item.path)}" data-file-kind="${escapeAttr(item.type)}">
@@ -1606,7 +1706,7 @@ function renderFiles() {
             </div>
           `).join("") : `<div class="file-empty">当前目录为空</div>`}
         </div>
-        <div class="file-actions-grid">
+        ${studentView ? "" : `<div class="file-actions-grid">
           <button class="secondary" data-file-new-folder>新建文件夹</button>
           <button class="secondary" data-file-new-file>新建文件</button>
           <button class="secondary" data-file-rename>重命名</button>
@@ -1615,33 +1715,33 @@ function renderFiles() {
           <button class="secondary" data-file-archive>打包成 zip</button>
           <button class="secondary" data-file-extract>解压压缩包</button>
           <button class="danger" data-file-delete>删除</button>
-        </div>
-        <form id="fileUploadForm" class="file-upload-form">
+        </div>`}
+        ${studentView ? `<div class="file-transfer-row"><button type="button" class="secondary" data-file-download>下载选中</button></div>` : `<form id="fileUploadForm" class="file-upload-form">
           <input name="file" type="file">
           <div class="file-transfer-row">
             <button type="submit">上传到当前目录</button>
             <button type="button" class="secondary" data-file-download>下载选中</button>
           </div>
-        </form>
+        </form>`}
       </aside>
       <section class="file-editor-panel">
         <div class="file-editor-toolbar">
-          <span class="status">${preview?.path ? escapeHtml(preview.path) : "未打开文件"}</span>
-          <button data-file-save ${preview?.encoding === "text" ? "" : "disabled"}>保存</button>
+          <span class="status">${preview?.path ? escapeHtml(displayFilePath(preview.path)) : "未打开文件"}</span>
+          <button data-file-save ${preview?.encoding === "text" && !studentView ? "" : "disabled"}>保存</button>
         </div>
-        ${renderFilePreview(preview)}
+        ${renderFilePreview(preview, studentView)}
         ${renderFileJobProgress(state.data.fileJob)}
       </section>
     </section>
   `);
 }
 
-function renderFilePreview(preview) {
+function renderFilePreview(preview, readOnly = false) {
   if (!preview) {
-    return `<textarea class="file-editor" disabled placeholder="选择左侧文本文件后可在这里预览或编辑"></textarea>`;
+    return `<textarea class="file-editor" disabled placeholder="${readOnly ? "选择左侧文件后可在这里预览" : "选择左侧文本文件后可在这里预览或编辑"}"></textarea>`;
   }
   if (preview.encoding === "text") {
-    return `<div class="file-editor-shell"><textarea id="fileEditor" class="file-editor" spellcheck="false">${escapeHtml(preview.content || "")}</textarea>${preview.truncated ? `<p class="file-note">文件较大，仅显示前 ${formatBytes(preview.content.length)}。</p>` : ""}</div>`;
+    return `<div class="file-editor-shell"><textarea id="fileEditor" class="file-editor" spellcheck="false" ${readOnly ? "readonly" : ""}>${escapeHtml(preview.content || "")}</textarea>${preview.truncated ? `<p class="file-note">文件较大，仅显示前 ${formatBytes(preview.content.length)}。</p>` : ""}</div>`;
   }
   const source = `data:${preview.content_type};base64,${preview.content}`;
   if (preview.content_type.startsWith("image/")) {
@@ -2274,25 +2374,118 @@ function renderAdminOverview({ nodes, users, auditItems }) {
 }
 
 function renderAdminNodes(nodes) {
+  const editingNode = nodes.find((node) => node.id === state.adminNodeEditId) || null;
+  const formTitle = editingNode ? "修改节点" : "新增节点";
+  const selectedOwners = editingNode?.owner_user_ids || [];
+  const gpuModels = (editingNode?.gpus || []).map((gpu) => gpu.model).join("\n");
   return `
-    <section class="panel admin-card">
-      <div class="panel-head"><div><h2>节点管理</h2><span>登记计算节点，重连或下线会写入审计日志。</span></div></div>
-      <form method="post" id="nodeForm" class="form-grid">
-        <label>节点名称<input name="name" placeholder="node-a" required></label>
-        <label>IP 地址<input name="ip" placeholder="192.168.1.21" required></label>
-        <label>SSH 用户<input name="ssh_user" value="ddltm"></label>
-        <label>网络带宽 Mbps<input name="max_speed_mbps" type="number" min="1" placeholder="10000"></label>
-        <label class="wide">GPU 型号列表<input name="gpu_models" placeholder="A100,A100"></label>
-        <div class="form-actions"><button type="submit">登记节点</button></div>
-      </form>
-      ${nodes.length ? renderTable(["节点", "状态", "资源", "操作"], nodes.map((node) => [
-        `<strong>${escapeHtml(node.name)}</strong><br><span class="muted">${escapeHtml(node.ip)}</span>`,
-        `<span class="status ${node.state}">${stateText(node.state)}</span>`,
-        `${(node.gpus || []).length} GPU<br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
-        `<button class="small secondary" data-reconnect-node="${node.id}">重连</button><button class="small danger" data-offline-node="${node.id}">下线</button>`,
-      ])) : renderEmpty("暂无节点")}
+    <section class="node-management-grid">
+      <article class="panel admin-card node-list-card">
+        <div class="panel-head"><div><h2>节点列表</h2><span>所有计算节点集中展示；修改、强制下线、重连和删除都会写入审计日志。</span></div></div>
+        ${nodes.length ? renderTable(["节点", "SSH", "带宽", "GPU", "所有人", "使用权 / 共享", "状态", "操作"], nodes.map((node) => [
+          `<strong>${escapeHtml(node.name)}</strong><br><span class="muted">${escapeHtml(node.ip)}</span>`,
+          escapeHtml(node.ssh_user || "-"),
+          speed(node.max_speed_mbps),
+          `${(node.gpus || []).length} 块<br><span class="muted">${escapeHtml(nodeGpuModelsText(node))}</span>`,
+          escapeHtml(nodeOwnerNames(node)),
+          `${nodeAccessScopeText(node.access_scope)}<br><span class="muted">${nodeSharingScopeText(node.sharing_scope)}</span>`,
+          `<span class="status ${node.state}">${stateText(node.state)}</span><br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
+          `<button class="small secondary" data-edit-node="${node.id}">修改</button><button class="small danger" data-offline-node="${node.id}">强制下线</button><button class="small secondary" data-reconnect-node="${node.id}">重连</button><button class="small danger" data-delete-node="${node.id}">删除</button>`,
+        ])) : renderEmpty("暂无节点")}
+      </article>
+      <article class="panel admin-card node-form-card">
+        <div class="panel-head"><div><h2>${formTitle}</h2><span>GPU 型号请按 nvidia-smi 显示顺序逐行填写，保存时会按该顺序进入数据库。</span></div></div>
+        <form method="post" id="nodeForm" class="form-grid compact-form">
+          <label>节点名称<input name="name" value="${escapeAttr(editingNode?.name || "")}" placeholder="node-a" required></label>
+          <label>IP 地址<input name="ip" value="${escapeAttr(editingNode?.ip || "")}" placeholder="192.168.1.21" required></label>
+          <label>SSH 用户<input name="ssh_user" value="${escapeAttr(editingNode?.ssh_user || "ddltm")}" required></label>
+          <label>与主节点最大连接带宽（Mbps）<input name="max_speed_mbps" type="number" min="1" value="${escapeAttr(editingNode?.max_speed_mbps || "")}" placeholder="10000"></label>
+          <label>GPU 数量<input name="gpu_count" type="number" min="0" max="64" value="${(editingNode?.gpus || []).length}" required></label>
+          <label>使用权<select name="access_scope">${renderSelectOptions([["public", "公开"], ["private", "私有"]], editingNode?.access_scope || "public")}</select></label>
+          <label>共享<select name="sharing_scope">${renderSelectOptions([["none", "不共享"], ["group", "组内共享"], ["public", "公开共享"]], editingNode?.sharing_scope || "public")}</select></label>
+          <label class="full-row">GPU 型号列表<textarea name="gpu_models" placeholder="必须按照nvidia-smi中的显卡顺序填写，一行一个，例如&#10;RTX 4090&#10;Tesla V100&#10;NVIDIA A100">${escapeHtml(gpuModels)}</textarea></label>
+          <div class="full-row">${renderNodeOwnerSelector(selectedOwners)}</div>
+          <div class="form-actions full-row">
+            <button type="submit">${editingNode ? "提交修改" : "提交新增"}</button>
+            ${editingNode ? `<button type="button" class="secondary" data-cancel-node-edit>取消修改</button>` : ""}
+          </div>
+        </form>
+      </article>
     </section>
   `;
+}
+
+function renderNodeOwnerSelector(selectedIds = []) {
+  const users = nodeOwnerCandidates();
+  const selected = new Set(selectedIds.map((id) => String(id)));
+  const summary = selected.size ? `已选择 ${selected.size} 人` : "未选择所有人";
+  return `
+    <div class="node-owner-picker">
+      <div class="node-owner-head">
+        <span>所有人</span>
+        <strong data-owner-summary>${summary}</strong>
+      </div>
+      <div class="owner-search-row">
+        <input type="search" data-owner-search placeholder="搜索统一识别码 / 用户名 / 姓名">
+        <button type="button" class="secondary" data-owner-search-button>搜索</button>
+      </div>
+      <input name="owner_user_ids_manual" value="${escapeAttr(selectedIds.join(","))}" placeholder="也可直接填写所有人 ID，如 1001,1002">
+      <div id="nodeOwnerOptions" class="multi-select-options">
+        ${users.length ? users.map((user) => `
+          <label class="check" data-owner-option="${escapeAttr(`${user.id} ${user.username} ${user.real_name}`.toLowerCase())}">
+            <input type="checkbox" name="owner_user_ids" value="${user.id}" ${selected.has(String(user.id)) ? "checked" : ""}>
+            <span>#${user.id} ${escapeHtml(user.real_name)}（${escapeHtml(user.username)}，${roleName(user.role)}）</span>
+          </label>
+        `).join("") : `<div class="empty compact-empty">暂无可选用户，请刷新后台数据</div>`}
+      </div>
+    </div>
+  `;
+}
+
+function nodeOwnerCandidates() {
+  return (state.data.nodeOwnerUsers || []).length ? state.data.nodeOwnerUsers : (state.data.users || []);
+}
+
+function filterNodeOwnerOptions(keyword) {
+  const text = String(keyword || "").trim().toLowerCase();
+  document.querySelectorAll("[data-owner-option]").forEach((item) => {
+    item.hidden = text ? !item.dataset.ownerOption.includes(text) : false;
+  });
+}
+
+function searchNodeOwners() {
+  filterNodeOwnerOptions(document.querySelector("[data-owner-search]")?.value || "");
+}
+
+function updateNodeOwnerSummary() {
+  const manualIds = parseList(document.querySelector("[name='owner_user_ids_manual']")?.value || "");
+  const count = uniqueNumbers([...checkedValues("nodeOwnerOptions"), ...manualIds]).length;
+  const summary = document.querySelector("[data-owner-summary]");
+  if (summary) summary.textContent = count ? `已选择 ${count} 人` : "未选择所有人";
+}
+
+function nodeOwnerNames(node) {
+  const ids = node.owner_user_ids || [];
+  if (!ids.length) return "未指定";
+  const users = nodeOwnerCandidates();
+  return ids.map((id) => {
+    const user = users.find((item) => String(item.id) === String(id));
+    return user ? `${user.real_name}(${user.username})` : `#${id}`;
+  }).join("，");
+}
+
+function nodeGpuModelsText(node) {
+  const models = (node.gpus || []).map((gpu) => gpu.model).filter(Boolean);
+  return models.length ? models.join("，") : "-";
+}
+
+function nodeAccessScopeText(value) {
+  return value === "private" ? "私有" : "公开";
+}
+
+function nodeSharingScopeText(value) {
+  const map = { none: "不共享", group: "组内共享", public: "公开共享" };
+  return map[value] || "公开共享";
 }
 
 function renderAdminUsers(users) {
@@ -2869,7 +3062,7 @@ function restorePreservedScrollPositions(positions) {
 
 function bindEvents() {
   document.querySelector("#loginForm")?.addEventListener("submit", (event) => run(() => login(event), "登录成功"));
-  document.querySelector("#nodeForm")?.addEventListener("submit", (event) => run(() => submitNode(event), "节点已登记"));
+  document.querySelector("#nodeForm")?.addEventListener("submit", (event) => run(() => submitNode(event), "节点已保存"));
   document.querySelector("#taskForm")?.addEventListener("submit", (event) => run(() => submitTask(event), "任务已提交"));
   document.querySelector("#profileForm")?.addEventListener("submit", (event) => run(() => submitProfile(event), "资料已保存"));
   document.querySelector("#passwordForm")?.addEventListener("submit", (event) => run(() => changePassword(event), "密码已更新"));
@@ -2888,6 +3081,7 @@ function bindEvents() {
   document.querySelector("#fileUploadForm")?.addEventListener("submit", (event) => run(() => uploadCurrentFile(event), "文件已上传"));
   document.querySelector("[data-file-root]")?.addEventListener("click", () => run(() => openPath("/")));
   document.querySelector("[data-file-up]")?.addEventListener("click", () => run(openParentPath));
+  document.querySelector("[data-file-students]")?.addEventListener("click", () => run(toggleStudentFileView));
   document.querySelector("[data-file-new-folder]")?.addEventListener("click", () => run(createFolderFromPrompt, "文件夹已创建"));
   document.querySelector("[data-file-new-file]")?.addEventListener("click", () => run(createFileFromPrompt, "文件已创建"));
   document.querySelector("[data-file-rename]")?.addEventListener("click", () => run(renameSelectedPath, "已重命名"));
@@ -2993,6 +3187,23 @@ function bindEvents() {
   bindSessionEvents();
   document.querySelectorAll("[data-reconnect-node]").forEach((button) => button.addEventListener("click", () => run(() => reconnectNode(button.dataset.reconnectNode), "已提交重连")));
   document.querySelectorAll("[data-offline-node]").forEach((button) => button.addEventListener("click", () => run(() => forceOfflineNode(button.dataset.offlineNode), "已强制下线")));
+  document.querySelectorAll("[data-edit-node]").forEach((button) => button.addEventListener("click", () => {
+    state.adminNodeEditId = Number(button.dataset.editNode);
+    render();
+  }));
+  document.querySelectorAll("[data-delete-node]").forEach((button) => button.addEventListener("click", () => run(() => deleteNode(button.dataset.deleteNode))));
+  document.querySelector("[data-cancel-node-edit]")?.addEventListener("click", () => {
+    state.adminNodeEditId = null;
+    render();
+  });
+  document.querySelector("[data-owner-search-button]")?.addEventListener("click", searchNodeOwners);
+  document.querySelector("[data-owner-search]")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    searchNodeOwners();
+  });
+  document.querySelectorAll("#nodeOwnerOptions input[type='checkbox']").forEach((input) => input.addEventListener("change", updateNodeOwnerSummary));
+  document.querySelector("[name='owner_user_ids_manual']")?.addEventListener("input", updateNodeOwnerSummary);
 }
 
 function bindAdminLoginEvents() {
