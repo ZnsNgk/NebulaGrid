@@ -1534,13 +1534,19 @@ function renderLogin() {
   return `
     <main class="login-page">
       <section class="login-copy">
-        <p>NebulaGrid 3.0</p>
-        <h1>面向实验室多机多卡的任务调度与资源管理</h1>
-        <div class="login-stats">
-          <span>节点监控</span>
-          <span>任务队列</span>
-          <span>文件工作区</span>
-          <span>环境维护</span>
+        <div class="login-mark" aria-hidden="true">
+          <img src="./load_page.png" alt="">
+        </div>
+        <div class="login-copy-text">
+          <p>NebulaGrid 3.0</p>
+          <h1>天枢 3.0</h1>
+          <h2>多GPU集群任务管理调度与资源管理平台</h2>
+          <div class="login-stats">
+            <span>节点监控</span>
+            <span>任务队列</span>
+            <span>文件工作区</span>
+            <span>环境维护</span>
+          </div>
         </div>
       </section>
       <section class="login-card">
