@@ -1811,7 +1811,7 @@ function renderNodeCard(node) {
           <h3>${escapeHtml(node.name)}</h3>
           <p>可用带宽 ${bandwidth} · ${gpus.length} GPUs</p>
         </div>
-        <span class="status ${node.state}">${stateText(node.state)}</span>
+        <span class="status ${node.state}">${nodeStateText(node.state)}</span>
       </div>
       <div class="node-stats">
         ${miniMetric("CPU", percent(node.cpu_usage))}
@@ -1891,7 +1891,7 @@ function renderTaskZoneTable(tasks) {
     const selected = state.selectedTaskId === task.task_id;
     const cells = [
       `<input type="radio" name="task_selection" value="${escapeAttr(task.task_id)}" ${selected ? "checked" : ""} data-select-task="${escapeAttr(task.task_id)}">`,
-      `<span class="status ${task.state}">${stateText(task.state)}</span>`,
+      `<span class="status ${task.state}">${taskStateText(task.state)}</span>`,
       `<strong>${escapeHtml(task.task_id)}</strong>${task.description ? `<br><span class="muted">${escapeHtml(task.description)}</span>` : ""}`,
       escapeHtml(task.env_name || "-"),
       `<code>${escapeHtml(task.workdir || "/")}</code>`,
@@ -2057,7 +2057,7 @@ function renderTaskGpuTypeOptions(nodeId = "", selectedTypes = []) {
 
 function renderTaskPredecessorOptions(selectedId = "") {
   return (state.taskPredecessorOptions || [])
-    .map((task) => `<option value="${escapeAttr(task.task_id)}" ${String(selectedId || "") === String(task.task_id) ? "selected" : ""}>${escapeHtml(task.task_id)} · ${escapeHtml(task.description || stateText(task.state))}</option>`)
+    .map((task) => `<option value="${escapeAttr(task.task_id)}" ${String(selectedId || "") === String(task.task_id) ? "selected" : ""}>${escapeHtml(task.task_id)} · ${escapeHtml(task.description || taskStateText(task.state))}</option>`)
     .join("");
 }
 
@@ -2156,7 +2156,7 @@ function renderFileJobProgress(job) {
     <div class="file-job-progress ${job.state}" id="fileJobProgress">
       <div class="file-job-line">
         <strong>${title}：${escapeHtml(job.source_path)}</strong>
-        <span>${stateText(job.state)} · ${progress}%</span>
+        <span>${fileJobStateText(job.state)} · ${progress}%</span>
       </div>
       <div class="file-job-bar"><i style="width:${progress}%"></i></div>
       <div class="file-job-detail">
@@ -2242,7 +2242,7 @@ function renderEnvs() {
       ${envs.length ? renderTable(["名称", "来源", "状态", "路径", "版本", "操作"], envs.map((env) => [
         renderEnvName(env),
         escapeHtml(envSourceText(env.source_type)),
-        `<span class="status ${env.state}">${stateText(env.state)}</span>`,
+        `<span class="status ${env.state}">${envStateText(env.state)}</span>`,
         `<code>${escapeHtml(env.path)}</code>`,
         escapeHtml(env.python_version || "-"),
         renderEnvActions(env),
@@ -2634,7 +2634,7 @@ function renderAccount() {
           <dt>姓名</dt><dd>${escapeHtml(state.user?.real_name || "-")}</dd>
           <dt>用户名</dt><dd>${escapeHtml(state.user?.username || "-")}</dd>
           <dt>角色</dt><dd>${roleName(state.user?.role)}</dd>
-          <dt>状态</dt><dd>${stateText(state.user?.state || "enabled")}</dd>
+          <dt>状态</dt><dd>${userStateText(state.user?.state || "enabled")}</dd>
           <dt>SSH 账户</dt><dd><code>${escapeHtml(accountNameForUser(state.user))}</code></dd>
         </dl>
       </article>
@@ -2796,7 +2796,7 @@ function renderAdminNodes(nodes) {
           `${(node.gpus || []).length} 块<br><span class="muted">${escapeHtml(nodeGpuModelsText(node))}</span>`,
           escapeHtml(nodeOwnerNames(node)),
           `${nodeAccessScopeText(node.access_scope)}<br><span class="muted">${nodeSharingScopeText(node.sharing_scope)}</span>`,
-          `<span class="status ${node.state}">${stateText(node.state)}</span><br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
+          `<span class="status ${node.state}">${nodeStateText(node.state)}</span><br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
           `<button class="small secondary" data-edit-node="${node.id}">修改</button><button class="small danger" data-offline-node="${node.id}">强制下线</button><button class="small secondary" data-reconnect-node="${node.id}">重连</button><button class="small danger" data-delete-node="${node.id}">删除</button>`,
         ])) : renderEmpty("暂无节点")}
       </article>
@@ -2972,7 +2972,7 @@ function renderAdminOnlineUsersBlock(onlineUsers = []) {
 
 function renderOnlineUsersTable(onlineUsers) {
   return renderTable(["用户", "角色", "在线设备", "IP / 设备", "最后活跃", "操作"], onlineUsers.map((user) => [
-    `<strong>#${escapeHtml(user.id)} ${escapeHtml(user.real_name)}</strong><br><span class="muted">${escapeHtml(user.username)} · ${stateText(user.state)}</span>`,
+    `<strong>#${escapeHtml(user.id)} ${escapeHtml(user.real_name)}</strong><br><span class="muted">${escapeHtml(user.username)} · ${userStateText(user.state)}</span>`,
     roleName(user.role),
     `${escapeHtml(user.online_sessions || 0)} 台`,
     `<span class="muted">IP：${escapeHtml((user.login_ips || []).join("、") || "-")}</span><br><span class="muted">设备：${escapeHtml((user.login_devices || []).join("、") || "-")}</span>`,
@@ -2988,7 +2988,7 @@ function renderAdminUserSessions(items = []) {
   if (!items.length) return renderEmpty("未找到匹配用户或该用户暂无登录记录");
   return items.map((item) => `
     <section class="sub-panel">
-      <div class="panel-head compact"><div><h3>#${escapeHtml(item.id)} ${escapeHtml(item.real_name)}</h3><span>${escapeHtml(item.username)} · ${roleName(item.role)} · ${stateText(item.state)}</span></div></div>
+      <div class="panel-head compact"><div><h3>#${escapeHtml(item.id)} ${escapeHtml(item.real_name)}</h3><span>${escapeHtml(item.username)} · ${roleName(item.role)} · ${userStateText(item.state)}</span></div></div>
       ${(item.sessions || []).length ? renderAdminSessionTable(item.sessions) : renderEmpty("该用户暂无登录记录")}
     </section>
   `).join("");
@@ -3000,8 +3000,8 @@ function renderAdminSessionTable(sessions) {
     escapeHtml(session.login_ip || "-"),
     formatDate(session.login_time),
     formatDate(session.last_seen_at),
-    `<span class="status ${session.state === "online" ? "online" : "offline"}">${session.current ? "当前会话 · " : ""}${stateText(session.state)}</span>`,
-    session.state === "online" ? `<button class="small danger" data-admin-offline-session="${session.id}">下线</button>` : "-",
+    `<span class="status ${sessionStatusClass(session)}">${session.current ? "当前会话 · " : ""}${sessionStateText(session)}</span>`,
+    session.session_state === "online" ? `<button class="small danger" data-admin-offline-session="${session.id}">下线</button>` : "-",
   ]));
 }
 
@@ -3129,7 +3129,7 @@ function renderUserTable(users) {
       `<strong>#${escapeHtml(user.id)}</strong>`,
       `<strong>${escapeHtml(user.real_name)}</strong><br><span class="muted">${escapeHtml(user.username)}</span>`,
       roleName(user.role),
-      stateText(user.state),
+      userStateText(user.state),
       supervisorText,
       `<code>${escapeHtml(user.linux_account_name || "-")}</code>`,
       `<code>${escapeHtml(user.home_path || "-")}</code>`,
@@ -3145,8 +3145,8 @@ function renderSessionTable(sessions) {
     escapeHtml(session.login_ip || "-"),
     formatDate(session.login_time),
     formatDate(session.last_seen_at),
-    `<span class="status ${session.state === "online" ? "online" : "offline"}">${session.current ? "当前会话 · " : ""}${stateText(session.state)}</span>`,
-    session.state === "online" ? `<button class="small danger" data-offline-session="${session.id}">下线</button>` : "-",
+    `<span class="status ${sessionStatusClass(session)}">${session.current ? "当前会话 · " : ""}${sessionStateText(session)}</span>`,
+    session.session_state === "online" ? `<button class="small danger" data-offline-session="${session.id}">下线</button>` : "-",
   ]));
 }
 
@@ -3349,38 +3349,89 @@ function renderAdminStat(label, value) {
   return `<article><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></article>`;
 }
 
-function stateText(value) {
-  const map = {
-    online: "在线",
-    offline: "离线",
-    manual_offline: "手动下线",
-    reconnecting: "重连中",
-    wait: "等待",
-    on_hold: "挂起",
-    running: "运行中",
-    succeeded: "完成",
-    failed: "失败",
-    cancelled: "已取消",
-    alloc_error: "调度错误",
-    dependency_failed: "依赖失败",
-    offline: "节点掉线",
-    offline_error: "节点掉线",
-    node_lost: "节点丢失",
-    preparing: "准备中",
-    dispatching: "派发中",
-    available: "可用",
-    registered: "已登记",
-    copying: "复制中",
-    importing: "导入中",
-    fixing: "修复中",
-    testing: "测试中",
-    error: "错误",
-    enabled: "启用",
-    disabled: "停用",
-    pending: "等待中",
-    detected: "自动发现",
-  };
+const nodeStateLabels = {
+  online: "在线",
+  offline: "离线",
+  manual_offline: "手动下线",
+  reconnecting: "重连中",
+  node_lost: "节点丢失",
+};
+
+const taskStateLabels = {
+  wait: "等待",
+  on_hold: "挂起",
+  preparing: "准备中",
+  dispatching: "派发中",
+  running: "运行中",
+  succeeded: "完成",
+  failed: "失败",
+  cancelled: "已取消",
+  alloc_error: "调度错误",
+  dependency_failed: "依赖失败",
+  offline: "节点掉线",
+  offline_error: "节点掉线",
+  node_lost: "节点丢失",
+};
+
+const envStateLabels = {
+  available: "可用",
+  registered: "已登记",
+  copying: "复制中",
+  importing: "导入中",
+  fixing: "修复中",
+  testing: "测试中",
+  detected: "自动发现",
+  error: "错误",
+};
+
+const userStateLabels = {
+  enabled: "启用",
+  disabled: "停用",
+};
+
+const loginSessionStateLabels = {
+  online: "在线",
+  offline: "已下线",
+};
+
+const fileJobStateLabels = {
+  pending: "等待中",
+  running: "运行中",
+  succeeded: "完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+function labelFrom(map, value) {
   return map[value] || value || "-";
+}
+
+function nodeStateText(value) {
+  return labelFrom(nodeStateLabels, value);
+}
+
+function taskStateText(value) {
+  return labelFrom(taskStateLabels, value);
+}
+
+function envStateText(value) {
+  return labelFrom(envStateLabels, value);
+}
+
+function userStateText(value) {
+  return labelFrom(userStateLabels, value);
+}
+
+function fileJobStateText(value) {
+  return labelFrom(fileJobStateLabels, value);
+}
+
+function sessionStateText(session) {
+  return session?.status_label || labelFrom(loginSessionStateLabels, session?.session_state);
+}
+
+function sessionStatusClass(session) {
+  return session?.status_category || (session?.session_state === "online" ? "online" : "offline");
 }
 
 function percent(value) {

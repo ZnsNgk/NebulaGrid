@@ -306,7 +306,8 @@ nebulagrid/
 | revoked_at              | 用户或管理员手动下线时间。                                                  |
 | current_client          | 当前有效会话数量。                                                          |
 | online_ip/online_device | 当前在线会话对应的 IP 与设备。                                              |
-| state                   | online/offline，由有效会话和心跳推断，不应只依赖前端主动退出。              |
+| session_state           | 登录会话专用状态，取值为 online/offline，由有效会话和心跳推断；API 不再返回通用 `state` 字段，避免与用户、节点和任务状态混用。 |
+| status_label/status_category | 登录会话专用展示字段，前端直接用于登录设备状态标签；`offline` 在这里表示“已下线”，不是“节点掉线”。 |
 
 # 5. 功能性需求
 
@@ -551,6 +552,11 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | Auth      | POST /api/auth/login                                  | 登录，支持 username/id/real_name + password。                             | 匿名                             |
 | Auth      | POST /api/auth/logout                                 | 退出当前会话。                                                            | 登录用户                         |
 | Auth      | GET /api/auth/me                                      | 获取当前用户资料、角色和权限。                                            | 登录用户                         |
+| Auth      | POST /api/auth/sessions/list                          | 获取当前用户登录设备列表；会话状态使用 `session_state/status_label/status_category`，不使用通用 `state`。 | 登录用户                         |
+| Auth      | POST /api/auth/sessions/offline                       | 手动下线当前用户指定登录设备。                                            | 登录用户                         |
+| Admin     | POST /api/admin/login-management/online-users          | 获取当前在线用户摘要；用户启停状态仍使用用户对象的 `state`。                | 管理员                           |
+| Admin     | POST /api/admin/login-management/user-sessions         | 查询指定用户登录设备；会话状态使用 `session_state/status_label/status_category`。 | 管理员                           |
+| Admin     | POST /api/admin/login-management/offline-session       | 管理员下线任意用户指定登录设备。                                          | 管理员                           |
 | Dashboard | GET /api/dashboard/summary                            | 获取节点、GPU、任务统计。                                                 | 所有角色，展示者脱敏             |
 | Nodes     | GET /api/nodes                                        | 节点列表，按角色过滤字段。                                                | 登录用户                         |
 | Nodes     | POST /api/admin/nodes                                 | 新增节点。                                                                | 管理员                           |

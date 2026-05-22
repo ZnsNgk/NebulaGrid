@@ -537,6 +537,9 @@ def build_session_info(session: LoginSessionRecord, current_token: str | None = 
     logout_time = session.logout_time
     if not active and logout_time is None and session.revoked_at is None:
         logout_time = session.last_seen_at
+    # 登录会话的 offline 只表示该浏览器会话不可用，不能复用节点状态里的“节点掉线”文案。
+    status_label = "在线" if active else "已下线"
+    status_category = "online" if active else "offline"
     return LoginSessionInfo(
         id=session.id,
         login_ip=session.login_ip,
@@ -546,7 +549,9 @@ def build_session_info(session: LoginSessionRecord, current_token: str | None = 
         last_seen_at=session.last_seen_at,
         logout_time=logout_time,
         revoked_at=session.revoked_at,
-        state="online" if active else "offline",
+        session_state="online" if active else "offline",
+        status_label=status_label,
+        status_category=status_category,
         current=current_hash == session.token_hash,
     )
 

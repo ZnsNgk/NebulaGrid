@@ -59,7 +59,10 @@ class LoginSessionInfo(BaseModel):
     last_seen_at: str
     logout_time: str | None = None
     revoked_at: str | None = None
-    state: str
+    # 登录会话状态使用专用字段名，避免和用户、节点、任务等业务对象的 state 混用。
+    session_state: str
+    status_label: str
+    status_category: str
     current: bool = False
 
 class AdminLoginSessionQuery(BaseModel):
@@ -105,4 +108,3 @@ class AdminUserLoginSessions(BaseModel):
     role: str
     state: str
     sessions: list[LoginSessionInfo] = Field(default_factory=list)
-

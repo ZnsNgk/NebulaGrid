@@ -354,6 +354,8 @@ erDiagram
 
 登录设备与在线状态已经持久化到 PostgreSQL。数据库只保存 token 摘要，不保存原始登录令牌；在线状态由 `last_seen_at`、`logout_at`、`revoked_at` 和后端会话过期窗口共同推断。
 
+登录会话 API 的状态字段必须与其他业务对象分开：登录设备列表返回 `session_state`、`status_label` 和 `status_category`，不返回通用 `state`。这样 `offline` 在登录会话中只表示“已下线”，不会和任务/节点状态里的“节点掉线”混用。
+
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | id | bigint / uuid | 会话流水主键 |
@@ -650,6 +652,16 @@ API Router
 | POST | /api/auth/logout | 退出 |
 | GET | /api/auth/me | 当前用户 |
 | POST | /api/auth/change-password | 修改密码 |
+| POST | /api/auth/sessions/list | 当前用户登录设备列表，状态字段为 `session_state/status_label/status_category` |
+| POST | /api/auth/sessions/offline | 下线当前用户指定登录设备 |
+
+#### Admin Login Management
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | /api/admin/login-management/online-users | 当前在线用户摘要；用户启停状态仍使用用户对象的 `state` |
+| POST | /api/admin/login-management/user-sessions | 查询用户登录设备列表，状态字段为 `session_state/status_label/status_category` |
+| POST | /api/admin/login-management/offline-session | 管理员下线指定登录设备 |
 
 #### Tasks
 

@@ -117,6 +117,29 @@ def login_as_admin(client: TestClient) -> str:
     return response.json()["data"]["access_token"]
 
 
+def test_login_session_status_has_dedicated_display_fields() -> None:
+    """验证登录会话状态返回独立展示字段，避免前端把 offline 误显示成节点掉线。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    list_response = client.post("/api/auth/sessions/list", headers=headers)
+    session = list_response.json()["data"][0]
+    offline_response = client.post("/api/auth/sessions/offline", headers=headers, json={"session_id": session["id"]})
+    offline_session = offline_response.json()["data"]
+
+    assert list_response.status_code == 200
+    assert "state" not in session
+    assert session["session_state"] == "online"
+    assert session["status_label"] == "在线"
+    assert session["status_category"] == "online"
+    assert offline_response.status_code == 200
+    assert "state" not in offline_session
+    assert offline_session["session_state"] == "offline"
+    assert offline_session["status_label"] == "已下线"
+    assert offline_session["status_category"] == "offline"
+
+
 def test_envs_are_globally_usable_but_owner_modified() -> None:
     """验证环境可被所有用户选择使用，但包安装和删除等修改动作只允许环境所有者执行。"""
     client = make_client()
