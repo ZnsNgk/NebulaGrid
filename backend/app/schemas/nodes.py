@@ -8,6 +8,7 @@ class GpuInfo(BaseModel):
 
     id: int
     gpu_index: int
+    gpu_uuid: str = ""
     model: str
     total_vram_mb: int
     schedulable: bool = True

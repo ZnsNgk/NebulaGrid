@@ -96,6 +96,41 @@ def migrate_existing_schema() -> None:
             )
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_nodes_access_scope ON nodes (access_scope)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_nodes_sharing_scope ON nodes (sharing_scope)"))
+        if "gpus" in tables:
+            ensure_columns(
+                connection,
+                "gpus",
+                {
+                    # Runtime Guard 以 GPU UUID 作为长期稳定标识，避免节点重启后 index 漂移造成误判。
+                    "gpu_uuid": "VARCHAR(128) DEFAULT ''",
+                },
+            )
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_gpus_gpu_uuid ON gpus (gpu_uuid)"))
+        if "tasks" in tables:
+            ensure_columns(
+                connection,
+                "tasks",
+                {
+                    # 任务调度从原型内存列表切换到数据库后，需要把执行命令、阻塞原因、
+                    # 日志路径和返回码都留在主表，避免 worker 重启后丢失运行上下文。
+                    "generated_command": "TEXT DEFAULT ''",
+                    "urgent": "BOOLEAN DEFAULT false",
+                    "last_block_reason": "VARCHAR(512) DEFAULT ''",
+                    "log_path": "VARCHAR(1024) DEFAULT ''",
+                    "return_code": "INTEGER",
+                },
+            )
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_urgent ON tasks (urgent)"))
+        if "env_install_jobs" in tables:
+            ensure_columns(
+                connection,
+                "env_install_jobs",
+                {
+                    # worker 需要从数据库恢复待执行安装命令，避免 API 请求同步阻塞和进程重启丢任务。
+                    "command": "TEXT DEFAULT ''",
+                    "workdir": "VARCHAR(1024) DEFAULT ''",
+                },
+            )
 
 
 def ensure_columns(connection, table_name: str, columns: dict[str, str]) -> None:
@@ -142,6 +177,8 @@ def seed_defaults(db: Session) -> None:
             admin.linux_account_name = settings.main_linux_user
     for key, value in {
         "scheduler.enabled": "true",
+        "scheduler.instance_lock": "locked-by-row-transaction",
+        "scheduler.interval_seconds": "5",
         "monitor.enabled": "true",
         "uploads.max_size_mb": "20480",
     }.items():

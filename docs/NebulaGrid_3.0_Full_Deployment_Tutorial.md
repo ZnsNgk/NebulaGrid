@@ -2,7 +2,7 @@
 
 本文是一份从零开始的部署教程，目标是让没有接触过 NebulaGrid 的同学也能把系统跑起来。教程覆盖主节点、计算节点、NFS、PostgreSQL、InfluxDB、Redis、Miniconda base 环境、后端依赖、数据库初始化、systemd 服务、Nginx、前端页面和基础验证。
 
-> 重要说明：当前仓库已经具备 API、前端测试控制台、数据库表结构、真实节点监控 worker 和远端监控脚本。调度器、执行器和环境安装 worker 的真实硬件闭环仍需继续接入 SSH 执行和数据库 CRUD。本教程用于部署当前代码并开始联调真实机器。
+> 重要说明：当前仓库已经具备 API、前端控制台、数据库表结构、任务数据库 CRUD、调度器 allocation 事务、任务执行 worker、真实节点监控 worker 和远端监控/任务 runner 脚本。调度器与执行器仍需要在真实 GPU 节点上完成 SSH、NFS、conda 环境和日志回收联调；环境安装 worker 的真实包安装闭环仍需继续完善。本教程用于部署当前代码并开始联调真实机器。
 
 ## 0. 部署拓扑
 
@@ -482,6 +482,13 @@ env $(cat /etc/nebulagrid/backend.env | xargs) \
 ```bash
 env $(cat /etc/nebulagrid/backend.env | xargs) \
   /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py --all-db-nodes --dry-run
+```
+
+同步完成后运行只读部署自检。该脚本会检查本机共享目录、远端脚本文件、数据库中的计算节点、SSH、NFS 路径、主账户身份和 `nvidia-smi`，不会创建、删除或修改本机和计算节点文件：
+
+```bash
+env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/deployment_self_check.py
 ```
 
 在计算节点上验证：
@@ -1133,6 +1140,7 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 - PostgreSQL 中能看到 NebulaGrid 数据表。
 - PostgreSQL 中能看到 `file_jobs` 表；打包/解压后 `/api/files/jobs/latest` 能返回最近任务状态。
 - PostgreSQL 中能看到 `envs` 表；环境导入、复制、检测和删除后状态与真实目录一致。
+- PostgreSQL 中能看到 `tasks`、`task_allocations`、`task_events`、`task_runtime_guards` 和 `env_install_jobs` 表；任务提交、调度、日志读取和环境安装作业状态都能落库。
 - `/home/ddltm/data/logs/env_install_logs/` 中能看到单环境 JSON Lines 日志文件，数据库 `env_operation_logs` 中能看到同源结构化日志。
 - InfluxDB 中能查询到 `node_metrics` / `gpu_metrics` 监控点。
 - systemd 中 API 和 worker 服务为 running。
@@ -1141,9 +1149,9 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 
 当前代码适合部署后开始真实机器联调。以下能力还需要继续开发完善：
 
-- 任务服务从内存仓库完全切换到数据库 CRUD。
-- 调度器执行真实 GPU 选择和 allocation 事务。
-- 执行器通过 SSH 调用远端 runner 启动任务。
-- runtime guard 检查实际 PID/GPU 使用并处理 `alloc_error`。
-- env install worker 执行真实包安装、manifest 和状态更新；环境导入、复制、检测、删除和单环境日志已经接入 API。
+- 任务服务已切换到数据库 CRUD，并支持任务可见性、批量提交、修改、挂起、删除后继确认、中止、重新提交、日志读取和历史区默认 100 条加载。
+- 调度器已执行真实 GPU 选择和 allocation 事务：紧急任务优先，校验前驱任务、节点可见性、GPU 数量、GPU 型号和 GPU 复用策略，并写入任务事件与运行时守护记录。
+- 执行器已通过 SSH 调用远端 runner 启动任务，记录 PID/PGID、读取状态文件、归档返回码并释放 allocation；仍需在真实节点验证 SSH key、NFS 路径、conda 激活和中止回收。
+- runtime guard 已按远端 PID 树和 GPU UUID 检查实际 PID/GPU 使用并处理 `alloc_error`；仍需在真实多进程训练和节点异常场景下压测。
+- env install worker 已从 `env_install_jobs` 领取本机和 compile 安装作业，执行受控安装命令并写回返回码、包状态和环境日志；上传文件真实落盘、sha256 校验、运行中安装取消和资源隔离仍需继续完善。
 - Alembic 数据库迁移；当前初始化使用 ORM `create_all`，适合 MVP 部署和测试。

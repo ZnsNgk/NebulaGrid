@@ -655,15 +655,23 @@ API Router
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | /api/tasks | 查询任务列表，支持分页/筛选 |
-| POST | /api/tasks | 提交任务 |
+| GET | /api/tasks | 查询任务列表，支持等待区、执行区、历史区、分页、搜索和 `all_history=true` |
+| POST | /api/tasks | 提交单个任务 |
+| POST | /api/tasks/batch | 批量提交任务；一行一个命令，空行和 `#` 注释会被忽略 |
+| GET | /api/tasks/events | 当前用户可见任务变化 SSE 流，前端收到事件后轻量刷新当前任务区 |
 | GET | /api/tasks/{task_id} | 查看任务详情 |
-| POST | /api/tasks/{task_id}/hold | 挂起任务 |
-| POST | /api/tasks/{task_id}/resume | 取消挂起 |
-| POST | /api/tasks/{task_id}/stop | 停止任务 |
-| DELETE | /api/tasks/{task_id} | 删除等待任务或隐藏历史任务 |
-| GET | /api/tasks/{task_id}/events | 任务事件流 |
-| GET | /api/tasks/{task_id}/allocations | 分配详情 |
+| PATCH | /api/tasks/{task_id} | 修改等待、挂起或历史任务；历史任务修改后重新进入等待/挂起区 |
+| POST | /api/tasks/{task_id}/hold | 挂起/取消挂起任务 |
+| POST | /api/tasks/{task_id}/cancel | 中止任务 |
+| POST | /api/tasks/{task_id}/resubmit | 重新提交任务，生成新的毫秒时间戳任务 ID |
+| GET | /api/tasks/{task_id}/delete-preview | 删除前返回所有后继任务 ID |
+| DELETE | /api/tasks/{task_id}?delete_successors=true/false | 删除等待或历史任务，可选择递归删除后继任务 |
+| GET | /api/tasks/{task_id}/log | 查看任务日志 tail |
+| GET | /api/tasks/{task_id}/log/events | 任务日志增量 SSE，首次连接默认从尾部读取一小段 |
+| GET | /api/tasks/{task_id}/log/download | 返回完整任务日志文本 |
+| GET | /api/tasks/{task_id}/guard | 查看运行时守护摘要 |
+| GET | /api/tasks/{task_id}/events | 任务事件流，后续可从 `task_events` 分页读取 |
+| GET | /api/tasks/{task_id}/allocations | 分配详情，后续可从 `task_allocations` 分页读取 |
 
 #### Nodes
 
@@ -683,18 +691,23 @@ API Router
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | /api/envs | 环境列表 |
+| GET | /api/envs | 环境列表，进入页面时同步非 base conda 环境到数据库 |
+| POST | /api/envs/upload-pack | 兼容旧入口的 conda-pack 导入 |
 | POST | /api/envs/register | 登记已有环境 |
-| POST | /api/envs/import-conda-pack | 上传 conda-pack 环境 |
-| GET | /api/envs/{env_id} | 环境详情 |
+| POST | /api/envs/import-conda-pack | 导入 conda-pack/zip 环境 |
+| POST | /api/envs/import-detected | 导入扫描发现的环境 |
+| POST | /api/envs/import-archive | 从用户文件区选择压缩包导入环境 |
 | DELETE | /api/envs/{env_id} | 删除环境 |
 | POST | /api/envs/{env_id}/test | 检测 Python/PyTorch/TensorFlow/包列表 |
 | GET | /api/envs/{env_id}/log | 查看环境操作日志 |
-| POST | /api/envs/{env_id}/packages/install | 本机离线安装 conda `.tar.bz2`、pip whl、requirements 批量包或源码目录 |
+| POST | /api/envs/{env_id}/clone | 基于可用环境创建副本 |
+| POST | /api/envs/{env_id}/packages/upload | 登记上传的环境安装包元数据 |
+| POST | /api/envs/{env_id}/packages/install | 创建本机离线安装作业，支持 conda `.tar.bz2`、pip whl、requirements 批量包或源码目录 |
 | POST | /api/envs/{env_id}/packages/delete-preview | 生成删除已安装包的确认提示 |
 | POST | /api/envs/{env_id}/packages/delete | 删除已安装 conda/pip 包 |
-| POST | /api/envs/{env_id}/packages/compile-install | 指定节点/GPU 编译安装 |
-| GET | /api/envs/{env_id}/install-jobs | 安装作业列表 |
+| POST | /api/envs/{env_id}/packages/{package_id}/install | 对已登记包创建 normal/compile 安装作业 |
+| DELETE | /api/envs/{env_id}/packages/{package_id} | 删除环境包登记记录 |
+| GET | /api/env-install-jobs/{job_id} | 查询环境安装作业详情 |
 | GET | /api/env-install-jobs/{job_id}/log | 安装日志 |
 | POST | /api/env-install-jobs/{job_id}/cancel | 中止安装作业 |
 
@@ -1396,7 +1409,7 @@ accounts:
 
 scheduler:
   enabled: true
-  interval_seconds: 2
+  interval_seconds: 5
   max_dispatch_per_round: 4
   default_gpu_free_mem_ratio_for_reuse: 0.4
   max_tasks_per_reuse_gpu: 5
@@ -1645,11 +1658,23 @@ while True:
 - 修复阶段统一处理路径、权限和文件属主。路径修复扫描所有文本文件，覆盖 `pip` shebang、`.pth`、包配置和 conda metadata。
 - 检测阶段通过 `conda activate <env_name>` 后运行 `remote/env_probe.py`，采集 Python、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
 - 环境包安装支持 conda `.tar.bz2` 离线安装、pip 单 whl、pip requirements 批量安装、源码目录 `pip install .` / `python setup.py install`；页面显示“就绪/安装中”，安装中提示不要关闭页面。
+- 本机离线安装、上传包安装和 compile 安装会创建 `env_install_jobs`，由 `nebulagrid-env-install-worker` 后台领取执行。作业持久化安装命令、工作目录、日志路径、目标节点、返回码和状态，避免 API 请求长时间阻塞或进程重启后丢失安装上下文。
 - 环境包删除先区分包来源 `conda/pip` 并生成确认提示；`python`、`pip`、`setuptools`、`conda` 等环境默认包不可删除。
 - 每个环境对应一个 JSON Lines 日志文件，位于 `NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`；同一条环境操作也写入 PostgreSQL `env_operation_logs` 表，命令输出保留换行并可在页面结构化解析展示。
 - 管理员可查看、修改、删除全部环境；普通用户只可修改、删除和查看自己的环境日志。
 
-这部分能力目前由 API 服务内的后台线程承担，适合 MVP 联调和单主节点部署。后续如果环境导入和复制耗时很长，可将同一状态机迁移到独立 Env Worker 或任务队列，但数据库状态、日志文件和权限模型应保持不变。
+环境导入和副本创建仍由 API 服务内的后台线程承担，适合 MVP 联调和单主节点部署；环境包安装已经迁移到独立 EnvInstallWorker。后续如果导入和复制耗时很长，也可将同一状态机迁移到 worker 或任务队列，但数据库状态、日志文件和权限模型应保持不变。
+
+## 23.2 任务调度实现同步（2026-05-22）
+
+当前任务链路已经从内存原型推进到数据库闭环：
+
+- 任务主表新增 `generated_command`、`urgent`、`last_block_reason`、`log_path` 和 `return_code`，GPU 表新增 `gpu_uuid`，初始化脚本会对旧库补列和索引。
+- API 支持单任务、批量任务、等待/执行/历史分区、任务变化 SSE、日志 tail、日志增量 SSE、删除后继预览、递归删除、重新提交和运行时守护摘要。
+- scheduler 以 PostgreSQL 为单一状态源，按紧急任务、优先级、提交时间、前驱依赖、节点可见性、GPU 数量、GPU 型号和 GPU 复用策略写入 allocation，并同步创建 `task_events` 与 `task_runtime_guards`。
+- executor 通过 SSH 调用远端 `runner.py`，生成环境激活、CUDA 绑定和用户命令组合后的执行命令；远端 wrapper 写入 PID/PGID 元数据和状态文件，executor 回收返回码、结束时间并释放 allocation。
+- Runtime Guard 通过远端 PID 树和 `nvidia-smi --query-compute-apps` 采集实际 GPU UUID，连续两轮发现越权后终止远端进程组、标记 `alloc_error`、释放 allocation，并写入任务日志与事件。
+- 部署自检脚本 `backend/scripts/deployment_self_check.py` 用于上线前只读检查本机共享目录、远端脚本、数据库节点、SSH、NFS 路径和 `nvidia-smi` 可用性。
 
 ## 24. 结论
 

@@ -298,6 +298,13 @@ sudo -u ddltm env $(cat /etc/nebulagrid/backend.env | xargs) \
   /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py --all-db-nodes --dry-run
 ```
 
+同步完成后运行只读部署自检，确认 SSH、NFS 路径、远端脚本和 `nvidia-smi` 都可用；该步骤不会修改本机或计算节点文件：
+
+```bash
+sudo -u ddltm env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/deployment_self_check.py
+```
+
 计算节点验证：
 
 ```bash
@@ -521,6 +528,7 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 - 环境副本：用户可基于任意可用环境创建自己的副本，后端复制 `miniconda3/envs/<old_env_name>` 到 `miniconda3/envs/<new_env_name>`，并执行路径修复、权限修复和检测。
 - 环境删除：普通用户只能删除自己的环境，管理员可以删除所有环境；删除会同时清理数据库记录和 `miniconda3/envs/<env_name>` 目录。
 - 环境日志：每个环境一个 JSON Lines 日志文件，位于 `NEBULAGRID_ENV_INSTALL_LOG_ROOT/env-<env_id>-<env_name>.log`，同时结构化写入 PostgreSQL `env_operation_logs` 表。管理员可查看全部日志，普通用户只能查看自己的日志；页面会自动解析 JSON 行和其中的换行符。
+- 环境包安装：本机离线 conda/pip 安装和上传包安装会创建 `env_install_jobs` 记录，由 `nebulagrid-env-install-worker` 后台领取执行，避免 API 请求线程被大包安装长时间占用。作业会持久化安装命令、工作目录、日志路径、返回码和终态。
 
 路径修复不是只处理 conda 元数据。当前实现会扫描环境内所有文本文件，提取旧环境前缀并替换为新路径，覆盖 `pip` shebang、`.pth`、包配置、metadata、conda 记录等常见残留；含空字节或明显二进制的文件会跳过，避免误改 `.so`、`.pyd` 等二进制包。
 
@@ -540,19 +548,21 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 - FastAPI API 结构、统一响应、鉴权依赖和 RBAC 入口。
 - SQLAlchemy ORM 数据模型和初始化脚本。
 - 任务、节点、文件、环境、用户、审计、设置等 API 契约。
-- worker 进程入口和远端脚本骨架。
+- 任务服务已从内存列表切换到 PostgreSQL CRUD；任务提交、批量提交、修改、挂起、删除、递归后继确认、中止、重新提交、日志读取和历史区默认 100 条加载均已落库。
+- scheduler 已按紧急任务、优先级、前驱任务、节点可见性、GPU 数量、GPU 型号和 GPU 复用策略执行数据库 allocation 事务，并写入 `task_events` 与 `task_runtime_guards`。
+- task executor 已接入 SSH 远端 runner 启动、PID/PGID 记录、状态文件回收、返回码归档和 allocation 释放；需要在真实节点完成 SSH/NFS/远端脚本同步联调。
+- runtime guard 已按远端 PID 树读取 `nvidia-smi` compute-apps，并以 GPU UUID 比对 allocation；连续两轮检测到未分配 GPU 后会终止远端进程组、标记 `alloc_error`、释放 allocation 并写入任务日志与事件。
+- env install worker 已支持从 `env_install_jobs` 领取本机安装作业和 compile 远端安装作业，写回包状态、返回码、环境操作日志和作业终态。
 - 基于 NFS 的路径规划和部署流程。
 
 管理员审计日志已经落库到 PostgreSQL `audit_logs` 表，`/api/admin/audit-logs` 支持 `page`、`page_size` 和 `category` 查询参数。后台审计页按系统操作、用户操作、压缩文件、文件操作、任务操作、环境操作、节点操作和其他分类展示，压缩/解压分别对应 `file.archive` 与 `file.extract`。
 
 仍需在真实机器上继续完善：
 
-- 任务服务从内存仓库切换为数据库 CRUD。
-- scheduler 的事务化 GPU 选择和 allocation 写入。
-- executor 的 SSH 调用、远端 runner 启动、停止和返回码回收。
+- 在真实 GPU 节点上压测 scheduler/executor 闭环，包括 NFS 路径一致性、conda 激活、日志写入、返回码状态流转和中止回收。
 - monitor 的 SSH 指标采集写入 InfluxDB，PostgreSQL 不再保存 node/gpu metrics 表。
-- runtime guard 的 PID/GPU 越权检测和 alloc_error 状态流转。
-- env worker 的上传文件落盘、sha256 校验、normal/compile 安装执行仍需继续打通；环境导入、复制、检测、日志和删除已经由 API 服务实现。
+- runtime guard 在真实多进程训练、torchrun 和节点重启场景下的误报/漏报压测。
+- env worker 的上传文件真实落盘、sha256 校验、compile 安装资源占用隔离和取消运行中 pip/conda 进程仍需继续打通；环境导入、复制、检测、日志和删除已经由 API 服务实现。
 - Alembic 迁移脚本；当前 `create_all` 适合 MVP 初始化，不适合长期生产演进。
 
 建议真实机器测试顺序：

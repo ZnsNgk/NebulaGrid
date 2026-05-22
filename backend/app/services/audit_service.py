@@ -12,6 +12,7 @@ from app.services.auth_service import UserRecord
 
 DEFAULT_SETTINGS: dict[str, str] = {
     "scheduler.enabled": "true",
+    "scheduler.interval_seconds": "5",
     "monitor.enabled": "true",
     "uploads.max_size_mb": "20480",
 }

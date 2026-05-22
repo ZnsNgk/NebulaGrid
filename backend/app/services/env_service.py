@@ -18,7 +18,7 @@ from app.core.config import get_settings
 from app.core.errors import forbidden, not_found, validation_error
 from app.core.path_resolver import normalize_virtual_path, resolve_user_visible_path
 from app.core.rbac import Role, require_permission
-from app.core.time_utils import ensure_local_datetime
+from app.core.time_utils import ensure_local_datetime, local_datetime
 from app.db.models import Env, EnvInstallJob, EnvOperationLog, EnvPackage, EnvPackageManifest, Task, User
 from app.db.session import SessionLocal
 from app.schemas.envs import (
@@ -232,19 +232,21 @@ def upload_package(
     env = get_env_for_user(user, env_id)
     require_env_owner(user, env)
     settings = get_settings()
-    package = EnvPackageInfo(
-        id=next(_PACKAGE_ID),
-        env_id=env.id,
-        owner_user_id=user.id,
-        filename=payload.filename,
-        package_type=payload.package_type,
-        file_path=f"{settings.env_package_root}/{user.username}/{payload.filename}",
-        size_bytes=payload.size_bytes,
-        sha256=payload.sha256,
-        status="uploaded",
-        created_at=utc_now(),
-    )
-    _PACKAGES.append(package)
+    with SessionLocal() as db:
+        model = EnvPackage(
+            env_id=env.id,
+            owner_user_id=user.id,
+            filename=payload.filename,
+            package_type=payload.package_type,
+            file_path=f"{settings.env_package_root}/{user.username}/{payload.filename}",
+            size_bytes=payload.size_bytes,
+            sha256=payload.sha256,
+            status="uploaded",
+        )
+        db.add(model)
+        db.commit()
+        db.refresh(model)
+        package = env_package_model_to_info(model)
     write_env_operation_log(env, "package_upload", "已登记待安装包", user.id, {"package": package.filename})
     record_audit(user.id, "env.package.upload", "env_package", str(package.id))
     return package
@@ -259,21 +261,29 @@ def install_package(
     """创建环境包安装作业；只有环境所有者能修改目标环境。"""
     env = get_env_for_user(user, env_id)
     require_env_owner(user, env)
-    package = require_package(package_id)
+    package = load_package_model(package_id)
     if package.env_id != env.id:
         raise validation_error("package does not belong to env")
-    job = EnvInstallJobInfo(
-        id=next(_JOB_ID),
-        package_id=package.id,
-        env_id=env.id,
-        mode=payload.mode,
-        target_node_id=payload.target_node_id,
-        visible_gpu_indices=payload.visible_gpu_indices,
-        status="queued",
-        log_path=str(env_operation_log_path(env)),
-        created_by=user.id,
-    )
-    _JOBS.append(job)
+    command = build_uploaded_package_install_command(package)
+    with SessionLocal() as db:
+        package_model = db.get(EnvPackage, package.id)
+        if package_model is None:
+            raise not_found("package not found")
+        package_model.status = "queued"
+        model = EnvInstallJob(
+            package_id=package.id,
+            env_id=env.id,
+            mode=payload.mode,
+            target_node_id=payload.target_node_id,
+            visible_gpu_indices=payload.visible_gpu_indices,
+            command=command,
+            log_path=str(env_operation_log_path(env)),
+            created_by=user.id,
+        )
+        db.add(model)
+        db.commit()
+        db.refresh(model)
+        job = env_install_job_model_to_info(model)
     write_env_operation_log(
         env,
         "package_install",
@@ -285,28 +295,68 @@ def install_package(
     return job
 
 
-def install_local_package(user: UserRecord, env_id: int, payload: EnvLocalPackageInstallRequest) -> EnvLocalPackageInstallResult:
-    """在主节点目标 conda 环境中执行离线安装。"""
+def install_local_package(user: UserRecord, env_id: int, payload: EnvLocalPackageInstallRequest) -> EnvInstallJobInfo:
+    """创建本机环境安装作业，由 env_install_worker 后台执行，避免 API 请求长时间占用。"""
     env = get_env_for_user(user, env_id)
     require_env_owner(user, env)
     if not is_env_usable_for_mutation(env):
         raise validation_error("environment is not available")
-    write_env_operation_log(env, "package_install", "开始本机安装包操作", user.id, payload.model_dump())
+    method, command, cwd, source_path = build_local_install_job_spec(user, payload)
+    log_path = str(env_operation_log_path(env))
+    with SessionLocal() as db:
+        package = EnvPackage(
+            env_id=env.id,
+            owner_user_id=user.id,
+            filename=Path(source_path).name,
+            package_type=method,
+            file_path=source_path,
+            size_bytes=0,
+            sha256="",
+            status="queued",
+        )
+        db.add(package)
+        db.flush()
+        job = EnvInstallJob(
+            package_id=package.id,
+            env_id=env.id,
+            mode="local",
+            command=command,
+            workdir=str(cwd) if cwd else "",
+            visible_gpu_indices=[],
+            status="queued",
+            log_path=log_path,
+            created_by=user.id,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        saved = env_install_job_model_to_info(job)
+    write_env_operation_log(env, "package_install", "已创建本机环境安装作业", user.id, {"job_id": saved.id, "method": method, "source": source_path})
+    record_audit(user.id, "env.package.install_local.queue", "env_install_job", str(saved.id), detail_json={"method": method})
+    return saved
+
+
+def build_local_install_job_spec(
+    user: UserRecord,
+    payload: EnvLocalPackageInstallRequest,
+) -> tuple[str, str, Path | None, str]:
+    """把本机安装请求转换成可持久化的受控命令，worker 重启后仍可继续执行。"""
     if payload.method == "conda":
-        result = install_conda_archive_package(user, env, payload)
-    elif payload.method == "pip":
-        result = install_pip_package(user, env, payload)
-    else:
-        raise validation_error("unsupported install method")
-    write_env_operation_log(
-        env,
-        "package_install",
-        "本机安装包操作完成" if result.ok else "本机安装包操作失败",
-        user.id,
-        {"method": result.method, "return_code": result.return_code, "stdout": tail_text(result.stdout), "stderr": tail_text(result.stderr)},
-    )
-    record_audit(user.id, "env.package.install_local", "env", str(env.id), result="success" if result.ok else "failed", detail_json={"method": result.method, "return_code": result.return_code})
-    return result
+        package_path = resolve_required_user_file(user, payload.package_path, {".tar.bz2"})
+        return "conda", f"conda install --offline -y {shlex.quote(str(package_path))}", None, str(package_path)
+    if payload.method == "pip" and payload.pip_mode == "wheel":
+        if payload.batch:
+            folder = resolve_required_user_directory(user, payload.folder_path)
+            requirements = resolve_required_user_file(user, payload.requirements_path, {".txt"})
+            command = f"python -m pip install --no-index --find-links={shlex.quote(str(folder))} -r {shlex.quote(str(requirements))}"
+            return "pip_batch", command, None, str(requirements)
+        package_path = resolve_required_user_file(user, payload.package_path, {".whl"})
+        return "pip_wheel", f"python -m pip install --no-index {shlex.quote(str(package_path))}", None, str(package_path)
+    if payload.method == "pip" and payload.pip_mode == "folder":
+        folder = resolve_required_user_directory(user, payload.folder_path)
+        command = "python setup.py install" if payload.folder_command == "setup_py" else "python -m pip install ."
+        return "pip_folder", command, folder, str(folder)
+    raise validation_error("unsupported install method")
 
 
 def install_conda_archive_package(user: UserRecord, env: EnvInfo, payload: EnvLocalPackageInstallRequest) -> EnvLocalPackageInstallResult:
@@ -506,10 +556,16 @@ def delete_package(user: UserRecord, env_id: int, package_id: int) -> EnvPackage
     """删除环境包登记记录并写入环境日志；真实卸载流程接入后继续复用该日志入口。"""
     env = get_env_for_user(user, env_id)
     require_env_owner(user, env)
-    package = require_package(package_id)
+    package_model = load_package_model(package_id)
+    package = env_package_model_to_info(package_model)
     if package.env_id != env.id:
         raise validation_error("package does not belong to env")
-    _PACKAGES.remove(package)
+    with SessionLocal() as db:
+        model = db.get(EnvPackage, package_id)
+        if model is None:
+            raise not_found("package not found")
+        db.delete(model)
+        db.commit()
     write_env_operation_log(env, "package_delete", "已删除环境包记录", user.id, {"package_id": package.id, "package": package.filename})
     record_audit(user.id, "env.package.delete", "env_package", str(package.id))
     return package
@@ -548,8 +604,15 @@ def cancel_install_job(user: UserRecord, job_id: int) -> EnvInstallJobInfo:
         raise forbidden("job creator required")
     if job.status in {"succeeded", "failed", "cancelled"}:
         raise validation_error("finished job cannot be cancelled")
-    job.status = "cancelled"
-    job.finished_at = utc_now()
+    with SessionLocal() as db:
+        model = db.get(EnvInstallJob, job_id)
+        if model is None:
+            raise not_found("install job not found")
+        model.status = "cancelled"
+        model.finished_at = local_datetime()
+        db.commit()
+        db.refresh(model)
+        job = env_install_job_model_to_info(model)
     env = get_env_for_user(user, job.env_id)
     write_env_operation_log(env, "package_install", "已取消包安装任务", user.id, {"job_id": job.id, "package_id": job.package_id})
     record_audit(user.id, "env.install.cancel", "env_install_job", str(job.id))
@@ -653,20 +716,74 @@ def resolve_clone_source_env_path(env: EnvInfo) -> Path:
     return target
 
 
+def load_package_model(package_id: int) -> EnvPackage:
+    """按 ID 从数据库获取环境包元数据，避免进程重启后内存队列丢失。"""
+    with SessionLocal() as db:
+        package = db.get(EnvPackage, package_id)
+        if package is None:
+            raise not_found("package not found")
+        db.expunge(package)
+        return package
+
+
 def require_package(package_id: int) -> EnvPackageInfo:
     """按 ID 获取环境包元数据，找不到时抛出 NOT_FOUND。"""
-    package = next((item for item in _PACKAGES if item.id == package_id), None)
-    if package is None:
-        raise not_found("package not found")
-    return package
+    return env_package_model_to_info(load_package_model(package_id))
 
 
 def require_job(job_id: int) -> EnvInstallJobInfo:
     """按 ID 获取环境安装作业，找不到时抛出 NOT_FOUND。"""
-    job = next((item for item in _JOBS if item.id == job_id), None)
-    if job is None:
-        raise not_found("install job not found")
-    return job
+    with SessionLocal() as db:
+        job = db.get(EnvInstallJob, job_id)
+        if job is None:
+            raise not_found("install job not found")
+        return env_install_job_model_to_info(job)
+
+
+def build_uploaded_package_install_command(package: EnvPackage) -> str:
+    """把已登记包转换为 worker 可执行命令；compile 模式后续可在远端复用同一字段。"""
+    package_path = shlex.quote(package.file_path)
+    if package.package_type in {"conda", "conda_archive", "tar_bz2"} or package.file_path.endswith(".tar.bz2"):
+        return f"conda install --offline -y {package_path}"
+    return f"python -m pip install {package_path}"
+
+
+def env_package_model_to_info(package: EnvPackage) -> EnvPackageInfo:
+    """把数据库包记录转换为 API 响应模型，避免服务层泄漏 ORM 对象。"""
+    created_at = ensure_local_datetime(package.created_at)
+    return EnvPackageInfo(
+        id=package.id,
+        env_id=package.env_id,
+        owner_user_id=package.owner_user_id,
+        filename=package.filename,
+        package_type=package.package_type,
+        file_path=package.file_path,
+        size_bytes=package.size_bytes,
+        sha256=package.sha256,
+        status=package.status,
+        created_at=created_at.isoformat() if created_at else utc_now(),
+    )
+
+
+def env_install_job_model_to_info(job: EnvInstallJob) -> EnvInstallJobInfo:
+    """把数据库安装作业转换为前端需要的稳定字段。"""
+    started_at = ensure_local_datetime(job.started_at)
+    finished_at = ensure_local_datetime(job.finished_at)
+    return EnvInstallJobInfo(
+        id=job.id,
+        package_id=job.package_id,
+        env_id=job.env_id,
+        mode=job.mode,
+        target_node_id=job.target_node_id,
+        visible_gpu_indices=job.visible_gpu_indices or [],
+        status=job.status,
+        remote_pid=job.remote_pid,
+        log_path=job.log_path,
+        return_code=job.return_code,
+        created_by=job.created_by,
+        started_at=started_at.isoformat() if started_at else None,
+        finished_at=finished_at.isoformat() if finished_at else None,
+    )
 
 
 def build_conda_env_path(name: str, requested_path: str | None = None) -> str:

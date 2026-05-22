@@ -5,6 +5,12 @@ const state = {
   user: null,
   page: location.hash.replace("#/", "") || "dashboard",
   taskZone: localStorage.getItem("ng_task_zone") || "wait",
+  selectedTaskId: "",
+  taskHistoryAllLoaded: false,
+  taskPredecessorOptions: [],
+  taskFormDraft: null,
+  taskEventsSource: null,
+  taskRealtimeBusy: false,
   adminMenu: localStorage.getItem("ng_admin_menu") || "overview",
   adminNodeEditId: null,
   auditCategory: localStorage.getItem("ng_audit_category") || "all",
@@ -110,6 +116,13 @@ const errorMessageMap = {
   "node name already exists": "节点名称已存在",
   "node owner not found": "节点所有人不存在，请刷新用户列表后重试",
   "gpu_count must match gpu_models length": "GPU 数量必须与 GPU 型号列表条数一致",
+  "command must be a single line": "单个任务的执行命令不允许换行",
+  "batch commands are empty": "批量命令中没有可提交的有效行",
+  "running task cannot be edited": "运行中的任务不能修改",
+  "running task cannot be deleted": "运行中的任务不能删除",
+  "only waiting task can be held": "只有等待区任务可以挂起",
+  "only waiting or held task can toggle hold": "只有等待区或挂起任务可以切换挂起状态",
+  "predecessor task not found": "前驱任务不存在或不可见",
 };
 
 const roleLabels = {
@@ -403,8 +416,7 @@ async function refreshPage() {
       state.lastDashboardRefreshAt = new Date();
     },
     tasks: async () => {
-      state.data.tasks = (await api(`/tasks?state=${encodeURIComponent(state.taskZone)}`)).data;
-      if (can("envs:read")) state.data.envs = (await api("/envs")).data;
+      await loadTasksPageData({ includeLookups: true });
     },
     files: async () => {
       state.data.files = (await api(`/files/list?${fileQuery(state.data.files.path || "/")}`)).data;
@@ -447,6 +459,25 @@ async function refreshPage() {
   await loaders[state.page]?.();
 }
 
+async function loadTasksPageData({ includeLookups = false } = {}) {
+  const params = new URLSearchParams({
+    state: state.taskZone,
+    page_size: "100",
+  });
+  if (state.taskZone === "history" && state.taskHistoryAllLoaded) params.set("all_history", "true");
+  const tasksRequest = api(`/tasks?${params.toString()}`);
+  const lookupRequests = [];
+  if (includeLookups && can("envs:read") && !(state.data.envs || []).length) {
+    lookupRequests.push(api("/envs").then((payload) => { state.data.envs = payload.data; }));
+  }
+  if (includeLookups && can("nodes:read") && !(state.data.nodes || []).length) {
+    lookupRequests.push(api("/nodes").then((payload) => { state.data.nodes = payload.data; }));
+  }
+  const [tasksPayload] = await Promise.all([tasksRequest, ...lookupRequests]);
+  state.data.tasks = tasksPayload.data;
+  if (!state.data.tasks.items.some((task) => task.task_id === state.selectedTaskId)) state.selectedTaskId = "";
+}
+
 function navigate(page) {
   const previousPage = state.page;
   state.page = page;
@@ -469,10 +500,45 @@ function setDashboardRefreshSeconds(value) {
 
 function updateRealtimeTimers() {
   updateAutoRefreshTimer();
+  updateTaskEventStream();
   updateSessionRefreshTimer();
   updateFileJobTimer();
   updateEnvRefreshTimer();
   updateAuthWatchTimer();
+}
+
+function updateTaskEventStream() {
+  if (state.taskEventsSource) {
+    state.taskEventsSource.close();
+    state.taskEventsSource = null;
+  }
+  if (!state.user || !state.token || typeof EventSource === "undefined") return;
+  const base = state.apiBase.replace(/\/$/, "");
+  const source = new EventSource(`${base}/tasks/events?token=${encodeURIComponent(state.token)}`);
+  source.addEventListener("tasks", () => {
+    if (state.page === "tasks") {
+      refreshTasksFromEvent();
+    } else if (state.page === "dashboard") {
+      autoRefreshDashboard();
+    }
+  });
+  source.onerror = () => {
+    if (!state.token) source.close();
+  };
+  state.taskEventsSource = source;
+}
+
+async function refreshTasksFromEvent() {
+  if (!state.user || state.page !== "tasks" || state.taskRealtimeBusy) return;
+  state.taskRealtimeBusy = true;
+  try {
+    await loadTasksPageData();
+    render();
+  } catch (error) {
+    if (!isAuthExpiredMessage(error.message)) console.warn("task realtime refresh failed", error);
+  } finally {
+    state.taskRealtimeBusy = false;
+  }
 }
 
 function updateAutoRefreshTimer() {
@@ -694,32 +760,26 @@ async function deleteNode(nodeId) {
 async function submitTask(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  await api("/tasks", {
-    method: "POST",
-    body: JSON.stringify({
-      description: formValue(form, "description"),
-      env_id: formValue(form, "env_id") ? Number(formValue(form, "env_id")) : null,
-      workdir: formValue(form, "workdir") || "/",
-      command: formValue(form, "command"),
-      priority: Number(formValue(form, "priority") || 0),
-      on_hold: form.elements.on_hold.checked,
-      requirement: {
-        need_gpus: Number(formValue(form, "need_gpus") || 0),
-        gpu_types: parseList(formValue(form, "gpu_types")),
-        allow_gpu_reuse: form.elements.allow_gpu_reuse.checked,
-      },
-    }),
+  const mode = form.dataset.taskFormMode || "add";
+  const payload = taskPayloadFromForm(form, mode);
+  const endpoint = mode === "batch" ? "/tasks/batch" : (mode === "edit" ? `/tasks/${encodeURIComponent(formValue(form, "task_id"))}` : "/tasks");
+  await api(endpoint, {
+    method: mode === "edit" ? "PATCH" : "POST",
+    body: JSON.stringify(payload),
   });
-  form.reset();
+  state.drawer = null;
+  state.taskFormDraft = null;
   await refreshPage();
 }
 
 async function cancelTask(taskId) {
+  if (!window.confirm(`确认中止任务 ${taskId}？`)) return;
   await api(`/tasks/${taskId}/cancel`, { method: "POST" });
   await refreshPage();
 }
 
 async function resubmitTask(taskId) {
+  if (!window.confirm(`确认重新提交任务 ${taskId}？\n系统会生成一个新任务 ID。`)) return;
   await api(`/tasks/${taskId}/resubmit`, { method: "POST" });
   await refreshPage();
 }
@@ -727,6 +787,104 @@ async function resubmitTask(taskId) {
 async function showTaskLog(taskId) {
   const log = await api(`/tasks/${taskId}/log?tail=200KB`);
   state.drawer = { title: `任务日志 ${taskId}`, body: `<pre class="drawer-log">${escapeHtml(log)}</pre>` };
+}
+
+async function openTaskForm(mode) {
+  const selected = selectedTask();
+  if (mode === "edit" && !selected) throw new Error("请选择任务");
+  await loadTaskPredecessorOptions(selected?.task_id || "");
+  state.taskFormDraft = taskToDraft(mode, selected);
+  state.drawer = {
+    title: mode === "batch" ? "批量添加任务" : (mode === "edit" ? `修改任务 ${selected.task_id}` : "添加任务"),
+    body: renderTaskForm(mode, selected),
+  };
+  render();
+}
+
+async function loadTaskPredecessorOptions(excludedTaskId = "") {
+  const [wait, running] = await Promise.all([
+    api("/tasks?state=wait&page_size=200"),
+    api("/tasks?state=running&page_size=200"),
+  ]);
+  const seen = new Set();
+  state.taskPredecessorOptions = [...(wait.data.items || []), ...(running.data.items || [])]
+    .filter((task) => task.task_id !== excludedTaskId)
+    .filter((task) => {
+      if (seen.has(task.task_id)) return false;
+      seen.add(task.task_id);
+      return true;
+    });
+}
+
+function taskPayloadFromForm(form, mode) {
+  const nodeId = formValue(form, "node_id");
+  const common = {
+    description: formValue(form, "description"),
+    env_id: formValue(form, "env_id") ? Number(formValue(form, "env_id")) : null,
+    workdir: formValue(form, "workdir") || "/",
+    priority: 0,
+    urgent: form.elements.urgent.checked,
+    on_hold: form.elements.on_hold.checked,
+    predecessor_task_id: formValue(form, "predecessor_task_id") || null,
+    requirement: {
+      need_gpus: Number(formValue(form, "need_gpus") || 1),
+      node_id: nodeId ? Number(nodeId) : null,
+      gpu_types: checkedValues("taskGpuTypeOptions"),
+      allow_gpu_reuse: form.elements.allow_gpu_reuse.checked,
+    },
+  };
+  if (mode === "batch") return { ...common, commands: form.elements.commands.value };
+  return { ...common, command: formValue(form, "command") };
+}
+
+async function holdSelectedTask() {
+  const task = requireSelectedTask();
+  await api(`/tasks/${task.task_id}/hold`, { method: "POST" });
+  await refreshPage();
+}
+
+async function deleteSelectedTask() {
+  const task = requireSelectedTask();
+  const preview = (await api(`/tasks/${task.task_id}/delete-preview`)).data;
+  const successors = preview.successors || [];
+  let deleteSuccessors = false;
+  if (successors.length) {
+    deleteSuccessors = window.confirm(`任务 ${task.task_id} 有以下后继任务：\n${successors.join(", ")}\n\n点击“确定”将同时删除当前任务和所有后继任务；点击“取消”后可选择只删除当前任务。`);
+    if (!deleteSuccessors && !window.confirm(`只删除当前任务 ${task.task_id}？后继任务会保留，但前驱关系会被清理。`)) return;
+  } else if (!window.confirm(`确认删除任务 ${task.task_id}？`)) {
+    return;
+  }
+  await api(`/tasks/${task.task_id}?delete_successors=${deleteSuccessors ? "true" : "false"}`, { method: "DELETE" });
+  state.selectedTaskId = "";
+  await refreshPage();
+}
+
+async function loadAllHistoryTasks() {
+  state.taskZone = "history";
+  state.taskHistoryAllLoaded = true;
+  localStorage.setItem("ng_task_zone", "history");
+  await refreshPage();
+}
+
+async function openTaskWorkdirPicker() {
+  const draft = syncTaskFormDraftFromDom();
+  const current = draft?.workdir || "/";
+  state.fileTargetPicker = {
+    mode: "task-workdir",
+    sourcePath: "",
+    currentPath: current,
+    items: [],
+  };
+  if (state.drawer && draft) state.drawer.body = renderTaskForm(draft.mode, selectedTask());
+  await loadFileTargetPickerPath(current);
+  render();
+}
+
+function syncTaskFormDraftFromDom() {
+  const form = document.querySelector("#taskForm");
+  if (!form) return state.taskFormDraft;
+  state.taskFormDraft = captureTaskFormDraft(form);
+  return state.taskFormDraft;
 }
 
 async function importEnvs() {
@@ -866,9 +1024,9 @@ async function submitEnvPackageInstall(event) {
   render();
   try {
     const result = (await api(`/envs/${panel.envId}/packages/install`, { method: "POST", body: JSON.stringify(body) })).data;
-    showToast(result.ok ? "安装命令执行完成" : "安装命令执行失败，请查看输出和日志", result.ok ? "success" : "error");
+    showToast("安装作业已加入后台队列", "success");
     state.envPackageInstall = null;
-    state.drawer = { title: `安装结果 · ${result.env_name}`, body: renderEnvPackageInstallResult(result) };
+    state.drawer = { title: `安装作业 #${result.id}`, body: renderEnvPackageInstallResult(result) };
     render();
   } catch (error) {
     panel.installStatus = "ready";
@@ -1053,6 +1211,16 @@ async function confirmFileTargetPicker() {
     render();
     return;
   }
+  if (picker.mode === "task-workdir") {
+    const selectedPath = picker.currentPath || "/";
+    const draft = state.taskFormDraft || syncTaskFormDraftFromDom() || taskToDraft("add");
+    draft.workdir = selectedPath;
+    state.taskFormDraft = draft;
+    if (state.drawer) state.drawer.body = renderTaskForm(draft.mode, selectedTask());
+    state.fileTargetPicker = null;
+    render();
+    return;
+  }
   if (picker.mode === "extract") {
     const payload = await api("/files/extract", { method: "POST", body: JSON.stringify({ path: picker.sourcePath, target_path: picker.currentPath }) });
     state.data.fileJob = payload.data;
@@ -1198,6 +1366,7 @@ function isSameOrChildPath(path, parent) {
 function fileTargetActionText(mode) {
   if (mode === "env-import") return "导入环境";
   if (mode === "env-package") return "选择安装资源";
+  if (mode === "task-workdir") return "选择项目路径";
   if (mode === "extract") return "解压到";
   return mode === "move" ? "移动到" : "复制到";
 }
@@ -1321,10 +1490,53 @@ function enforceSupervisorLimit(select) {
   showToast("每名学生最多只能选择两名导师", "error");
 }
 
-function switchTaskZone(zone) {
+async function switchTaskZone(zone) {
   state.taskZone = zone;
+  state.selectedTaskId = "";
+  if (zone !== "history") state.taskHistoryAllLoaded = false;
   localStorage.setItem("ng_task_zone", zone);
-  run(refreshPage);
+  render();
+  try {
+    await loadTasksPageData();
+  } catch (error) {
+    showToast(error.message || "切换任务区失败", "error");
+  }
+  render();
+}
+
+function selectTask(taskId) {
+  state.selectedTaskId = taskId;
+  render();
+}
+
+function selectedTask() {
+  return (state.data.tasks.items || []).find((task) => task.task_id === state.selectedTaskId) || null;
+}
+
+function requireSelectedTask() {
+  const task = selectedTask();
+  if (!task) throw new Error("请选择任务");
+  return task;
+}
+
+async function handleTaskAction(action) {
+  if (action === "add") return openTaskForm("add");
+  if (action === "batch") return openTaskForm("batch");
+  if (action === "edit") return openTaskForm("edit");
+  if (action === "hold") return holdSelectedTask();
+  if (action === "delete") return deleteSelectedTask();
+  if (action === "cancel") return cancelTask(requireSelectedTask().task_id);
+  if (action === "resubmit") return resubmitTask(requireSelectedTask().task_id);
+  if (action === "historyAll") return loadAllHistoryTasks();
+  if (action === "log") return showTaskLog(requireSelectedTask().task_id);
+  return null;
+}
+
+function updateTaskGpuTypeOptions() {
+  const form = document.querySelector("#taskForm");
+  const container = document.querySelector("#taskGpuTypeOptions");
+  if (!form || !container) return;
+  container.innerHTML = renderTaskGpuTypeOptions(formValue(form, "node_id"), checkedValues("taskGpuTypeOptions"));
 }
 
 function switchAdminMenu(menu) {
@@ -1632,54 +1844,226 @@ function renderNodeCard(node) {
 
 function renderTasks() {
   const tasks = state.data.tasks.items || [];
-  const envOptions = state.data.envs
-    .filter(isEnvUsable)
-    .map((env) => `<option value="${env.id}">${escapeHtml(env.name)}</option>`)
-    .join("");
   const zones = [
-    ["wait", "等待区", "已提交但尚未执行的任务"],
-    ["running", "运行区", "正在执行或准备执行的任务"],
-    ["history", "历史区", "已完成、失败、取消或调度错误的任务"],
+    ["wait", "等待区"],
+    ["running", "执行区"],
+    ["history", "历史区"],
   ];
+  const selected = selectedTask();
   return shell(`
-    <section class="panel">
-      <div class="panel-head"><div><h2>提交训练任务</h2><span>沿用 2.0 的任务入口，但按 3.0 API 保存为结构化任务。</span></div></div>
-      <form method="post" id="taskForm" class="form-grid task-form">
-        <label class="wide">任务描述<input name="description" placeholder="ResNet 训练 / 参数搜索 / 数据预处理"></label>
-        <label>运行环境<select name="env_id"><option value="">不指定</option>${envOptions}</select></label>
-        <label>优先级<input name="priority" type="number" min="0" max="100" value="0"></label>
-        <label class="wide">工作目录<input name="workdir" value="/"></label>
-        <label>GPU 数量<input name="need_gpus" type="number" min="0" max="16" value="1"></label>
-        <label>GPU 型号<input name="gpu_types" placeholder="A100,4090"></label>
-        <label class="check"><input name="allow_gpu_reuse" type="checkbox">允许复用 GPU</label>
-        <label class="check"><input name="on_hold" type="checkbox">先挂起</label>
-        <label class="full-row">执行命令<textarea name="command" placeholder="python train.py --config configs/default.yaml" required></textarea></label>
-        <div class="form-actions"><button type="submit">提交任务</button></div>
-      </form>
-    </section>
     <section class="panel task-board">
-      <div class="panel-head">
-        <div>
-          <h2>任务管理</h2>
+      <div class="task-board-stack">
+        <div class="task-board-head">
+          <div>
+            <h2>任务管理</h2>
+            <span>${selected ? `已选择 ${escapeHtml(selected.task_id)}` : "请选择一条任务后执行管理操作"}</span>
+          </div>
+          <div class="task-action-bar">
+            ${renderTaskActionButton("add", "添加任务")}
+            ${renderTaskActionButton("batch", "批量添加")}
+            ${renderTaskActionButton("edit", "修改选中任务")}
+            ${renderTaskActionButton("hold", "挂起/取消挂起选中任务")}
+            ${renderTaskActionButton("delete", "删除选中任务", "danger")}
+            ${renderTaskActionButton("cancel", "中止选中任务", "danger")}
+            ${renderTaskActionButton("resubmit", "重新提交")}
+            ${renderTaskActionButton("historyAll", state.taskHistoryAllLoaded ? "已显示全部历史任务" : "查看所有历史任务")}
+            ${renderTaskActionButton("log", "查看任务日志")}
+          </div>
         </div>
-        <div class="task-tabs">
+        <div class="task-zone-rail task-zone-tabs">
           ${zones.map(([id, label]) => `<button class="secondary ${state.taskZone === id ? "active" : ""}" data-task-zone="${id}">${label}</button>`).join("")}
         </div>
+        <div class="task-zone-content">
+          <div class="task-list-summary">
+            <strong>${zones.find(([id]) => id === state.taskZone)?.[1] || "当前分区"}</strong>
+            <span>共 ${state.data.tasks.total || tasks.length} 条</span>
+          </div>
+          ${tasks.length ? renderTaskZoneTable(tasks) : renderEmpty(`${zones.find(([id]) => id === state.taskZone)?.[1] || "当前分区"}暂无任务`)}
+        </div>
       </div>
-      <div class="zone-help">${escapeHtml(zones.find(([id]) => id === state.taskZone)?.[2] || "")}</div>
-      ${tasks.length ? renderTaskZoneTable(tasks) : renderEmpty(`${zones.find(([id]) => id === state.taskZone)?.[1] || "当前分区"}暂无任务`)}
     </section>
   `);
 }
 
 function renderTaskZoneTable(tasks) {
-  return renderTable(["任务", "状态", "资源", "命令", "操作"], tasks.map((task) => [
-    `<strong>${escapeHtml(task.task_id)}</strong><br><span class="muted">${escapeHtml(task.description || "无描述")}</span>`,
-    `<span class="status ${task.state}">${stateText(task.state)}</span><br><span class="muted">${formatDate(task.created_at)}</span>`,
-    `GPU ${task.requirement?.need_gpus ?? 0}<br><span class="muted">${escapeHtml((task.requirement?.gpu_types || []).join(", ") || "不限型号")}</span>`,
-    `<code>${escapeHtml(task.command)}</code>`,
-    `<button class="small secondary" data-log="${escapeAttr(task.task_id)}">日志</button><button class="small secondary" data-resubmit="${escapeAttr(task.task_id)}">重提</button>${["succeeded", "failed", "cancelled", "alloc_error", "offline_error", "node_lost"].includes(task.state) ? "" : `<button class="small danger" data-cancel="${escapeAttr(task.task_id)}">取消</button>`}`,
-  ]));
+  const headers = ["", "状态", "任务ID", "环境", "路径", "命令", "节点", "GPU数", "GPU型号", "前驱", "紧急", "复用", "所有人", "时间"];
+  const rows = tasks.map((task) => {
+    const selected = state.selectedTaskId === task.task_id;
+    const cells = [
+      `<input type="radio" name="task_selection" value="${escapeAttr(task.task_id)}" ${selected ? "checked" : ""} data-select-task="${escapeAttr(task.task_id)}">`,
+      `<span class="status ${task.state}">${stateText(task.state)}</span>`,
+      `<strong>${escapeHtml(task.task_id)}</strong>${task.description ? `<br><span class="muted">${escapeHtml(task.description)}</span>` : ""}`,
+      escapeHtml(task.env_name || "-"),
+      `<code>${escapeHtml(task.workdir || "/")}</code>`,
+      `<code class="task-command">${escapeHtml(task.command)}</code>${task.last_block_reason ? `<br><span class="muted">${escapeHtml(task.last_block_reason)}</span>` : ""}`,
+      escapeHtml(task.node_name || (task.requirement?.node_id ? `#${task.requirement.node_id}` : "<任意>")),
+      escapeHtml(task.requirement?.need_gpus ?? 0),
+      escapeHtml(taskGpuModelText(task)),
+      escapeHtml(task.predecessor_task_no || "(无)"),
+      escapeHtml(task.urgent ? "是" : "否"),
+      escapeHtml(task.requirement?.allow_gpu_reuse ? "是" : "否"),
+      `${escapeHtml(task.owner_name || task.owner_username || "-")}`,
+      renderTaskTimes(task),
+    ];
+    return `<tr class="task-row ${selected ? "selected" : ""}" data-task-row="${escapeAttr(task.task_id)}" title="双击查看日志">${cells.map((cell) => `<td>${cell}</td>`).join("")}</tr>`;
+  });
+  return `
+    <div class="table-wrap">
+      <table>
+        <thead><tr>${headers.map((header) => `<th>${header}</th>`).join("")}</tr></thead>
+        <tbody>${rows.join("")}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderTaskActionButton(action, label, tone = "secondary") {
+  const disabled = isTaskActionDisabled(action);
+  return `<button class="${tone}" data-task-action="${action}" ${disabled ? "disabled" : ""}>${label}</button>`;
+}
+
+function isTaskActionDisabled(action) {
+  if (["add", "batch"].includes(action)) return !can("tasks:create");
+  const zone = state.taskZone;
+  if (action === "historyAll") return zone !== "history" || state.taskHistoryAllLoaded;
+  const needsSelection = ["edit", "hold", "delete", "cancel", "resubmit", "log"].includes(action);
+  if (needsSelection && !selectedTask()) return true;
+  if (zone === "wait") return ["cancel", "resubmit"].includes(action);
+  if (zone === "running") return ["edit", "hold", "delete", "resubmit"].includes(action);
+  if (zone === "history") return ["hold", "cancel"].includes(action);
+  return false;
+}
+
+function taskGpuModelText(task) {
+  if (task.gpu_models?.length) return task.gpu_models.join(", ");
+  const requested = task.requirement?.gpu_types || [];
+  return requested.length ? requested.join(", ") : "不限型号";
+}
+
+function renderTaskTimes(task) {
+  return `
+    <span class="muted">提交：${formatDate(task.created_at)}</span><br>
+    <span class="muted">执行：${formatDate(task.started_at)}</span><br>
+    <span class="muted">结束：${formatDate(task.finished_at)}</span>
+  `;
+}
+
+function taskToDraft(mode, task = null) {
+  return {
+    mode,
+    task_id: task?.task_id || "",
+    description: task?.description || "",
+    env_id: task?.env_id || "",
+    workdir: task?.workdir || "/",
+    command: task?.command || "",
+    commands: "",
+    node_id: task?.requirement?.node_id || "",
+    need_gpus: task?.requirement?.need_gpus ?? 1,
+    gpu_types: task?.requirement?.gpu_types || [],
+    predecessor_task_id: task?.predecessor_task_id || "",
+    urgent: Boolean(task?.urgent),
+    allow_gpu_reuse: Boolean(task?.requirement?.allow_gpu_reuse),
+    on_hold: mode === "batch" || Boolean(task?.on_hold),
+  };
+}
+
+function captureTaskFormDraft(form) {
+  return {
+    mode: form.dataset.taskFormMode || "add",
+    task_id: formValue(form, "task_id"),
+    description: formValue(form, "description"),
+    env_id: formValue(form, "env_id"),
+    workdir: formValue(form, "workdir") || "/",
+    command: form.elements.command?.value || "",
+    commands: form.elements.commands?.value || "",
+    node_id: formValue(form, "node_id"),
+    need_gpus: formValue(form, "need_gpus") || 1,
+    gpu_types: checkedValues("taskGpuTypeOptions"),
+    predecessor_task_id: formValue(form, "predecessor_task_id"),
+    urgent: form.elements.urgent?.checked || false,
+    allow_gpu_reuse: form.elements.allow_gpu_reuse?.checked || false,
+    on_hold: form.elements.on_hold?.checked || false,
+  };
+}
+
+function renderTaskForm(mode, task = null) {
+  const draft = state.taskFormDraft || taskToDraft(mode, task);
+  const isBatch = mode === "batch";
+  const isEdit = mode === "edit";
+  const envOptions = renderTaskEnvOptions(draft.env_id);
+  const nodeOptions = renderTaskNodeOptions(draft.node_id);
+  const gpuOptions = renderTaskGpuTypeOptions(draft.node_id || "", draft.gpu_types || []);
+  const predecessorOptions = renderTaskPredecessorOptions(draft.predecessor_task_id || "");
+  const workdir = draft.workdir || "/";
+  return `
+    <form method="post" id="taskForm" class="task-edit-form" data-task-form-mode="${escapeAttr(mode)}">
+      ${isEdit ? `<input type="hidden" name="task_id" value="${escapeAttr(draft.task_id)}">` : ""}
+      <label>选择环境<select name="env_id"><option value="">不指定</option>${envOptions}</select></label>
+      <label>项目路径
+        <input type="hidden" name="workdir" value="${escapeAttr(workdir)}">
+        <span class="path-pick">
+          <code id="taskWorkdirPreview">${escapeHtml(workdir)}</code>
+          <button type="button" class="secondary" data-task-pick-workdir>选择文件夹</button>
+        </span>
+      </label>
+      <label class="full-row">${isBatch ? "执行命令（一行一个）" : "执行命令"}
+        ${isBatch
+          ? `<textarea name="commands" required placeholder="python train.py --config /home/ddltm/data/user/${escapeAttr(state.user?.username || "user")}/project/config.yaml&#10;# 空行和注释会被忽略">${escapeHtml(draft.commands || "")}</textarea>`
+          : `<input name="command" required value="${escapeAttr(draft.command || "")}" placeholder="python example.py --config ${escapeAttr(taskHomeHint())}/project/config.yaml">`}
+        <span class="muted">用户文件夹绝对路径：${escapeHtml(taskHomeHint())}</span>
+      </label>
+      <label>指定计算节点<select name="node_id" data-task-node-select><option value="">${escapeHtml("<任意>")}</option>${nodeOptions}</select></label>
+      <label>需求的 GPU 数量<input name="need_gpus" type="number" min="0" max="16" value="${escapeAttr(draft.need_gpus ?? 1)}"></label>
+      <div class="full-row task-gpu-picker">
+        <span>指定 GPU 型号</span>
+        <div id="taskGpuTypeOptions" class="task-check-grid">${gpuOptions}</div>
+      </div>
+      <label>前驱任务<select name="predecessor_task_id"><option value="">无</option>${predecessorOptions}</select></label>
+      <label>任务描述<input name="description" value="${escapeAttr(draft.description || "")}" placeholder="可选"></label>
+      <label class="check"><input name="urgent" type="checkbox" ${draft.urgent ? "checked" : ""}>紧急任务</label>
+      <label class="check"><input name="allow_gpu_reuse" type="checkbox" ${draft.allow_gpu_reuse ? "checked" : ""}>复用 GPU</label>
+      <label class="check"><input name="on_hold" type="checkbox" ${draft.on_hold ? "checked" : ""}>挂起任务</label>
+      <div class="form-actions full-row">
+        <button type="submit">${isEdit ? "提交修改" : "添加"}</button>
+      </div>
+    </form>
+  `;
+}
+
+function renderTaskEnvOptions(selectedId = "") {
+  return (state.data.envs || [])
+    .filter(isEnvUsable)
+    .map((env) => `<option value="${env.id}" ${String(selectedId || "") === String(env.id) ? "selected" : ""}>${escapeHtml(env.name)}</option>`)
+    .join("");
+}
+
+function renderTaskNodeOptions(selectedId = "") {
+  return (state.data.nodes || [])
+    .map((node) => `<option value="${node.id}" ${String(selectedId || "") === String(node.id) ? "selected" : ""}>${escapeHtml(node.name)}</option>`)
+    .join("");
+}
+
+function renderTaskGpuTypeOptions(nodeId = "", selectedTypes = []) {
+  const selected = new Set((selectedTypes || []).map(String));
+  const nodes = nodeId ? (state.data.nodes || []).filter((node) => String(node.id) === String(nodeId)) : (state.data.nodes || []);
+  const models = [];
+  nodes.forEach((node) => (node.gpus || []).forEach((gpu) => {
+    if (gpu.model && !models.includes(gpu.model)) models.push(gpu.model);
+  }));
+  return models.length
+    ? models.map((model) => `<label class="checkline"><input type="checkbox" value="${escapeAttr(model)}" ${selected.has(String(model)) ? "checked" : ""}>${escapeHtml(model)}</label>`).join("")
+    : `<span class="muted">暂无可选 GPU 型号</span>`;
+}
+
+function renderTaskPredecessorOptions(selectedId = "") {
+  return (state.taskPredecessorOptions || [])
+    .map((task) => `<option value="${escapeAttr(task.task_id)}" ${String(selectedId || "") === String(task.task_id) ? "selected" : ""}>${escapeHtml(task.task_id)} · ${escapeHtml(task.description || stateText(task.state))}</option>`)
+    .join("");
+}
+
+function taskHomeHint() {
+  if (state.user?.role === "admin") return "/home/ddltm";
+  return `/home/ddltm/data/user/${state.user?.username || "user"}`;
 }
 
 function renderFiles() {
@@ -1795,7 +2179,8 @@ function renderFileTargetPicker() {
   const action = fileTargetActionText(picker.mode);
   const isEnvImport = picker.mode === "env-import";
   const isEnvPackage = picker.mode === "env-package";
-  const targetPath = isEnvImport ? picker.sourcePath : (isEnvPackage ? (picker.selectKind === "directory" ? picker.currentPath : picker.sourcePath) : buildPickedTargetPath(picker.sourcePath, picker.currentPath, picker.mode));
+  const isTaskWorkdir = picker.mode === "task-workdir";
+  const targetPath = isTaskWorkdir ? picker.currentPath : (isEnvImport ? picker.sourcePath : (isEnvPackage ? (picker.selectKind === "directory" ? picker.currentPath : picker.sourcePath) : buildPickedTargetPath(picker.sourcePath, picker.currentPath, picker.mode)));
   const invalidTarget = !targetPath;
   const fileGlyph = isEnvImport ? "ZIP" : "PKG";
   const filePickerHint = picker.selectKind === "directory" ? "当前目录会作为选中的文件夹" : "请选择安装文件";
@@ -1805,12 +2190,12 @@ function renderFileTargetPicker() {
         <div class="file-picker-head">
           <div>
             <h2 id="filePickerTitle">${action}</h2>
-            <span>${escapeHtml(isEnvImport ? "请选择用户根目录下的环境 zip 包" : (isEnvPackage ? filePickerHint : baseName(picker.sourcePath)))}</span>
+            <span>${escapeHtml(isTaskWorkdir ? "请选择任务项目文件夹" : (isEnvImport ? "请选择用户根目录下的环境 zip 包" : (isEnvPackage ? filePickerHint : baseName(picker.sourcePath))))}</span>
           </div>
           <button class="secondary" data-file-picker-close>关闭</button>
         </div>
         <div class="file-picker-current">
-          <span>${isEnvImport || isEnvPackage ? "当前目录" : "目标目录"}</span>
+          <span>${isEnvImport || isEnvPackage || isTaskWorkdir ? "当前目录" : "目标目录"}</span>
           <strong>${escapeHtml(picker.currentPath)}</strong>
         </div>
         <div class="file-picker-nav">
@@ -1828,15 +2213,15 @@ function renderFileTargetPicker() {
               <span class="file-glyph">${fileGlyph}</span>
               <span>${escapeHtml(item.name)}</span>
             </button>
-          `).join("") : `<div class="file-empty">${isEnvImport ? "当前目录下没有 zip 包或子文件夹" : (isEnvPackage ? "当前目录下没有可选择项目" : "当前目录下没有子文件夹")}</div>`}
+          `).join("") : `<div class="file-empty">${isTaskWorkdir ? "当前目录下没有子文件夹" : (isEnvImport ? "当前目录下没有 zip 包或子文件夹" : (isEnvPackage ? "当前目录下没有可选择项目" : "当前目录下没有子文件夹"))}</div>`}
         </div>
         <div class="file-picker-target">
-          <span>${isEnvPackage && picker.selectKind === "directory" ? "选中文件夹" : (isEnvImport || isEnvPackage ? "已选择" : "将生成")}</span>
-          <code>${escapeHtml(targetPath || (isEnvImport ? "请选择 zip 包" : (isEnvPackage ? "请选择文件或文件夹" : "不能选择当前目标目录")))}</code>
+          <span>${isTaskWorkdir ? "选中项目路径" : (isEnvPackage && picker.selectKind === "directory" ? "选中文件夹" : (isEnvImport || isEnvPackage ? "已选择" : "将生成"))}</span>
+          <code>${escapeHtml(targetPath || (isTaskWorkdir ? "请选择项目文件夹" : (isEnvImport ? "请选择 zip 包" : (isEnvPackage ? "请选择文件或文件夹" : "不能选择当前目标目录"))))}</code>
         </div>
         <div class="file-picker-actions">
           <button class="secondary" data-file-picker-close>取消</button>
-          <button data-file-picker-confirm ${invalidTarget ? "disabled" : ""}>${isEnvImport ? "导入此环境" : (isEnvPackage ? "确认选择" : "选择此文件夹")}</button>
+          <button data-file-picker-confirm ${invalidTarget ? "disabled" : ""}>${isTaskWorkdir ? "使用此路径" : (isEnvImport ? "导入此环境" : (isEnvPackage ? "确认选择" : "选择此文件夹"))}</button>
         </div>
       </section>
     </div>
@@ -2009,23 +2394,39 @@ function renderPathPick(label, value, field, kind, extensions = "") {
 }
 
 function renderEnvPackageInstallResult(result = {}) {
+  const isJob = Boolean(result.status) && result.ok === undefined;
+  const statusText = isJob ? envInstallJobStatusLabel(result.status) : (result.ok ? "成功" : "失败");
+  const statusClass = isJob ? envInstallJobStatusClass(result.status) : (result.ok ? "available" : "failed");
   return `
     <div class="env-install-result">
       <dl class="kv">
-        <dt>状态</dt><dd><span class="status ${result.ok ? "available" : "failed"}">${result.ok ? "成功" : "失败"}</span></dd>
-        <dt>环境</dt><dd>${escapeHtml(result.env_name || "-")}</dd>
-        <dt>方式</dt><dd>${escapeHtml(result.method || "-")}</dd>
+        <dt>状态</dt><dd><span class="status ${statusClass}">${escapeHtml(statusText)}</span></dd>
+        <dt>环境</dt><dd>${escapeHtml(result.env_name || (result.env_id ? `#${result.env_id}` : "-"))}</dd>
+        <dt>方式</dt><dd>${escapeHtml(result.method || result.mode || "-")}</dd>
+        ${isJob ? `<dt>作业</dt><dd>#${escapeHtml(result.id || "-")}</dd>` : ""}
         <dt>返回码</dt><dd>${escapeHtml(result.return_code ?? "-")}</dd>
         <dt>日志</dt><dd><code>${escapeHtml(result.log_path || "-")}</code></dd>
       </dl>
-      <h3>命令</h3>
-      <pre class="drawer-log">${escapeHtml(result.command || "")}</pre>
-      <h3>stdout</h3>
-      <pre class="drawer-log">${escapeHtml(result.stdout || "")}</pre>
-      <h3>stderr</h3>
-      <pre class="drawer-log">${escapeHtml(result.stderr || "")}</pre>
+      ${isJob ? "" : `
+        <h3>命令</h3>
+        <pre class="drawer-log">${escapeHtml(result.command || "")}</pre>
+        <h3>stdout</h3>
+        <pre class="drawer-log">${escapeHtml(result.stdout || "")}</pre>
+        <h3>stderr</h3>
+        <pre class="drawer-log">${escapeHtml(result.stderr || "")}</pre>
+      `}
     </div>
   `;
+}
+
+function envInstallJobStatusLabel(status) {
+  return ({ queued: "排队中", running: "安装中", succeeded: "成功", failed: "失败", cancelled: "已取消" })[status] || status || "-";
+}
+
+function envInstallJobStatusClass(status) {
+  if (status === "succeeded") return "available";
+  if (["failed", "cancelled"].includes(status)) return "failed";
+  return "running";
 }
 
 function renderEnvPackageDeletePanel() {
@@ -2961,6 +3362,8 @@ function stateText(value) {
     failed: "失败",
     cancelled: "已取消",
     alloc_error: "调度错误",
+    dependency_failed: "依赖失败",
+    offline: "节点掉线",
     offline_error: "节点掉线",
     node_lost: "节点丢失",
     preparing: "准备中",
@@ -3120,7 +3523,7 @@ function bindEvents() {
   document.querySelector("[data-file-picker-confirm]")?.addEventListener("click", () => {
     const successText = state.fileTargetPicker?.mode === "env-import"
       ? ""
-      : (state.fileTargetPicker?.mode === "env-package" ? "" : (state.fileTargetPicker?.mode === "move" ? "已移动" : (state.fileTargetPicker?.mode === "extract" ? "已开始解压" : "已复制")));
+      : (["env-package", "task-workdir"].includes(state.fileTargetPicker?.mode) ? "" : (state.fileTargetPicker?.mode === "move" ? "已移动" : (state.fileTargetPicker?.mode === "extract" ? "已开始解压" : "已复制")));
     run(confirmFileTargetPicker, successText);
   });
   document.querySelectorAll("[data-file-picker-open]").forEach((button) => {
@@ -3140,9 +3543,19 @@ function bindEvents() {
   document.querySelector("[data-action='close-drawer']")?.addEventListener("click", () => {
     if (isEnvPackageInstalling() && !window.confirm("安装正在执行，关闭页面可能导致你无法看到实时结果。确认关闭吗？")) return;
     state.drawer = null;
+    state.taskFormDraft = null;
     render();
   });
   document.querySelectorAll("[data-task-zone]").forEach((button) => button.addEventListener("click", () => switchTaskZone(button.dataset.taskZone)));
+  document.querySelectorAll("[data-select-task]").forEach((input) => input.addEventListener("change", () => selectTask(input.value)));
+  document.querySelectorAll("[data-task-row]").forEach((row) => row.addEventListener("click", () => selectTask(row.dataset.taskRow)));
+  document.querySelectorAll("[data-task-row]").forEach((row) => row.addEventListener("dblclick", () => run(() => showTaskLog(row.dataset.taskRow))));
+  document.querySelectorAll("[data-task-action]").forEach((button) => button.addEventListener("click", () => run(() => handleTaskAction(button.dataset.taskAction))));
+  document.querySelector("[data-task-pick-workdir]")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    openTaskWorkdirPicker().catch((error) => showToast(error.message || "打开文件夹选择器失败", "error"));
+  });
+  document.querySelector("[data-task-node-select]")?.addEventListener("change", updateTaskGpuTypeOptions);
   document.querySelectorAll("[data-admin-menu]").forEach((button) => button.addEventListener("click", () => switchAdminMenu(button.dataset.adminMenu)));
   document.querySelectorAll("[data-audit-category]").forEach((button) => button.addEventListener("click", () => switchAuditCategory(button.dataset.auditCategory)));
   document.querySelectorAll("[data-audit-page]").forEach((button) => button.addEventListener("click", () => switchAuditPage(button.dataset.auditPage)));

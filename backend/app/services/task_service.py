@@ -1,182 +1,709 @@
-from itertools import count
+from __future__ import annotations
 
+import time
+from pathlib import Path
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
+
+from app.core.config import get_settings
 from app.core.errors import forbidden, not_found, validation_error
 from app.core.path_resolver import resolve_user_visible_path
 from app.core.rbac import Role, require_permission
-from app.schemas.tasks import TaskCreateRequest, TaskGuardInfo, TaskInfo, TaskUpdateRequest
-from app.services.audit_service import record_audit, utc_now
-from app.services.auth_service import UserRecord, find_user_by_id
+from app.core.time_utils import ensure_local_datetime, local_datetime
+from app.db.models import (
+    Env,
+    Gpu,
+    Node,
+    Task,
+    TaskAllocation,
+    TaskDependency,
+    TaskEvent,
+    TaskRequirement as TaskRequirementModel,
+    TaskRuntimeGuard,
+    User,
+    UserSupervisor,
+)
+from app.schemas.tasks import (
+    TaskBatchCreateRequest,
+    TaskBatchCreateResult,
+    TaskCreateRequest,
+    TaskDeletePreview,
+    TaskDeleteResult,
+    TaskGuardInfo,
+    TaskInfo,
+    TaskRequirement,
+    TaskUpdateRequest,
+)
+from app.services.audit_service import record_audit
+from app.services.auth_service import UserRecord
 from app.services.env_service import get_env_for_user
+from app.services.node_service import can_user_access_node
 
-_TASK_ID = count(1)
-_TASKS: list[TaskInfo] = []
+WAIT_STATES = {"wait", "on_hold"}
+RUNNING_STATES = {"dispatching", "starting", "running", "preparing"}
+TERMINAL_STATES = {
+    "succeeded",
+    "failed",
+    "cancelled",
+    "alloc_error",
+    "offline_error",
+    "offline",
+    "node_lost",
+    "dependency_failed",
+}
 
 
 def list_tasks(
     user: UserRecord,
+    db: Session,
     state: str | None,
     search: str | None,
     page: int,
     page_size: int,
+    all_history: bool = False,
 ) -> tuple[list[TaskInfo], int]:
-    """按角色过滤任务列表，并支持状态和关键词筛选。"""
+    """按角色可见性分页返回任务，历史区默认分页，显式加载时返回全部可见历史。"""
     require_permission(user.role, "tasks:read")
-    items = [task for task in _TASKS if can_view_task(user, task)]
-    if state:
-        items = [task for task in items if task_in_state_zone(task, state)]
-    if search:
-        lowered = search.lower()
-        items = [
-            task
-            for task in items
-            if lowered in task.task_id.lower() or lowered in task.description.lower()
-        ]
-    start = (page - 1) * page_size
-    end = start + page_size
-    return items[start:end], len(items)
-
-
-def create_task(user: UserRecord, payload: TaskCreateRequest) -> TaskInfo:
-    """提交任务并进入 wait 或 on_hold 状态，真实资源分配交给调度器。"""
-    require_permission(user.role, "tasks:create")
-    if user.state != "enabled":
-        raise forbidden("disabled user cannot submit tasks")
-    resolve_user_visible_path(payload.workdir, user.username, user.role.value)
-    if payload.env_id is not None:
-        env = get_env_for_user(user, payload.env_id)
-        if env.state not in {"available", "registered"}:
-            raise validation_error("environment is not available")
-    numeric_id = next(_TASK_ID)
-    task = TaskInfo(
-        id=numeric_id,
-        task_id=f"NG-{numeric_id:06d}",
-        user_id=user.id,
-        description=payload.description,
-        env_id=payload.env_id,
-        workdir=payload.workdir,
-        command=payload.command,
-        state="on_hold" if payload.on_hold else "wait",
-        priority=payload.priority,
-        on_hold=payload.on_hold,
-        created_at=utc_now(),
-        requirement=payload.requirement,
+    statement = (
+        select(Task)
+        .options(selectinload(Task.requirement))
+        .where(task_visibility_condition(user, db))
     )
-    _TASKS.append(task)
-    record_audit(user.id, "task.create", "task", task.task_id)
-    return task
-
-
-def get_task_for_user(user: UserRecord, task_id: str) -> TaskInfo:
-    """获取用户可见任务详情，不可见时按 NOT_FOUND 处理以减少越权探测。"""
-    task = find_task(task_id)
-    if task is None or not can_view_task(user, task):
-        raise not_found("task not found")
-    return task
-
-
-def update_task(user: UserRecord, task_id: str, payload: TaskUpdateRequest) -> TaskInfo:
-    """编辑等待或挂起任务，运行中任务不可修改以保护调度一致性。"""
-    task = get_task_for_user(user, task_id)
-    require_task_owner_or_admin(user, task)
-    if task.state not in {"wait", "on_hold"}:
-        raise validation_error("only wait or on_hold tasks can be edited")
-    data = payload.model_dump(exclude_unset=True)
-    if "workdir" in data and data["workdir"] is not None:
-        owner = find_user_by_id(task.user_id)
-        resolve_user_visible_path(
-            data["workdir"],
-            owner.username if owner else str(task.user_id),
-            owner.role.value if owner else user.role.value,
+    zone = (state or "").lower()
+    state_filter = task_state_condition(zone)
+    if state_filter is not None:
+        statement = statement.where(state_filter)
+    if search:
+        keyword = f"%{search.strip()}%"
+        statement = statement.where(
+            or_(Task.task_id.ilike(keyword), Task.description.ilike(keyword), Task.command.ilike(keyword))
         )
+    total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
+    ordered = order_task_query(statement, zone)
+    if not (all_history and zone in {"history", "hist", "finished"}):
+        ordered = ordered.offset((page - 1) * page_size).limit(page_size)
+    tasks = db.scalars(ordered).all()
+    return [build_task_info(task, db) for task in tasks], total
+
+
+def task_change_cursor(user: UserRecord, db: Session) -> dict[str, int]:
+    """返回当前用户可见任务的轻量版本号，供 SSE 判断是否需要刷新任务列表。"""
+    require_permission(user.role, "tasks:read")
+    visible_tasks = select(Task.id).where(task_visibility_condition(user, db)).subquery()
+    total = db.scalar(select(func.count()).select_from(visible_tasks)) or 0
+    max_task_id = db.scalar(select(func.max(visible_tasks.c.id))) or 0
+    max_event_id = db.scalar(
+        select(func.max(TaskEvent.id)).where(TaskEvent.task_id.in_(select(visible_tasks.c.id)))
+    ) or 0
+    return {
+        "total": int(total),
+        "max_task_id": int(max_task_id),
+        "max_event_id": int(max_event_id),
+    }
+
+
+def create_task(user: UserRecord, payload: TaskCreateRequest, db: Session) -> TaskInfo:
+    """提交单个任务并写入数据库，初始进入等待区或挂起状态。"""
+    task = create_task_model(user, payload, db)
+    db.commit()
+    db.refresh(task)
+    record_audit(user.id, "task.create", "task", task.task_id, detail_json={"owner_user_id": task.user_id})
+    return build_task_info(task, db)
+
+
+def create_tasks_batch(user: UserRecord, payload: TaskBatchCreateRequest, db: Session) -> TaskBatchCreateResult:
+    """按行批量提交任务，忽略空行、整行注释和 # 后面的注释内容。"""
+    commands = parse_batch_commands(payload.commands)
+    if not commands:
+        raise validation_error("batch commands are empty")
+    tasks: list[Task] = []
+    for command in commands:
+        task_payload = TaskCreateRequest(
+            description=payload.description,
+            env_id=payload.env_id,
+            workdir=payload.workdir,
+            command=command,
+            priority=payload.priority,
+            urgent=payload.urgent,
+            on_hold=payload.on_hold,
+            predecessor_task_id=payload.predecessor_task_id,
+            requirement=payload.requirement,
+        )
+        tasks.append(create_task_model(user, task_payload, db, flush_only=True))
+    db.commit()
+    for task in tasks:
+        db.refresh(task)
+    record_audit(user.id, "task.batch_create", "task", "batch", detail_json={"count": len(tasks)})
+    return TaskBatchCreateResult(items=[build_task_info(task, db) for task in tasks], total=len(tasks))
+
+
+def get_task_for_user(user: UserRecord, task_id: str, db: Session) -> TaskInfo:
+    """获取用户可见任务详情；不可见时按不存在处理，减少越权探测面。"""
+    task = find_task_model(task_id, db)
+    if task is None or not can_view_task(user, task, db):
+        raise not_found("task not found")
+    return build_task_info(task, db)
+
+
+def update_task(user: UserRecord, task_id: str, payload: TaskUpdateRequest, db: Session) -> TaskInfo:
+    """编辑等待、挂起或历史任务；历史任务编辑后会重新进入等待/挂起区。"""
+    task = require_task_model_for_user(user, task_id, db)
+    require_task_manager(user, task, db)
+    if task.state in RUNNING_STATES:
+        raise validation_error("running task cannot be edited")
+    data = payload.model_dump(exclude_unset=True)
+    owner = require_user_model(task.user_id, db)
+    if "workdir" in data and data["workdir"] is not None:
+        resolve_user_visible_path(data["workdir"], owner.username, owner.role)
     if "env_id" in data and data["env_id"] is not None:
         env = get_env_for_user(user, data["env_id"])
         if env.state not in {"available", "registered"}:
             raise validation_error("environment is not available")
+    if "requirement" in data and payload.requirement is not None:
+        validate_requirement_node(user, payload.requirement, db)
+        apply_requirement(task, payload.requirement)
+        data.pop("requirement")
+    predecessor_changed = "predecessor_task_id" in data
+    predecessor_task_id = data.pop("predecessor_task_id", None)
     for key, value in data.items():
-        if key == "requirement" and payload.requirement is not None:
-            task.requirement = payload.requirement
-            continue
-        setattr(task, key, value)
-    if "on_hold" in data:
+        if hasattr(task, key):
+            setattr(task, key, value)
+    if "urgent" in data and task.urgent and "priority" not in data:
+        task.priority = max(task.priority, 100)
+    if predecessor_changed:
+        replace_task_dependency(task, predecessor_task_id, user, db)
+    if task.state in TERMINAL_STATES:
+        # 历史任务被修改时按 2.0 行为重新入队；同时清理运行期字段，避免旧结果污染新执行。
+        release_task_allocations(task.id, db)
+        task.started_at = None
+        task.finished_at = None
+        task.return_code = None
+        task.last_block_reason = ""
+        task.generated_command = ""
+    if "on_hold" in data or task.state in TERMINAL_STATES:
         task.state = "on_hold" if task.on_hold else "wait"
+    add_task_event(db, task, "updated", "任务配置已修改", user.id, data)
+    db.commit()
+    db.refresh(task)
     record_audit(user.id, "task.update", "task", task.task_id, detail_json=data)
-    return task
+    return build_task_info(task, db)
 
 
-def cancel_task(user: UserRecord, task_id: str) -> TaskInfo:
-    """取消任务并记录完成时间，后续执行器会负责远程进程终止。"""
-    task = get_task_for_user(user, task_id)
-    require_task_owner_or_admin(user, task)
-    if task.state in {"succeeded", "failed", "cancelled"}:
+def hold_task(user: UserRecord, task_id: str, db: Session) -> TaskInfo:
+    """在等待和挂起之间切换，避免前端维护两个几乎相同的状态接口。"""
+    task = require_task_model_for_user(user, task_id, db)
+    require_task_manager(user, task, db)
+    if task.state not in WAIT_STATES:
+        raise validation_error("only waiting or held task can toggle hold")
+    if task.state == "on_hold" or task.on_hold:
+        task.state = "wait"
+        task.on_hold = False
+        action = "resumed"
+        message = "任务已取消挂起"
+        audit_action = "task.resume"
+    else:
+        task.state = "on_hold"
+        task.on_hold = True
+        action = "held"
+        message = "任务已挂起"
+        audit_action = "task.hold"
+    add_task_event(db, task, action, message, user.id)
+    db.commit()
+    db.refresh(task)
+    record_audit(user.id, audit_action, "task", task.task_id)
+    return build_task_info(task, db)
+
+
+def cancel_task(user: UserRecord, task_id: str, db: Session) -> TaskInfo:
+    """中止任务；运行中任务会由执行 worker 根据运行时记录继续回收远端进程。"""
+    task = require_task_model_for_user(user, task_id, db)
+    require_task_manager(user, task, db)
+    if task.state in TERMINAL_STATES:
         raise validation_error("finished task cannot be cancelled")
+    previous_state = task.state
     task.state = "cancelled"
-    task.finished_at = utc_now()
-    record_audit(user.id, "task.cancel", "task", task.task_id)
-    return task
+    task.on_hold = False
+    task.finished_at = local_datetime()
+    if previous_state not in {"starting", "running"}:
+        release_task_allocations(task.id, db)
+    append_task_log(task, "\nProgram Terminated By User\n")
+    add_task_event(db, task, "cancelled", "任务已请求中止", user.id, {"previous_state": previous_state})
+    db.commit()
+    db.refresh(task)
+    record_audit(user.id, "task.cancel", "task", task.task_id, detail_json={"previous_state": previous_state})
+    return build_task_info(task, db)
 
 
-def resubmit_task(user: UserRecord, task_id: str) -> TaskInfo:
-    """基于历史任务创建一条新任务，保留命令和资源需求用于快速重跑。"""
-    source = get_task_for_user(user, task_id)
-    require_task_owner_or_admin(user, source)
+def delete_task(user: UserRecord, task_id: str, delete_successors: bool, db: Session) -> TaskDeleteResult:
+    """删除任务记录，可选择递归删除所有后继任务；运行中任务不会被删除。"""
+    task = require_task_model_for_user(user, task_id, db)
+    require_task_manager(user, task, db)
+    successor_tasks = load_successor_tasks(task.id, db)
+    selected = [task, *(successor_tasks if delete_successors else [])]
+    selected_by_id = {item.id: item for item in selected}
+    skipped = [item.task_id for item in selected if item.state in RUNNING_STATES]
+    if task.state in RUNNING_STATES:
+        raise validation_error("running task cannot be deleted")
+    removed: list[str] = []
+    for item in list(selected_by_id.values()):
+        if item.state in RUNNING_STATES:
+            continue
+        require_task_manager(user, item, db)
+        release_task_allocations(item.id, db)
+        db.query(TaskDependency).filter(
+            or_(TaskDependency.task_id == item.id, TaskDependency.prev_task_id == item.id)
+        ).delete(synchronize_session=False)
+        removed.append(item.task_id)
+        db.delete(item)
+    db.commit()
+    record_audit(
+        user.id,
+        "task.delete",
+        "task",
+        task_id,
+        detail_json={"removed": removed, "skipped_running": skipped, "delete_successors": delete_successors},
+    )
+    return TaskDeleteResult(removed=removed, skipped_running=skipped)
+
+
+def preview_task_delete(user: UserRecord, task_id: str, db: Session) -> TaskDeletePreview:
+    """返回递归后继任务 ID，用于删除前二次确认。"""
+    task = require_task_model_for_user(user, task_id, db)
+    require_task_manager(user, task, db)
+    successors = [item.task_id for item in load_successor_tasks(task.id, db) if can_view_task(user, item, db)]
+    return TaskDeletePreview(task_id=task.task_id, successors=successors)
+
+
+def resubmit_task(user: UserRecord, task_id: str, db: Session) -> TaskInfo:
+    """基于已有任务生成新 ID 的任务，保留命令、环境、资源需求和前驱配置。"""
+    source = require_task_model_for_user(user, task_id, db)
+    require_task_manager(user, source, db)
+    predecessor = load_predecessor(source.id, db)
     payload = TaskCreateRequest(
         description=source.description,
         env_id=source.env_id,
         workdir=source.workdir,
         command=source.command,
         priority=source.priority,
+        urgent=source.urgent,
         on_hold=False,
-        requirement=source.requirement,
+        predecessor_task_id=predecessor.task_id if predecessor else None,
+        requirement=task_requirement_schema(source.requirement),
     )
-    task = create_task(user, payload)
+    task = create_task_model(user, payload, db, owner_user_id=source.user_id)
+    db.commit()
+    db.refresh(task)
     record_audit(user.id, "task.resubmit", "task", task.task_id, detail_json={"source": task_id})
+    return build_task_info(task, db)
+
+
+def get_task_log(user: UserRecord, task_id: str, tail: str | None, db: Session) -> str:
+    """读取任务日志尾部，避免大日志一次性进入内存。"""
+    task = require_task_model_for_user(user, task_id, db)
+    log_path = task.log_path or str(Path(get_settings().task_log_root) / f"{task.task_id}.log")
+    path = Path(log_path)
+    if not path.exists() or not path.is_file():
+        return f"[{task.task_id}] 日志尚未生成\nlog_path={log_path}\n"
+    max_bytes = parse_tail_bytes(tail)
+    with path.open("rb") as file:
+        file.seek(0, 2)
+        size = file.tell()
+        file.seek(max(0, size - max_bytes))
+        return file.read(max_bytes).decode("utf-8", errors="replace")
+
+
+def get_task_guard(user: UserRecord, task_id: str, db: Session) -> TaskGuardInfo:
+    """返回运行时守护摘要，普通用户也只能访问自己可见的任务。"""
+    task = require_task_model_for_user(user, task_id, db)
+    guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+    allocations = db.scalars(select(TaskAllocation).where(TaskAllocation.task_id == task.id)).all()
+    allocated_gpu_ids: list[int] = []
+    for allocation in allocations:
+        allocated_gpu_ids.extend(coerce_int(gpu_id) for gpu_id in allocation.gpu_ids)
+    return TaskGuardInfo(
+        task_id=task.task_id,
+        root_pid=guard.root_pid if guard else None,
+        process_group_id=guard.process_group_id if guard else None,
+        allocated_gpu_ids=allocated_gpu_ids,
+        observed_gpu_uuids=guard.observed_gpu_uuids if guard else [],
+        violation_count=guard.violation_count if guard else 0,
+        state=guard.state if guard else "not_started",
+        last_check_at=datetime_to_iso(guard.last_check_at) if guard and guard.last_check_at else None,
+    )
+
+
+def create_task_model(
+    user: UserRecord,
+    payload: TaskCreateRequest,
+    db: Session,
+    owner_user_id: int | None = None,
+    flush_only: bool = False,
+) -> Task:
+    """创建任务 ORM 对象；批量提交复用该函数以保证校验和事件一致。"""
+    require_permission(user.role, "tasks:create")
+    if user.state != "enabled":
+        raise forbidden("disabled user cannot submit tasks")
+    owner = require_user_model(owner_user_id or user.id, db)
+    resolve_user_visible_path(payload.workdir, owner.username, owner.role)
+    if payload.env_id is not None:
+        env = get_env_for_user(user, payload.env_id)
+        if env.state not in {"available", "registered"}:
+            raise validation_error("environment is not available")
+    validate_requirement_node(user, payload.requirement, db)
+    task = Task(
+        task_id=generate_task_id(db),
+        user_id=owner.id,
+        description=payload.description,
+        env_id=payload.env_id,
+        workdir=payload.workdir,
+        command=payload.command,
+        state="on_hold" if payload.on_hold else "wait",
+        priority=max(payload.priority, 100 if payload.urgent else payload.priority),
+        urgent=payload.urgent,
+        on_hold=payload.on_hold,
+        log_path=str(Path(get_settings().task_log_root) / f"pending-{int(time.time() * 1000)}.log"),
+        created_at=local_datetime(),
+        requirement=TaskRequirementModel(
+            need_gpus=payload.requirement.need_gpus,
+            gpu_types=payload.requirement.gpu_types,
+            node_id=payload.requirement.node_id,
+            allow_gpu_reuse=payload.requirement.allow_gpu_reuse,
+            max_reuse_count=payload.requirement.max_reuse_count,
+        ),
+    )
+    db.add(task)
+    db.flush()
+    task.log_path = str(Path(get_settings().task_log_root) / f"{task.task_id}.log")
+    replace_task_dependency(task, payload.predecessor_task_id, user, db)
+    add_task_event(db, task, "created", "任务已提交", user.id)
+    if not flush_only:
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            raise validation_error("task id already exists") from exc
     return task
 
 
-def get_task_log(user: UserRecord, task_id: str, tail: str | None) -> str:
-    """返回任务日志占位内容，真实版本会读取配置的任务日志目录。"""
-    task = get_task_for_user(user, task_id)
-    return f"[{task.task_id}] log tail={tail or 'default'}\nlog storage is not connected yet\n"
+def apply_requirement(task: Task, requirement: TaskRequirement) -> None:
+    """把资源需求写回 ORM；缺失旧记录时补建，避免历史数据升级后编辑失败。"""
+    if task.requirement is None:
+        task.requirement = TaskRequirementModel(task_id=task.id)
+    task.requirement.need_gpus = requirement.need_gpus
+    task.requirement.gpu_types = requirement.gpu_types
+    task.requirement.node_id = requirement.node_id
+    task.requirement.allow_gpu_reuse = requirement.allow_gpu_reuse
+    task.requirement.max_reuse_count = requirement.max_reuse_count
 
 
-def get_task_guard(user: UserRecord, task_id: str) -> TaskGuardInfo:
-    """返回运行时守护占位摘要，普通用户只看到自己任务的脱敏信息。"""
-    task = get_task_for_user(user, task_id)
-    return TaskGuardInfo(
-        task_id=task.task_id,
-        root_pid=None,
-        process_group_id=None,
-        allocated_gpu_ids=[],
-        observed_gpu_uuids=[],
-        violation_count=0,
-        state="not_started",
-        last_check_at=None,
+def validate_requirement_node(user: UserRecord, requirement: TaskRequirement, db: Session) -> None:
+    """校验指定节点必须存在且对当前用户可用，防止前端伪造私有节点 ID。"""
+    if requirement.node_id is None:
+        return
+    node = db.get(Node, requirement.node_id)
+    if node is None:
+        raise validation_error("node not found")
+    if user.role != Role.ADMIN and not can_user_access_node(user, node, db):
+        raise forbidden("node is not visible to current user")
+
+
+def replace_task_dependency(task: Task, predecessor_task_id: str | None, user: UserRecord, db: Session) -> None:
+    """整体替换任务前驱关系，当前 UI 只支持一个前驱任务。"""
+    db.query(TaskDependency).filter(TaskDependency.task_id == task.id).delete(synchronize_session=False)
+    predecessor_task_id = (predecessor_task_id or "").strip()
+    if not predecessor_task_id:
+        return
+    predecessor = find_task_model(predecessor_task_id, db)
+    if predecessor is None or not can_view_task(user, predecessor, db):
+        raise validation_error("predecessor task not found")
+    if predecessor.id == task.id:
+        raise validation_error("task cannot depend on itself")
+    if predecessor.state in TERMINAL_STATES:
+        # 历史前驱允许用于重跑场景；等待/执行前驱是常规路径，因此这里只禁止不存在和自依赖。
+        pass
+    db.add(TaskDependency(task_id=task.id, prev_task_id=predecessor.id, policy="success"))
+
+
+def task_visibility_condition(user: UserRecord, db: Session):
+    """生成任务可见性条件：学生看自己，导师看自己和学生，管理员看全部。"""
+    if user.role == Role.ADMIN:
+        return True
+    visible_user_ids = [user.id]
+    if user.role == Role.MENTOR:
+        visible_user_ids.extend(
+            db.scalars(select(UserSupervisor.student_id).where(UserSupervisor.supervisor_id == user.id)).all()
+        )
+    return Task.user_id.in_(visible_user_ids)
+
+
+def task_state_condition(zone: str):
+    """把等待区/执行区/历史区映射为任务状态集合，也兼容精确状态筛选。"""
+    if not zone:
+        return None
+    if zone in {"wait", "waiting", "queue"}:
+        return Task.state.in_(WAIT_STATES)
+    if zone in {"running", "exec"}:
+        return Task.state.in_(RUNNING_STATES)
+    if zone in {"history", "hist", "finished"}:
+        return Task.state.in_(TERMINAL_STATES)
+    return Task.state == zone
+
+
+def order_task_query(statement, zone: str):
+    """不同区域使用不同排序：等待区按调度优先级，历史区最新结束在前。"""
+    if zone in {"history", "hist", "finished"}:
+        return statement.order_by(Task.finished_at.desc().nullslast(), Task.created_at.desc())
+    if zone in {"wait", "waiting", "queue"}:
+        return statement.order_by(Task.urgent.desc(), Task.priority.desc(), Task.created_at.asc())
+    return statement.order_by(Task.started_at.desc().nullslast(), Task.created_at.desc())
+
+
+def can_view_task(user: UserRecord, task: Task, db: Session) -> bool:
+    """判断用户是否可见任务；导师范围来自 user_supervisors 关系表。"""
+    if user.role == Role.ADMIN:
+        return True
+    if task.user_id == user.id:
+        return True
+    if user.role != Role.MENTOR:
+        return False
+    return db.scalar(
+        select(UserSupervisor.id)
+        .where(UserSupervisor.supervisor_id == user.id)
+        .where(UserSupervisor.student_id == task.user_id)
+    ) is not None
+
+
+def can_manage_task(user: UserRecord, task: Task, db: Session) -> bool:
+    """判断用户是否可管理任务：本人、导师名下学生或管理员。"""
+    return task.user_id == user.id or (can_view_task(user, task, db) and user.role in {Role.ADMIN, Role.MENTOR})
+
+
+def require_task_manager(user: UserRecord, task: Task, db: Session) -> None:
+    """服务层强制任务管理权限，前端按钮禁用不能替代这里的判断。"""
+    if not can_manage_task(user, task, db):
+        raise forbidden("task manager required")
+
+
+def require_task_model_for_user(user: UserRecord, task_id: str, db: Session) -> Task:
+    """读取可见任务 ORM 对象，供会修改状态的服务函数使用。"""
+    task = find_task_model(task_id, db)
+    if task is None or not can_view_task(user, task, db):
+        raise not_found("task not found")
+    return task
+
+
+def find_task_model(task_id: str, db: Session) -> Task | None:
+    """按业务任务号查找任务，并预加载资源需求。"""
+    return db.scalar(
+        select(Task)
+        .options(selectinload(Task.requirement))
+        .where(Task.task_id == task_id)
     )
 
 
-def find_task(task_id: str) -> TaskInfo | None:
-    """按业务 task_id 查找任务，避免路由层直接访问内存列表。"""
-    return next((task for task in _TASKS if task.task_id == task_id), None)
+def require_user_model(user_id: int, db: Session) -> User:
+    """获取任务所有人，缺失说明历史数据损坏，应按业务校验错误处理。"""
+    user = db.get(User, user_id)
+    if user is None:
+        raise validation_error("task owner not found")
+    return user
 
 
-def can_view_task(user: UserRecord, task: TaskInfo) -> bool:
-    """判断任务是否对用户可见，管理员和导师先拥有全量可见性。"""
-    return user.role in {Role.ADMIN, Role.MENTOR, Role.VIEWER} or task.user_id == user.id
+def build_task_info(task: Task, db: Session) -> TaskInfo:
+    """把任务 ORM 记录转换为前端展示模型，并附带 owner/env/allocation 摘要。"""
+    owner = db.get(User, task.user_id)
+    env = db.get(Env, task.env_id) if task.env_id is not None else None
+    predecessor = load_predecessor(task.id, db)
+    allocation = load_latest_allocation(task.id, db)
+    node = None
+    gpu_indices: list[int] = []
+    gpu_models: list[str] = []
+    if allocation is not None:
+        node = db.get(Node, allocation.node_id)
+        gpus = db.scalars(select(Gpu).where(Gpu.id.in_([coerce_int(item) for item in allocation.gpu_ids]))).all() if allocation.gpu_ids else []
+        gpus_by_id = {gpu.id: gpu for gpu in gpus}
+        for gpu_id in allocation.gpu_ids:
+            gpu = gpus_by_id.get(coerce_int(gpu_id))
+            if gpu is None:
+                continue
+            gpu_indices.append(gpu.gpu_index)
+            if gpu.model not in gpu_models:
+                gpu_models.append(gpu.model)
+    elif task.requirement and task.requirement.node_id is not None:
+        node = db.get(Node, task.requirement.node_id)
+    return TaskInfo(
+        id=task.id,
+        task_id=task.task_id,
+        user_id=task.user_id,
+        owner_name=owner.real_name if owner else "",
+        owner_username=owner.username if owner else "",
+        description=task.description,
+        env_id=task.env_id,
+        env_name=env.name if env else None,
+        env_path=env.path if env else None,
+        workdir=task.workdir,
+        command=task.command,
+        state=task.state,
+        priority=task.priority,
+        urgent=task.urgent,
+        on_hold=task.on_hold,
+        last_block_reason=task.last_block_reason,
+        log_path=task.log_path,
+        return_code=task.return_code,
+        created_at=datetime_to_iso(task.created_at),
+        started_at=datetime_to_iso(task.started_at) if task.started_at else None,
+        finished_at=datetime_to_iso(task.finished_at) if task.finished_at else None,
+        predecessor_task_id=predecessor.task_id if predecessor else None,
+        predecessor_task_no=predecessor.task_id if predecessor else None,
+        node_id=node.id if node else None,
+        node_name=node.name if node else None,
+        gpu_indices=gpu_indices,
+        gpu_models=gpu_models,
+        requirement=task_requirement_schema(task.requirement),
+    )
 
 
-def require_task_owner_or_admin(user: UserRecord, task: TaskInfo) -> None:
-    """断言用户是任务所有者或管理员，失败时返回 403。"""
-    if user.role != Role.ADMIN and task.user_id != user.id:
-        raise forbidden("task owner or admin required")
+def task_requirement_schema(requirement: TaskRequirementModel | None) -> TaskRequirement:
+    """把 ORM 资源需求转换为 Pydantic 模型，兼容缺失需求的历史任务。"""
+    if requirement is None:
+        return TaskRequirement()
+    return TaskRequirement(
+        need_gpus=requirement.need_gpus,
+        gpu_types=requirement.gpu_types or [],
+        node_id=requirement.node_id,
+        allow_gpu_reuse=requirement.allow_gpu_reuse,
+        max_reuse_count=requirement.max_reuse_count,
+    )
 
 
-def task_in_state_zone(task: TaskInfo, state: str) -> bool:
-    """支持 2.0 风格等待区、运行区、历史区筛选，也兼容精确状态筛选。"""
-    zone = state.lower()
-    if zone in {"wait", "waiting", "queue"}:
-        return task.state in {"wait", "on_hold"}
-    if zone in {"running", "exec"}:
-        return task.state in {"running", "preparing", "dispatching"}
-    if zone in {"history", "hist", "finished"}:
-        return task.state in {"succeeded", "failed", "cancelled", "alloc_error", "offline_error", "node_lost"}
-    return task.state == state
+def load_predecessor(task_pk: int, db: Session) -> Task | None:
+    """读取当前任务的单前驱任务。"""
+    dependency = db.scalar(select(TaskDependency).where(TaskDependency.task_id == task_pk))
+    return db.get(Task, dependency.prev_task_id) if dependency else None
+
+
+def load_successor_tasks(task_pk: int, db: Session) -> list[Task]:
+    """递归读取所有后继任务，删除确认时需要展示完整影响范围。"""
+    seen: set[int] = set()
+    result: list[Task] = []
+    frontier = [task_pk]
+    while frontier:
+        current = frontier.pop(0)
+        rows = db.scalars(select(TaskDependency).where(TaskDependency.prev_task_id == current)).all()
+        for row in rows:
+            if row.task_id in seen:
+                continue
+            seen.add(row.task_id)
+            task = db.get(Task, row.task_id)
+            if task is None:
+                continue
+            result.append(task)
+            frontier.append(task.id)
+    return result
+
+
+def load_latest_allocation(task_pk: int, db: Session) -> TaskAllocation | None:
+    """读取任务最近一次分配，历史区也要展示实际执行节点和 GPU。"""
+    return db.scalar(
+        select(TaskAllocation)
+        .where(TaskAllocation.task_id == task_pk)
+        .order_by(TaskAllocation.allocated_at.desc(), TaskAllocation.id.desc())
+    )
+
+
+def release_task_allocations(task_pk: int, db: Session) -> None:
+    """释放任务尚未释放的 allocation，保证调度器后续能重新使用资源。"""
+    now = local_datetime()
+    allocations = db.scalars(
+        select(TaskAllocation)
+        .where(TaskAllocation.task_id == task_pk)
+        .where(TaskAllocation.released_at.is_(None))
+    ).all()
+    for allocation in allocations:
+        allocation.released_at = now
+
+
+def add_task_event(
+    db: Session,
+    task: Task,
+    event_type: str,
+    message: str,
+    actor_user_id: int | None = None,
+    detail_json: dict | None = None,
+) -> None:
+    """追加任务事件流，记录状态变化原因，便于长时间运行后的审计和排障。"""
+    db.add(TaskEvent(
+        task_id=task.id,
+        event_type=event_type,
+        message=message,
+        actor_user_id=actor_user_id,
+        detail_json=detail_json or {},
+    ))
+
+
+def append_task_log(task: Task, text: str) -> None:
+    """在任务日志存在或可创建时追加系统消息，失败不影响状态落库。"""
+    log_path = task.log_path or str(Path(get_settings().task_log_root) / f"{task.task_id}.log")
+    try:
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(text)
+    except OSError:
+        return
+
+
+def parse_batch_commands(commands: str) -> list[str]:
+    """清理批量命令：空行、注释行和 # 后文本都会被忽略。"""
+    result: list[str] = []
+    for raw_line in commands.splitlines():
+        line = raw_line.split("#", maxsplit=1)[0].strip()
+        if line:
+            result.append(line)
+    return result
+
+
+def parse_tail_bytes(value: str | None) -> int:
+    """解析日志 tail 大小，默认读取 200KB，最大限制 512KB 保护 API 内存。"""
+    if not value:
+        return 200 * 1024
+    text = value.strip().lower()
+    multiplier = 1
+    if text.endswith("kb"):
+        multiplier = 1024
+        text = text[:-2]
+    elif text.endswith("mb"):
+        multiplier = 1024 * 1024
+        text = text[:-2]
+    try:
+        size = int(float(text) * multiplier)
+    except ValueError:
+        size = 200 * 1024
+    return max(1024, min(size, 512 * 1024))
+
+
+def generate_task_id(db: Session) -> str:
+    """生成毫秒精度时间戳任务号；同毫秒冲突时等待下一毫秒，避免覆盖旧任务。"""
+    for _ in range(1000):
+        now = local_datetime()
+        candidate = now.strftime("%y%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
+        if db.scalar(select(Task.id).where(Task.task_id == candidate)) is None:
+            return candidate
+        time.sleep(0.001)
+    raise validation_error("failed to generate task id")
+
+
+def datetime_to_iso(value) -> str:
+    """把数据库时间转换为本地时区 ISO 字符串。"""
+    converted = ensure_local_datetime(value)
+    return converted.isoformat() if converted else ""
+
+
+def coerce_int(value) -> int:
+    """把 JSON 中的 GPU ID 安全转换为整数，异常值按 0 处理。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0

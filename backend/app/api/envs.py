@@ -118,7 +118,7 @@ def post_local_package_install(
     request: Request,
     current_user: UserRecord = Depends(get_current_user),
 ):
-    """在主节点目标环境中执行离线安装。"""
+    """创建本机离线安装作业，实际安装由 env_install_worker 后台执行。"""
     result = install_local_package(current_user, env_id, payload)
     return api_success(data=result.model_dump(), request_id=request.headers.get("x-request-id"))
 

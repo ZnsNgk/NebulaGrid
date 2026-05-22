@@ -271,6 +271,7 @@ def build_gpu_info(gpu: Gpu, latest_metrics: LatestMetrics, occupied_gpu_ids: se
     return GpuInfo(
         id=gpu.id,
         gpu_index=gpu.gpu_index,
+        gpu_uuid=getattr(gpu, "gpu_uuid", "") or "",
         model=gpu.model,
         total_vram_mb=gpu.total_vram_mb,
         schedulable=gpu.schedulable,

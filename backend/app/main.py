@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import IntegrityError
 
 from app.api.router import get_api_router
 from app.core.config import get_settings
@@ -84,6 +85,17 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=422,
             request_id=get_request_id(request),
             data={"errors": exc.errors()},
+        )
+
+    @app.exception_handler(IntegrityError)
+    async def handle_integrity_error(request: Request, exc: IntegrityError) -> JSONResponse:
+        """把数据库唯一键/外键约束错误转成 400，避免节点管理等接口暴露 500。"""
+        logger.warning("database integrity error: %s", exc)
+        return api_error(
+            code="CONSTRAINT_ERROR",
+            message="request violates database constraints",
+            status_code=400,
+            request_id=get_request_id(request),
         )
 
 

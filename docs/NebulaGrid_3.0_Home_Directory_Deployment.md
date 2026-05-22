@@ -238,7 +238,21 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 
 当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。同一用户同时只能运行一个文件打包/解压任务，系统也会限制全局并发，避免共享盘 IO 被大量压缩任务打满。
 
-## 10. 环境目录与日志
+## 10. 任务调度状态
+
+普通训练任务已经以 PostgreSQL 为单一状态源，不再依赖 API 进程内存。任务提交、批量提交、修改、挂起、删除、后继任务确认、中止、重新提交、日志路径、执行时间、结束时间、实际节点和实际 GPU 分配都会写入 `tasks`、`task_requirements`、`task_dependencies`、`task_allocations`、`task_events` 和 `task_runtime_guards`。
+
+调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号和 GPU 复用策略选择资源。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
+
+任务日志默认位于 `/home/ddltm/data/logs/task_logs/<task_id>.log`；历史区默认加载最近 100 条可见任务，用户点击“查看所有历史任务”后才会加载全部可见历史任务，避免长时间运行后一次性拉取过多记录。
+
+## 11. 运行时守护与环境安装作业
+
+Runtime Guard 已经以 `task_runtime_guards` 为入口追踪运行任务。执行器启动远端 runner 后会记录 root PID 和进程组，守护进程通过 SSH 展开 PID 树，再读取 `nvidia-smi --query-compute-apps` 返回的 GPU UUID。GPU UUID 是越权判断依据，GPU index 只用于页面展示和 `CUDA_VISIBLE_DEVICES`。连续两轮发现任务使用未分配 GPU 后，系统会终止远端进程组、标记 `alloc_error`、释放 allocation，并把原因写入任务日志和 `task_events`。
+
+环境包安装已经进入 `env_install_jobs` 队列。本机 conda/pip 离线安装、上传包安装和 compile 安装都会持久化安装命令、工作目录、日志路径和目标节点信息，由 `nebulagrid-env-install-worker` 后台执行并写回返回码、包状态和环境日志。安装作业日志继续复用 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，因此该路径同样必须在主节点和计算节点保持一致。
+
+## 12. 环境目录与日志
 
 环境管理功能依赖 `/home/ddltm/envs/miniconda3/envs` 和 `/home/ddltm/data/logs/env_install_logs` 在主节点和计算节点路径一致。导入环境、创建环境副本、修复路径、检测环境和删除环境都会围绕这两个目录工作：
 

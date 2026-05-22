@@ -2011,15 +2011,30 @@ td {
   .admin-stats,
   .admin-grid,
   .node-management-grid,
+  .task-zone-tabs,
   .metrics,
   .env-package-panel,
   .framework-grid,
   .form-grid,
+  .task-edit-form,
   .task-form,
   .path-bar,
   .gpu-row,
   .refresh-control {
     grid-template-columns: 1fr;
+  }
+
+  .task-board-head {
+    display: grid;
+  }
+
+  .task-action-bar {
+    justify-content: flex-start;
+  }
+
+  .task-board {
+    height: min(760px, calc(100vh - 96px));
+    min-height: 420px;
   }
 
   .file-sidebar-panel,
@@ -2077,8 +2092,167 @@ td {
   gap: 10px;
 }
 
+.task-action-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+  margin: 0;
+}
+
+.task-board-stack {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 14px;
+  min-height: 0;
+}
+
+.task-board {
+  height: calc(100vh - 132px);
+  min-height: 520px;
+  display: grid;
+}
+
+.task-board-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+}
+
+.task-board-head > div:first-child {
+  min-width: 220px;
+}
+
+.task-board-head h2 {
+  margin: 0;
+  font-size: 22px;
+  color: #f8fbff;
+}
+
+.task-board-head span {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.task-zone-rail {
+  display: grid;
+  gap: 10px;
+}
+
+.task-zone-tabs {
+  grid-template-columns: repeat(3, minmax(0, 140px));
+}
+
+.task-zone-rail button {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.task-zone-content {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+}
+
+.task-list-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.task-list-summary strong {
+  color: #f8fbff;
+  font-size: 15px;
+}
+
+.task-list-summary span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.task-board table {
+  min-width: 1680px;
+}
+
+.task-board .table-wrap {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+}
+
+.task-board th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.task-row {
+  cursor: pointer;
+}
+
+.task-row:hover td {
+  background: rgba(74, 163, 255, 0.08);
+}
+
+.task-row.selected td {
+  background: rgba(74, 163, 255, 0.14);
+}
+
+.task-board input[type="radio"] {
+  width: auto;
+  min-height: 0;
+  cursor: pointer;
+}
+
+.task-command {
+  display: block;
+  max-width: 520px;
+  white-space: normal;
+  line-height: 1.5;
+}
+
+.task-edit-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.task-edit-form textarea {
+  min-height: 118px;
+  line-height: 1.55;
+}
+
+.task-gpu-picker {
+  display: grid;
+  gap: 8px;
+}
+
+.task-gpu-picker > span {
+  color: #c9d5f0;
+  font-size: 13px;
+}
+
+.task-check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(7, 16, 33, 0.58);
+  padding: 10px;
+}
+
 .task-tabs button.active,
-.admin-tabs button.active {
+.admin-tabs button.active,
+.task-zone-rail button.active {
   background: linear-gradient(135deg, rgba(139, 92, 246, 0.68), rgba(6, 182, 212, 0.34));
   color: #fff;
   border-color: rgba(34, 211, 238, 0.48);

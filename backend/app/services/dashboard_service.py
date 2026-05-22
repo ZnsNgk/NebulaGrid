@@ -13,7 +13,7 @@ def build_dashboard_summary(user: UserRecord, db: Session) -> DashboardSummary:
     # 共享范围只影响用户能看到和使用的 GPU；节点总量等平台级指标仍按全量计算节点统计。
     nodes = list_nodes(user, db, visible_only=False)
     visible_nodes = list_nodes(user, db, visible_only=True)
-    tasks, _ = list_tasks(user, state=None, search=None, page=1, page_size=200)
+    tasks, _ = list_tasks(user, db, state=None, search=None, page=1, page_size=200)
     gpus_total = sum(len(node.gpus) for node in nodes)
     return DashboardSummary(
         nodes_total=len(nodes),

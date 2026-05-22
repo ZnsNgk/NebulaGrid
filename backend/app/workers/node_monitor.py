@@ -88,6 +88,7 @@ def sync_gpu_inventory(db: Session, node: Node, gpus: Any) -> list[tuple[Gpu, di
             db.flush()
             existing[index] = gpu
             node.gpus.append(gpu)
+        gpu.gpu_uuid = str(item.get("uuid") or gpu.gpu_uuid or "")
         gpu.model = str(item.get("name") or gpu.model or "Unknown")
         gpu.total_vram_mb = coerce_int(item.get("memory_total_mb"))
         gpu.schedulable = True

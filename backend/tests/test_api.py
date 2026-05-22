@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
 from app.main import create_app
+from app.workers.runtime_guard import expand_pid_tree, parse_gpu_apps, parse_process_table
 
 
 def make_client() -> TestClient:
@@ -19,6 +20,29 @@ def test_health_check_returns_ok() -> None:
     assert response.status_code == 200
     assert payload["ok"] is True
     assert payload["data"]["status"] == "ok"
+
+
+def test_runtime_guard_matches_gpu_usage_from_pid_tree() -> None:
+    """验证 Runtime Guard 会把子进程 GPU 使用计入任务 PID 树，避免只检查根 PID 漏报。"""
+    process_table = parse_process_table(
+        """
+        100 1
+        101 100
+        102 101
+        200 1
+        """
+    )
+    task_pids = expand_pid_tree(100, process_table)
+    observed = parse_gpu_apps(
+        """
+        102, GPU-task, 2048
+        200, GPU-other, 1024
+        """,
+        task_pids,
+    )
+
+    assert task_pids == {100, 101, 102}
+    assert observed == {"GPU-task"}
 
 
 def test_auth_login_and_me() -> None:

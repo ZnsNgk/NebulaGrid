@@ -341,12 +341,14 @@ nebulagrid/
 | TASK-001     | 用户可提交任务，填写任务描述、环境、项目路径、执行命令、GPU 数量、GPU 型号、指定节点、前驱任务、紧急/挂起/GPU 复用等。 | P0         |
 | TASK-002     | 任务提交后系统生成 task_id，记录提交人、提交时间、原始参数和初始状态 wait/on_hold。                                    | P0         |
 | TASK-003     | 用户可查看自己的等待、运行、历史任务；导师可查看学生任务；管理员可查看所有任务。                                       | P0         |
-| TASK-004     | 用户可停止自己的运行任务；管理员可停止任意任务；导师默认无权停止学生任务。                                             | P0         |
+| TASK-004     | 学生可管理自己的任务；导师可查看并管理自己和名下学生任务；管理员可查看并管理所有任务。                                 | P0         |
 | TASK-005     | 等待任务可编辑、挂起、恢复、删除；运行任务不可编辑核心资源字段。                                                       | P0         |
 | TASK-006     | 历史任务支持分页、筛选、按用户/节点/状态/日期/关键字检索和重新提交。                                                   | P0         |
 | TASK-007     | 任务状态变化必须写入 task_events，便于追踪从等待到运行再到结束的完整过程。                                             | P0         |
 | TASK-008     | 任务可设置前驱任务，当前驱任务成功完成后才允许进入调度；若前驱失败，可按策略阻塞或标记依赖失败。                       | P1         |
-| TASK-009     | 支持批量任务提交和参数网格生成，但批量提交必须先预览生成结果。                                                         | P1         |
+| TASK-009     | 支持批量任务提交；批量命令一行一个，系统忽略空行、注释行和 `#` 后的注释内容。参数网格生成可作为后续增强。              | P1         |
+
+当前前端任务管理页面采用“顶部动作按钮 + 左侧等待区/执行区/历史区 + 列表”的结构。等待区提供“挂起/取消挂起选中任务”切换操作，并支持点击列表行任意位置选中任务。等待区禁用中止、重新提交、查看所有历史任务和查看日志；执行区禁用修改、挂起/取消挂起、删除、重新提交和查看所有历史任务；历史区禁用挂起/取消挂起和中止。历史区默认加载最近 100 条可见任务，用户显式点击“查看所有历史任务”后才加载全部可见历史任务。任务区切换只刷新当前任务列表，不重复拉取环境和节点；后端提供当前用户可见任务变化 SSE 流，任务新增、状态流转、删除等变化发生后，前端自动轻量刷新当前界面。
 
 ## 5.4 环境管理
 
@@ -1088,11 +1090,15 @@ running --> succeeded: exit 0
 running --> failed: exit non-zero
 running --> cancelled: user/admin stop
 running --> offline: node offline
+running --> alloc_error: gpu violation
+wait --> dependency_failed: predecessor failed
 wait --> [*]: delete
 succeeded --> [*]
 failed --> [*]
 cancelled --> [*]
 offline --> [*]
+alloc_error --> [*]
+dependency_failed --> [*]
 ```
 
 ## B.2 用户用例图（文字版）
@@ -1163,6 +1169,14 @@ offline --> [*]
 - 日志记录导入、复制、修复、检测、安装包、删除包和删除环境等操作。
 - 环境日志以 JSON Lines 落盘，并同步写入 env_operation_logs 表；页面查看时自动解析 JSON 和换行符。
 - 管理员可以查看所有环境日志，普通用户只能查看自己的环境日志。
+
+## D.6 环境安装作业与运行时守护
+
+- 本机 conda/pip 离线安装、上传包安装和 compile 安装均创建 `env_install_jobs` 记录，不再由 API 请求同步等待安装完成。
+- `env_install_jobs` 持久化安装命令、工作目录、目标节点、可见 GPU、日志路径、返回码和状态；worker 通过行锁领取 queued 作业，避免多 worker 重复执行。
+- 本机安装由 `nebulagrid-env-install-worker` 在目标环境中执行；compile 安装通过 SSH 在指定计算节点执行远端安装命令，要求 `/home/ddltm/data` 和 `/home/ddltm/envs` 路径一致。
+- Runtime Guard 以 `task_runtime_guards` 中的 root PID/进程组和 allocation GPU ID 为依据，远端展开 PID 树后按 GPU UUID 比对实际 `nvidia-smi` compute-apps 使用情况。
+- 守护检测连续两轮发现未分配 GPU 后，任务进入 `alloc_error`，系统终止远端进程组、释放 allocation，并写入任务日志、任务事件和审计线索。
 
 # 结语：开发时最重要的三条底线
 
