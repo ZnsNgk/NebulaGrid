@@ -59,12 +59,63 @@ def build_wrapper(args: argparse.Namespace) -> str:
     """生成等待用户命令完成的 wrapper，退出码会写入 status 文件。"""
     status_path = shell_quote(args.status_path)
     log_path = shell_quote(args.log_path)
-    command = args.command
+    command = shell_quote(args.command)
     return f"""#!/bin/bash
 set +e
 mkdir -p "$(dirname {log_path})" "$(dirname {status_path})"
 echo "[NebulaGrid] task started at $(date --iso-8601=seconds)" >> {log_path}
-{command} >> {log_path} 2>&1
+NEBULAGRID_COMMAND={command} NEBULAGRID_LOG_PATH={log_path} python3 - <<'PY' 2>> {log_path}
+import errno
+import os
+import pty
+import select
+import subprocess
+
+command = os.environ["NEBULAGRID_COMMAND"]
+log_path = os.environ["NEBULAGRID_LOG_PATH"]
+
+# 这里不用普通 shell 重定向，而是让用户命令跑在伪终端里，再按 chunk 立即写入日志。
+# 这样 Python、训练框架和进度条通常会按交互式输出刷新，避免等缓冲区满后才一次性落盘。
+master_fd, slave_fd = pty.openpty()
+process = subprocess.Popen(
+    ["/bin/bash", "-lc", command],
+    stdin=slave_fd,
+    stdout=slave_fd,
+    stderr=slave_fd,
+    close_fds=True,
+)
+os.close(slave_fd)
+log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_SYNC", 0), 0o644)
+try:
+    while True:
+        ready, _, _ = select.select([master_fd], [], [], 0.2)
+        if master_fd in ready:
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError as exc:
+                if exc.errno != errno.EIO:
+                    raise
+                data = b""
+            if data:
+                os.write(log_fd, data)
+            elif process.poll() is not None:
+                break
+        if process.poll() is not None:
+            try:
+                while True:
+                    data = os.read(master_fd, 4096)
+                    if not data:
+                        break
+                    os.write(log_fd, data)
+            except OSError as exc:
+                if exc.errno != errno.EIO:
+                    raise
+            break
+finally:
+    os.close(log_fd)
+    os.close(master_fd)
+raise SystemExit(process.wait())
+PY
 code=$?
 echo "[NebulaGrid] task finished at $(date --iso-8601=seconds) with code $code" >> {log_path}
 NEBULAGRID_RETURN_CODE=$code python3 - <<'PY' > {status_path}

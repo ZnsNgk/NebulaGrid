@@ -1890,6 +1890,51 @@ td {
   overflow: auto;
 }
 
+.task-log-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.task-log-toolbar,
+.task-log-command,
+.task-log-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.task-log-command {
+  align-items: stretch;
+}
+
+.task-log-command code {
+  flex: 1 1 360px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(8, 13, 25, 0.88);
+  color: #d7f6e5;
+  overflow: auto;
+  white-space: nowrap;
+}
+
+.task-log-status {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.task-log-content {
+  min-height: 58vh;
+  max-height: 68vh;
+  white-space: pre-wrap;
+}
+
+.error-text {
+  color: #fecaca;
+}
+
 .markdown-table {
   overflow: auto;
   margin: 12px 0;

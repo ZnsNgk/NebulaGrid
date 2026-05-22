@@ -11,6 +11,17 @@ const state = {
   taskFormDraft: null,
   taskEventsSource: null,
   taskRealtimeBusy: false,
+  taskLog: {
+    taskId: "",
+    text: "",
+    command: "",
+    refreshSeconds: Number(localStorage.getItem("ng_task_log_refresh_seconds") || 2),
+    paused: false,
+    busy: false,
+    timer: null,
+    lastRefreshAt: null,
+    error: "",
+  },
   adminMenu: localStorage.getItem("ng_admin_menu") || "overview",
   adminNodeEditId: null,
   auditCategory: localStorage.getItem("ng_audit_category") || "all",
@@ -64,6 +75,8 @@ const state = {
 const LOGIN_DEVICE_REFRESH_MS = 3000;
 const AUTH_WATCH_MS = 3000;
 const FILE_JOB_REFRESH_MS = 2000;
+const TASK_LOG_TAIL_BYTES = "200KB";
+const TASK_LOG_TAIL_LINES = 200;
 
 const authExpiredMessages = new Set([
   "invalid token",
@@ -292,6 +305,7 @@ function resetLocalLoginState(message = "") {
   state.user = null;
   state.data.sessions = [];
   state.drawer = null;
+  stopTaskLogRefreshTimer();
   if (message) state.loginError = message;
   localStorage.removeItem("ng_token");
   state.page = "dashboard";
@@ -486,6 +500,7 @@ function navigate(page) {
   }
   location.hash = `/${page}`;
   state.drawer = null;
+  stopTaskLogRefreshTimer();
   updateRealtimeTimers();
   run(refreshPage);
 }
@@ -505,6 +520,7 @@ function updateRealtimeTimers() {
   updateFileJobTimer();
   updateEnvRefreshTimer();
   updateAuthWatchTimer();
+  updateTaskLogRefreshTimer();
 }
 
 function updateTaskEventStream() {
@@ -785,8 +801,115 @@ async function resubmitTask(taskId) {
 }
 
 async function showTaskLog(taskId) {
-  const log = await api(`/tasks/${taskId}/log?tail=200KB`);
-  state.drawer = { title: `任务日志 ${taskId}`, body: `<pre class="drawer-log">${escapeHtml(log)}</pre>` };
+  stopTaskLogRefreshTimer();
+  const task = findTaskById(taskId) || (await api(`/tasks/${taskId}`)).data;
+  state.taskLog = {
+    ...state.taskLog,
+    taskId,
+    text: "正在读取日志...",
+    command: buildTaskLogCommand(task.log_path),
+    paused: false,
+    busy: false,
+    lastRefreshAt: null,
+    error: "",
+  };
+  state.drawer = { type: "task-log", title: `任务日志 ${taskId}` };
+  render();
+  await refreshTaskLogDrawer({ force: true });
+  updateTaskLogRefreshTimer();
+}
+
+function findTaskById(taskId) {
+  return (state.data.tasks.items || []).find((task) => task.task_id === taskId) || null;
+}
+
+function buildTaskLogCommand(logPath) {
+  const path = logPath || "<log_path>";
+  return `tail -f -n ${TASK_LOG_TAIL_LINES} ${shellQuote(path)}`;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
+}
+
+function stopTaskLogRefreshTimer() {
+  if (!state.taskLog.timer) return;
+  window.clearInterval(state.taskLog.timer);
+  state.taskLog.timer = null;
+}
+
+function updateTaskLogRefreshTimer() {
+  stopTaskLogRefreshTimer();
+  if (!state.user || state.drawer?.type !== "task-log" || !state.taskLog.taskId) return;
+  if (state.taskLog.paused || state.taskLog.refreshSeconds <= 0) return;
+  state.taskLog.timer = window.setInterval(() => refreshTaskLogDrawer(), state.taskLog.refreshSeconds * 1000);
+}
+
+async function refreshTaskLogDrawer({ force = false } = {}) {
+  if (!state.taskLog.taskId || state.taskLog.busy) return;
+  if (!force && (state.taskLog.paused || state.drawer?.type !== "task-log")) return;
+  const logElement = document.querySelector("[data-preserve-scroll='task-log']");
+  const shouldStickToBottom = !logElement || logElement.scrollTop + logElement.clientHeight >= logElement.scrollHeight - 24;
+  state.taskLog.busy = true;
+  try {
+    const log = await api(`/tasks/${state.taskLog.taskId}/log?tail=${encodeURIComponent(TASK_LOG_TAIL_BYTES)}`);
+    state.taskLog.text = log;
+    state.taskLog.error = "";
+    state.taskLog.lastRefreshAt = new Date();
+  } catch (error) {
+    state.taskLog.error = error.message || "日志刷新失败";
+  } finally {
+    state.taskLog.busy = false;
+    if (state.drawer?.type === "task-log") {
+      render();
+      if (shouldStickToBottom) scrollTaskLogToBottom();
+    }
+  }
+}
+
+function scrollTaskLogToBottom() {
+  const logElement = document.querySelector("[data-preserve-scroll='task-log']");
+  if (logElement) logElement.scrollTop = logElement.scrollHeight;
+}
+
+function setTaskLogRefreshSeconds(value) {
+  const seconds = Math.max(0, Math.min(3600, Number(value) || 0));
+  state.taskLog.refreshSeconds = seconds;
+  localStorage.setItem("ng_task_log_refresh_seconds", String(seconds));
+  updateTaskLogRefreshTimer();
+  render();
+}
+
+function toggleTaskLogRefresh() {
+  if (state.taskLog.paused || state.taskLog.refreshSeconds <= 0) {
+    state.taskLog.paused = false;
+    if (state.taskLog.refreshSeconds <= 0) {
+      state.taskLog.refreshSeconds = 2;
+      localStorage.setItem("ng_task_log_refresh_seconds", String(state.taskLog.refreshSeconds));
+    }
+  } else {
+    state.taskLog.paused = true;
+  }
+  updateTaskLogRefreshTimer();
+  render();
+}
+
+async function copyTaskLogCommand() {
+  const text = state.taskLog.command || "";
+  if (!text) return;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+  } else {
+    const input = document.createElement("textarea");
+    input.value = text;
+    input.style.position = "fixed";
+    input.style.left = "-9999px";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+  showToast("日志命令已复制", "success");
 }
 
 async function openTaskForm(mode) {
@@ -3196,8 +3319,38 @@ function renderDrawer() {
         <h2>${escapeHtml(state.drawer.title)}</h2>
         <button class="secondary" data-action="close-drawer">关闭</button>
       </div>
-      ${state.drawer.body}
+      ${state.drawer.type === "task-log" ? renderTaskLogDrawer() : state.drawer.body}
     </aside>
+  `;
+}
+
+function renderTaskLogDrawer() {
+  const status = state.taskLog.paused || state.taskLog.refreshSeconds <= 0
+    ? "已暂停"
+    : `每 ${state.taskLog.refreshSeconds} 秒刷新`;
+  const refreshedAt = state.taskLog.lastRefreshAt ? `上次刷新 ${formatTime(state.taskLog.lastRefreshAt)}` : "等待首次刷新";
+  return `
+    <div class="task-log-panel">
+      <div class="task-log-toolbar">
+        <button class="secondary" data-task-log-toggle>${state.taskLog.paused || state.taskLog.refreshSeconds <= 0 ? "恢复刷新" : "暂停刷新"}</button>
+        <button class="secondary" data-task-log-refresh>立即刷新</button>
+        <label class="refresh-control">刷新间隔
+          <input name="task_log_refresh_seconds" type="number" min="0" max="3600" step="1" value="${state.taskLog.refreshSeconds}">
+          <span>秒，0 为暂停</span>
+        </label>
+      </div>
+      <div class="task-log-command">
+        <code>${escapeHtml(state.taskLog.command)}</code>
+        <button class="secondary" data-task-log-copy>复制</button>
+      </div>
+      <div class="task-log-status">
+        <span>${escapeHtml(status)}</span>
+        <span>${escapeHtml(refreshedAt)}</span>
+        ${state.taskLog.busy ? "<span>刷新中...</span>" : ""}
+        ${state.taskLog.error ? `<span class="error-text">${escapeHtml(state.taskLog.error)}</span>` : ""}
+      </div>
+      <pre class="drawer-log task-log-content" data-preserve-scroll="task-log">${escapeHtml(normalizeTerminalLog(state.taskLog.text))}</pre>
+    </div>
   `;
 }
 
@@ -3482,6 +3635,49 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function normalizeTerminalLog(value) {
+  const text = String(value ?? "").replace(/\r\n/g, "\n");
+  const lines = [];
+  let line = "";
+  let cursor = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "\x1b") {
+      const match = text.slice(index).match(/^\x1b\[([0-?]*)([ -/]*)([@-~])/);
+      if (match) {
+        // tqdm 和终端进度条常用 ANSI K 清除当前行尾，这里按终端语义折叠展示文本。
+        if (match[3] === "K") line = line.slice(0, cursor);
+        index += match[0].length - 1;
+      }
+      continue;
+    }
+    if (char === "\r") {
+      cursor = 0;
+      continue;
+    }
+    if (char === "\n") {
+      lines.push(line);
+      line = "";
+      cursor = 0;
+      continue;
+    }
+    if (char === "\b") {
+      cursor = Math.max(0, cursor - 1);
+      line = line.slice(0, cursor) + line.slice(cursor + 1);
+      continue;
+    }
+    if (char < " " && char !== "\t") continue;
+    if (cursor < line.length) {
+      line = line.slice(0, cursor) + char + line.slice(cursor + 1);
+    } else {
+      line = line.padEnd(cursor, " ") + char;
+    }
+    cursor += 1;
+  }
+  lines.push(line);
+  return lines.join("\n").replace(/\n{4,}/g, "\n\n\n");
+}
+
 function escapeAttr(value) {
   return escapeHtml(value).replaceAll("`", "&#096;");
 }
@@ -3593,10 +3789,15 @@ function bindEvents() {
   document.querySelector("[name='dashboard_refresh_seconds']")?.addEventListener("change", (event) => setDashboardRefreshSeconds(event.currentTarget.value));
   document.querySelector("[data-action='close-drawer']")?.addEventListener("click", () => {
     if (isEnvPackageInstalling() && !window.confirm("安装正在执行，关闭页面可能导致你无法看到实时结果。确认关闭吗？")) return;
+    stopTaskLogRefreshTimer();
     state.drawer = null;
     state.taskFormDraft = null;
     render();
   });
+  document.querySelector("[data-task-log-toggle]")?.addEventListener("click", toggleTaskLogRefresh);
+  document.querySelector("[data-task-log-refresh]")?.addEventListener("click", () => run(() => refreshTaskLogDrawer({ force: true })));
+  document.querySelector("[data-task-log-copy]")?.addEventListener("click", () => run(copyTaskLogCommand));
+  document.querySelector("[name='task_log_refresh_seconds']")?.addEventListener("change", (event) => setTaskLogRefreshSeconds(event.currentTarget.value));
   document.querySelectorAll("[data-task-zone]").forEach((button) => button.addEventListener("click", () => switchTaskZone(button.dataset.taskZone)));
   document.querySelectorAll("[data-select-task]").forEach((input) => input.addEventListener("change", () => selectTask(input.value)));
   document.querySelectorAll("[data-task-row]").forEach((row) => row.addEventListener("click", () => selectTask(row.dataset.taskRow)));
