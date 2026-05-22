@@ -250,7 +250,9 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 
 Runtime Guard 已经以 `task_runtime_guards` 为入口追踪运行任务。执行器启动远端 runner 后会记录 root PID 和进程组，守护进程通过 SSH 展开 PID 树，再读取 `nvidia-smi --query-compute-apps` 返回的 GPU UUID。GPU UUID 是越权判断依据，GPU index 只用于页面展示和 `CUDA_VISIBLE_DEVICES`。连续两轮发现任务使用未分配 GPU 后，系统会终止远端进程组、标记 `alloc_error`、释放 allocation，并把原因写入任务日志和 `task_events`。
 
-环境包安装已经进入 `env_install_jobs` 队列。本机 conda/pip 离线安装、上传包安装和 compile 安装都会持久化安装命令、工作目录、日志路径和目标节点信息，由 `nebulagrid-env-install-worker` 后台执行并写回返回码、包状态和环境日志。安装作业日志继续复用 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，因此该路径同样必须在主节点和计算节点保持一致。
+环境包安装已经进入 `env_install_jobs` 队列。本机 conda/pip 离线安装、上传包安装和 compile 安装都会持久化安装命令、工作目录、日志路径、目标节点、主节点标记、GPU 可见模式和可见 GPU index。API 创建作业后会启动后台线程领取执行，生产部署仍建议同时运行 `nebulagrid-env-install-worker` 作为独立环境安装 worker；数据库作业状态会避免同一作业重复执行。安装作业日志继续复用 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，因此该路径同样必须在主节点和计算节点保持一致。
+
+用户点击安装包页面的“在指定节点”时，后端会实时探测主节点和用户可见计算节点的 `gcc`、`g++`、`clang`、`nvcc` 与 GPU 清单。默认 GPU 模式不设置 `CUDA_VISIBLE_DEVICES`；CPU 模式设置为目标节点 GPU 总数加一；指定 GPU 模式设置为用户勾选的 GPU index 列表。同一环境安装包或删除包期间会加锁，页面状态显示为“安装中”，再次提交会提示稍后再试。
 
 ## 12. 环境目录与日志
 

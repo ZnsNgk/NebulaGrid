@@ -246,6 +246,8 @@ class EnvInstallJob(Base, TimestampMixin):
     env_id: Mapped[int] = mapped_column(ForeignKey("envs.id"), index=True)
     mode: Mapped[str] = mapped_column(String(32), default="normal")
     target_node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"), nullable=True)
+    compile_on_master: Mapped[bool] = mapped_column(Boolean, default=False)
+    gpu_visibility: Mapped[str] = mapped_column(String(32), default="default")
     visible_gpu_indices: Mapped[list[int]] = mapped_column(JSON, default=list)
     command: Mapped[str] = mapped_column(Text, default="")
     workdir: Mapped[str] = mapped_column(String(1024), default="")

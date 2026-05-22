@@ -23,6 +23,7 @@ const state = {
     error: "",
   },
   adminMenu: localStorage.getItem("ng_admin_menu") || "overview",
+  adminSettingKey: "",
   adminNodeEditId: null,
   auditCategory: localStorage.getItem("ng_audit_category") || "all",
   auditPage: 1,
@@ -47,6 +48,7 @@ const state = {
   lastDashboardRefreshAt: null,
   drawer: null,
   fileTargetPicker: null,
+  envCompilePicker: null,
   envPackageInstall: null,
   envPackageDelete: null,
   fileViewScope: "own",
@@ -126,6 +128,7 @@ const errorMessageMap = {
   "package name is required": "请选择需要删除的包",
   "package not found": "包不存在，请刷新后重试",
   "protected package cannot be deleted": "环境默认包不能删除",
+  "environment package operation is running": "该环境正在进行操作，请稍后",
   "node name already exists": "节点名称已存在",
   "node owner not found": "节点所有人不存在，请刷新用户列表后重试",
   "gpu_count must match gpu_models length": "GPU 数量必须与 GPU 型号列表条数一致",
@@ -305,6 +308,7 @@ function resetLocalLoginState(message = "") {
   state.user = null;
   state.data.sessions = [];
   state.drawer = null;
+  state.envCompilePicker = null;
   stopTaskLogRefreshTimer();
   if (message) state.loginError = message;
   localStorage.removeItem("ng_token");
@@ -397,6 +401,7 @@ async function login(event) {
 function navigateAfterLogin() {
   state.page = "dashboard";
   state.drawer = null;
+  state.envCompilePicker = null;
   if (location.hash !== "#/dashboard") {
     history.replaceState(null, "", "#/dashboard");
   }
@@ -500,6 +505,7 @@ function navigate(page) {
   }
   location.hash = `/${page}`;
   state.drawer = null;
+  state.envCompilePicker = null;
   stopTaskLogRefreshTimer();
   updateRealtimeTimers();
   run(refreshPage);
@@ -1087,6 +1093,9 @@ async function showEnvPackageDrawer(envId, mode) {
     batch: false,
     folderCommand: "pip",
     installStatus: "ready",
+    compileTarget: null,
+    gpuVisibility: "default",
+    visibleGpuIndices: [],
     packagePath: "",
     folderPath: "",
     requirementsPath: "",
@@ -1127,6 +1136,85 @@ async function openEnvPackagePicker(field, kind, extensions = "") {
   render();
 }
 
+async function openEnvCompilePicker() {
+  if (isEnvPackageInstalling()) return;
+  refreshEnvPackageInstallFromForm();
+  const panel = state.envPackageInstall;
+  if (!panel) return;
+  state.envCompilePicker = {
+    loading: true,
+    targets: [],
+    selectedTargetId: panel.compileTarget?.id || "",
+    gpuVisibility: panel.gpuVisibility || "default",
+    visibleGpuIndices: [...(panel.visibleGpuIndices || [])],
+  };
+  render();
+  try {
+    const payload = await api("/envs/compile-targets");
+    state.envCompilePicker.targets = payload.data || [];
+    if (!state.envCompilePicker.selectedTargetId && state.envCompilePicker.targets.length) {
+      state.envCompilePicker.selectedTargetId = state.envCompilePicker.targets[0].id;
+    }
+  } finally {
+    if (state.envCompilePicker) state.envCompilePicker.loading = false;
+    render();
+  }
+}
+
+function closeEnvCompilePicker() {
+  state.envCompilePicker = null;
+  render();
+}
+
+function selectEnvCompileTarget(targetId) {
+  if (!state.envCompilePicker) return;
+  state.envCompilePicker.selectedTargetId = targetId;
+  state.envCompilePicker.gpuVisibility = "default";
+  state.envCompilePicker.visibleGpuIndices = [];
+  render();
+}
+
+function setCompileGpuMode(mode) {
+  if (!state.envCompilePicker) return;
+  state.envCompilePicker.gpuVisibility = mode;
+  if (mode !== "gpu") state.envCompilePicker.visibleGpuIndices = [];
+  render();
+}
+
+function toggleCompileGpu(index, checked) {
+  if (!state.envCompilePicker) return;
+  const current = new Set(state.envCompilePicker.visibleGpuIndices || []);
+  if (checked) current.add(Number(index));
+  else current.delete(Number(index));
+  state.envCompilePicker.visibleGpuIndices = Array.from(current).sort((a, b) => a - b);
+  state.envCompilePicker.gpuVisibility = state.envCompilePicker.visibleGpuIndices.length ? "gpu" : "default";
+  render();
+}
+
+function confirmEnvCompilePicker() {
+  const picker = state.envCompilePicker;
+  const panel = state.envPackageInstall;
+  if (!picker || !panel) return;
+  const target = (picker.targets || []).find((item) => item.id === picker.selectedTargetId);
+  if (!target) throw new Error("请选择编译节点");
+  if (picker.gpuVisibility === "gpu" && !(picker.visibleGpuIndices || []).length) throw new Error("请选择可见 GPU");
+  panel.compileTarget = target;
+  panel.gpuVisibility = picker.gpuVisibility || "default";
+  panel.visibleGpuIndices = panel.gpuVisibility === "gpu" ? [...(picker.visibleGpuIndices || [])] : [];
+  state.envCompilePicker = null;
+  if (state.drawer) state.drawer.body = renderEnvPackageInstallPanel();
+  render();
+}
+
+function clearEnvCompileTarget() {
+  if (!state.envPackageInstall || isEnvPackageInstalling()) return;
+  state.envPackageInstall.compileTarget = null;
+  state.envPackageInstall.gpuVisibility = "default";
+  state.envPackageInstall.visibleGpuIndices = [];
+  if (state.drawer) state.drawer.body = renderEnvPackageInstallPanel();
+  render();
+}
+
 async function submitEnvPackageInstall(event) {
   event.preventDefault();
   refreshEnvPackageInstallFromForm();
@@ -1141,6 +1229,10 @@ async function submitEnvPackageInstall(event) {
     requirements_path: panel.requirementsPath || null,
     batch: Boolean(panel.batch),
     folder_command: panel.folderCommand || "pip",
+    compile_on_master: Boolean(panel.compileTarget?.is_master),
+    target_node_id: panel.compileTarget?.node_id || null,
+    gpu_visibility: panel.gpuVisibility || "default",
+    visible_gpu_indices: panel.gpuVisibility === "gpu" ? (panel.visibleGpuIndices || []) : [],
   };
   panel.installStatus = "installing";
   if (state.drawer) state.drawer.body = renderEnvPackageInstallPanel();
@@ -1813,11 +1905,12 @@ async function offlineSession(sessionId) {
 async function updateSetting(event) {
   event.preventDefault();
   const form = event.currentTarget;
+  const key = formValue(form, "key");
   await api("/admin/settings", {
     method: "PATCH",
-    body: JSON.stringify({ values: { [formValue(form, "key")]: formValue(form, "value") } }),
+    body: JSON.stringify({ values: { [key]: formValue(form, "value") } }),
   });
-  form.reset();
+  state.adminSettingKey = key;
   await refreshPage();
 }
 
@@ -1859,6 +1952,7 @@ function shell(content) {
       </main>
       ${state.drawer ? renderDrawer() : ""}
       ${state.fileTargetPicker ? renderFileTargetPicker() : ""}
+      ${state.envCompilePicker ? renderEnvCompilePicker() : ""}
       ${state.toast ? `<div class="toast ${state.toast.type}">${escapeHtml(state.toast.text)}</div>` : ""}
       ${state.loading ? `<div class="loading">正在处理...</div>` : ""}
     </div>
@@ -2410,7 +2504,7 @@ function isEnvUsable(env) {
 }
 
 function isEnvBusy(env) {
-  return ["copying", "importing", "fixing", "testing"].includes(env?.state);
+  return ["copying", "importing", "fixing", "testing", "installing"].includes(env?.state);
 }
 
 function envSourceText(value) {
@@ -2436,7 +2530,7 @@ function renderEnvPackageInstallPanel() {
       <form id="envPackageInstallForm" class="env-package-form">
         <div class="env-install-warning">系统不会处理依赖，请自行解决依赖。</div>
         <div class="env-install-state ${installing ? "installing" : "ready"}">
-          <span class="status ${installing ? "testing" : "available"}">${installing ? "安装中" : "就绪"}</span>
+          <span class="status ${installing ? "installing" : "available"}">${installing ? "安装中" : "就绪"}</span>
           <strong>${installing ? "安装命令正在目标环境中执行，请不要关闭此页面。" : "选择安装方式和安装资源后即可执行安装。"}</strong>
         </div>
         <section class="env-install-methods">
@@ -2482,12 +2576,11 @@ function renderEnvPackageInstallPanel() {
         ` : ""}
         <section class="env-install-section">
           <h3>指定节点编译</h3>
-          <label>目标节点
-            <select disabled>
-              <option>等待任务调度接入</option>
-            </select>
-          </label>
-          <button type="button" class="secondary" disabled>创建编译任务</button>
+          <div class="compile-target-summary">${renderCompileTargetSummary(panel)}</div>
+          <div class="compile-target-actions">
+            <button type="button" class="secondary" data-open-env-compile ${installing ? "disabled" : ""}>在指定节点</button>
+            ${panel.compileTarget ? `<button type="button" class="secondary" data-clear-env-compile ${installing ? "disabled" : ""}>清除</button>` : ""}
+          </div>
         </section>
         <div class="form-actions">
           <button type="submit" ${installing ? "disabled" : ""}>${installing ? "安装中" : "执行安装"}</button>
@@ -2503,6 +2596,102 @@ function renderEnvPackageInstallPanel() {
       </aside>
     </div>
   `;
+}
+
+function renderCompileTargetSummary(panel = {}) {
+  const target = panel.compileTarget;
+  if (!target) return `<span class="muted">未指定时在主节点按默认 CUDA 可见性执行。</span>`;
+  const mode = panel.gpuVisibility || "default";
+  const gpuText = mode === "cpu"
+    ? "CPU"
+    : (mode === "gpu" ? `GPU ${formatGpuIndices(panel.visibleGpuIndices || [])}` : "默认");
+  return `
+    <dl class="kv compact-kv">
+      <dt>节点</dt><dd>${escapeHtml(target.name || "-")}<span class="muted"> ${escapeHtml(target.ip || "")}</span></dd>
+      <dt>GPU</dt><dd>${escapeHtml(gpuText)}</dd>
+    </dl>
+  `;
+}
+
+function renderEnvCompilePicker() {
+  const picker = state.envCompilePicker || {};
+  const targets = picker.targets || [];
+  const selected = targets.find((item) => item.id === picker.selectedTargetId) || targets[0] || null;
+  const gpus = selected?.gpus || [];
+  const selectedGpuIndices = new Set((picker.visibleGpuIndices || []).map(Number));
+  return `
+    <div class="modal-backdrop">
+      <section class="compile-picker-modal" role="dialog" aria-modal="true" aria-labelledby="compilePickerTitle">
+        <div class="file-picker-head">
+          <div>
+            <h2 id="compilePickerTitle">在指定节点执行安装</h2>
+            <span>节点信息为本次打开弹窗时实时探测。</span>
+          </div>
+          <button class="secondary" data-compile-picker-close>关闭</button>
+        </div>
+        ${picker.loading ? renderEmpty("正在探测节点编译环境...") : `
+          <div class="compile-picker-grid">
+            <div class="compile-target-list">
+              ${targets.length ? targets.map((target) => renderCompileTargetOption(target, selected?.id)).join("") : renderEmpty("暂无可见节点")}
+            </div>
+            <div class="compile-gpu-panel">
+              ${selected ? `
+                <div class="compile-target-detail">
+                  <h3>${escapeHtml(selected.name)}</h3>
+                  <span class="muted">${escapeHtml(selected.ip || "-")} · ${escapeHtml(selected.is_master ? "主节点" : nodeStateText(selected.state))}</span>
+                </div>
+                ${renderCompilerGrid(selected.compilers || {})}
+                <div class="compile-gpu-modes">
+                  <button type="button" class="secondary ${picker.gpuVisibility === "default" ? "active" : ""}" data-compile-gpu-mode="default">默认</button>
+                  <button type="button" class="secondary ${picker.gpuVisibility === "cpu" ? "active" : ""}" data-compile-gpu-mode="cpu">CPU</button>
+                </div>
+                <div class="compile-gpu-list">
+                  ${gpus.length ? gpus.map((gpu) => `
+                    <label class="compile-gpu-option">
+                      <input type="checkbox" value="${escapeAttr(gpu.index)}" data-compile-gpu-index="${escapeAttr(gpu.index)}" ${selectedGpuIndices.has(Number(gpu.index)) ? "checked" : ""}>
+                      <span>GPU ${escapeHtml(gpu.index)} · ${escapeHtml(gpu.model || "-")}</span>
+                      <small>${escapeHtml(gpu.total_vram_mb ? `${gpu.total_vram_mb} MB` : "")}</small>
+                    </label>
+                  `).join("") : renderEmpty("该节点未探测到 GPU")}
+                </div>
+                ${selected.error ? `<div class="env-test-error">${escapeHtml(selected.error)}</div>` : ""}
+              ` : renderEmpty("请选择节点")}
+            </div>
+          </div>
+        `}
+        <div class="file-picker-actions">
+          <button class="secondary" data-compile-picker-refresh ${picker.loading ? "disabled" : ""}>重新探测</button>
+          <button data-compile-picker-confirm ${picker.loading || !selected ? "disabled" : ""}>确认</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderCompileTargetOption(target, selectedId) {
+  const compilers = target.compilers || {};
+  const compilerText = ["gcc", "g++", "clang", "nvcc"].map((name) => `${name}: ${compilers[name] || "未安装"}`).join(" / ");
+  return `
+    <label class="compile-target-option ${target.id === selectedId ? "active" : ""}">
+      <input type="radio" name="compile_target" value="${escapeAttr(target.id)}" data-compile-target-select ${target.id === selectedId ? "checked" : ""}>
+      <span><strong>${escapeHtml(target.name)}</strong><small>${escapeHtml(target.ip || "-")}</small></span>
+      <em>${escapeHtml(compilerText)}</em>
+    </label>
+  `;
+}
+
+function renderCompilerGrid(compilers = {}) {
+  return `
+    <div class="compiler-grid">
+      ${["gcc", "g++", "clang", "nvcc"].map((name) => `
+        <span><b>${escapeHtml(name)}</b><strong>${escapeHtml(compilers[name] || "未安装")}</strong></span>
+      `).join("")}
+    </div>
+  `;
+}
+
+function formatGpuIndices(indices = []) {
+  return indices.length ? indices.join(", ") : "-";
 }
 
 function renderPathPick(label, value, field, kind, extensions = "") {
@@ -3137,16 +3326,48 @@ function renderAdminLoginManagementOnly() {
   bindAdminLoginEvents();
 }
 
+function settingOptionLabel(item) {
+  return item.description ? `${item.key} - ${item.description}` : item.key;
+}
+
+function selectedAdminSetting(settings) {
+  if (!settings.length) return null;
+  return settings.find((item) => item.key === state.adminSettingKey) || settings[0];
+}
+
+function renderSettingValueControl(item) {
+  if (!item) return "";
+  const options = item.options || [];
+  if (options.length) {
+    const optionPairs = options.map((option) => [option.value, option.label]);
+    if (item.value && !optionPairs.some(([value]) => String(value) === String(item.value))) {
+      optionPairs.push([item.value, item.value]);
+    }
+    return `<select name="value">${renderSelectOptions(optionPairs, item.value)}</select>`;
+  }
+  const type = item.value_type === "integer" ? "number" : "text";
+  return `<input name="value" type="${type}" value="${escapeAttr(item.value || "")}" required>`;
+}
+
 function renderAdminSettings(settings) {
+  const selected = selectedAdminSetting(settings);
+  const options = settings.map((item) => [item.key, settingOptionLabel(item)]);
   return `
     <section class="panel admin-card">
-      <div class="panel-head"><div><h2>系统设置</h2><span>保存后立即写入后端设置存储。</span></div></div>
+      <div class="panel-head"><div><h2>系统设置</h2><span>所有可管理配置都已落库；选择键后按类型修改值。</span></div></div>
       <form method="post" id="settingForm" class="form-grid compact-form">
-        <label>键<input name="key" placeholder="scheduler.enabled" required></label>
-        <label>值<input name="value" placeholder="true" required></label>
+        <label class="full-row">配置键<select name="key" id="settingKey" required>${renderSelectOptions(options, selected?.key || "")}</select></label>
+        <label>配置值${renderSettingValueControl(selected)}</label>
+        <label class="full-row">说明<input value="${escapeAttr(selected?.description || "")}" readonly></label>
         <div class="form-actions"><button type="submit">保存</button></div>
       </form>
-      ${settings.length ? renderTable(["键", "值"], settings.map((item) => [escapeHtml(item.key), `<code>${escapeHtml(item.value)}</code>`])) : renderEmpty("暂无设置")}
+      <div class="settings-table">
+        ${settings.length ? renderTable(["键", "说明", "值"], settings.map((item) => [
+          `<code>${escapeHtml(item.key)}</code>`,
+          `<span class="setting-description">${escapeHtml(item.description || "-")}</span>`,
+          `<code>${escapeHtml(item.value)}</code>`,
+        ])) : renderEmpty("暂无设置")}
+      </div>
     </section>
   `;
 }
@@ -3533,6 +3754,7 @@ const envStateLabels = {
   importing: "导入中",
   fixing: "修复中",
   testing: "测试中",
+  installing: "安装中",
   detected: "自动发现",
   error: "错误",
 };
@@ -3725,6 +3947,10 @@ function bindEvents() {
   document.querySelector("#userForm")?.addEventListener("submit", (event) => run(() => submitUser(event), "账号已创建"));
   document.querySelector("#studentForm")?.addEventListener("submit", (event) => run(() => submitUser(event, "student"), "学生已创建"));
   document.querySelector("#settingForm")?.addEventListener("submit", (event) => run(() => updateSetting(event), "设置已保存"));
+  document.querySelector("#settingKey")?.addEventListener("change", (event) => {
+    state.adminSettingKey = event.currentTarget.value;
+    render();
+  });
   document.querySelector("#userEditForm")?.addEventListener("submit", (event) => run(() => submitUserUpdate(event), "账号已更新"));
   document.querySelector("#passwordResetForm")?.addEventListener("submit", (event) => run(() => resetUserPassword(event), "密码已重置"));
   document.querySelector("#userSearchForm")?.addEventListener("submit", (event) => updateUserFilters(event));
@@ -3837,6 +4063,20 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-env-package-pick]").forEach((button) => {
     button.addEventListener("click", () => run(() => openEnvPackagePicker(button.dataset.envPackagePick, button.dataset.pickKind, button.dataset.pickExt || "")));
+  });
+  document.querySelector("[data-open-env-compile]")?.addEventListener("click", () => run(openEnvCompilePicker));
+  document.querySelector("[data-clear-env-compile]")?.addEventListener("click", clearEnvCompileTarget);
+  document.querySelector("[data-compile-picker-close]")?.addEventListener("click", closeEnvCompilePicker);
+  document.querySelector("[data-compile-picker-refresh]")?.addEventListener("click", () => run(openEnvCompilePicker));
+  document.querySelector("[data-compile-picker-confirm]")?.addEventListener("click", () => run(confirmEnvCompilePicker));
+  document.querySelectorAll("[data-compile-target-select]").forEach((input) => {
+    input.addEventListener("change", () => selectEnvCompileTarget(input.value));
+  });
+  document.querySelectorAll("[data-compile-gpu-mode]").forEach((button) => {
+    button.addEventListener("click", () => setCompileGpuMode(button.dataset.compileGpuMode));
+  });
+  document.querySelectorAll("[data-compile-gpu-index]").forEach((input) => {
+    input.addEventListener("change", () => toggleCompileGpu(input.value, input.checked));
   });
   document.querySelector("#envPackageDeleteForm")?.addEventListener("submit", (event) => run(() => submitEnvPackageDelete(event)));
   document.querySelectorAll("[data-delete-package-select]").forEach((input) => {

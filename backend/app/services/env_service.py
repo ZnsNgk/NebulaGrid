@@ -24,6 +24,8 @@ from app.db.session import SessionLocal
 from app.schemas.envs import (
     EnvArchiveImportRequest,
     EnvCloneRequest,
+    EnvCompileGpuInfo,
+    EnvCompileTargetInfo,
     EnvFrameworkInfo,
     EnvInfo,
     EnvInstallJobInfo,
@@ -47,6 +49,7 @@ _JOB_ID = count(1)
 _PACKAGES: list[EnvPackageInfo] = []
 _JOBS: list[EnvInstallJobInfo] = []
 ENV_IMPORT_ACTIVE_STATES = {"copying", "importing", "fixing", "testing"}
+ENV_PACKAGE_ACTIVE_JOB_STATES = {"queued", "running"}
 PROTECTED_ENV_PACKAGE_NAMES = {
     "python",
     "pip",
@@ -252,6 +255,123 @@ def upload_package(
     return package
 
 
+def list_env_compile_targets(user: UserRecord) -> list[EnvCompileTargetInfo]:
+    """实时探测主节点和当前用户可见节点的编译器/GPU 信息，供安装包编译弹窗展示。"""
+    require_permission(user.role, "envs:read")
+    from app.services.node_service import list_nodes
+
+    with SessionLocal() as db:
+        nodes = list_nodes(user, db)
+    targets = [probe_master_compile_target()]
+    targets.extend(probe_node_compile_target(node) for node in nodes)
+    return targets
+
+
+def probe_master_compile_target() -> EnvCompileTargetInfo:
+    """主节点也可作为编译安装目标，因此每次打开弹窗时直接在本机执行探测。"""
+    settings = get_settings()
+    probe = run_compile_probe(["bash", "-lc", compile_probe_shell()])
+    return EnvCompileTargetInfo(
+        id="master",
+        node_id=None,
+        is_master=True,
+        name="主节点",
+        ip="127.0.0.1",
+        ssh_user=settings.main_linux_user,
+        state="online" if probe["ok"] else "offline",
+        compilers=probe["compilers"],
+        gpus=probe["gpus"],
+        collected_at=utc_now(),
+        error=probe["error"],
+    )
+
+
+def probe_node_compile_target(node) -> EnvCompileTargetInfo:
+    """通过 SSH 在计算节点执行一次轻量探测；失败时仍返回节点卡片并展示错误原因。"""
+    probe = run_compile_probe(build_compile_probe_ssh_command(node))
+    return EnvCompileTargetInfo(
+        id=f"node:{node.id}",
+        node_id=node.id,
+        is_master=False,
+        name=node.name,
+        ip=node.ip,
+        ssh_user=node.ssh_user,
+        state=node.state if probe["ok"] else "offline",
+        compilers=probe["compilers"],
+        gpus=probe["gpus"] or [
+            EnvCompileGpuInfo(index=gpu.gpu_index, model=gpu.model, total_vram_mb=gpu.total_vram_mb, uuid=gpu.gpu_uuid)
+            for gpu in (node.gpus or [])
+        ],
+        collected_at=utc_now(),
+        error=probe["error"],
+    )
+
+
+def build_compile_probe_ssh_command(node) -> list[str]:
+    """编译探测复用平台 SSH 连接参数，避免交互式密码阻塞 API 请求。"""
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"{node.ssh_user}@{node.ip}",
+        compile_probe_shell(),
+    ]
+
+
+def compile_probe_shell() -> str:
+    """输出稳定的 TSV 探测结果，方便在没有远端 Python 依赖时解析编译器和 GPU。"""
+    return r"""
+for tool in gcc g++ clang nvcc; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    version=$("$tool" --version 2>/dev/null | head -n 1)
+    printf 'COMPILER\t%s\t%s\n' "$tool" "$version"
+  else
+    printf 'COMPILER\t%s\t\n' "$tool"
+  fi
+done
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=index,name,memory.total,uuid --format=csv,noheader,nounits 2>/dev/null | sed 's/^/GPU\t/'
+fi
+"""
+
+
+def run_compile_probe(command: list[str]) -> dict:
+    """执行编译目标探测；任一编译器缺失时标为未安装，SSH 失败不会中断整个弹窗。"""
+    empty_compilers = {name: None for name in ["gcc", "g++", "clang", "nvcc"]}
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "compilers": empty_compilers, "gpus": [], "error": str(exc)}
+    compilers, gpus = parse_compile_probe_output(completed.stdout or "")
+    error = None if completed.returncode == 0 else tail_text(completed.stderr or completed.stdout or f"exit {completed.returncode}", 1000)
+    return {"ok": completed.returncode == 0, "compilers": compilers, "gpus": gpus, "error": error}
+
+
+def parse_compile_probe_output(output: str) -> tuple[dict[str, str | None], list[EnvCompileGpuInfo]]:
+    """解析编译探测输出；空版本表示未安装，GPU 行兼容 nvidia-smi CSV 中逗号后的空格。"""
+    compilers: dict[str, str | None] = {name: None for name in ["gcc", "g++", "clang", "nvcc"]}
+    gpus: list[EnvCompileGpuInfo] = []
+    for line in output.splitlines():
+        if line.startswith("COMPILER\t"):
+            _, name, version = (line.split("\t", 2) + [""])[:3]
+            compilers[name] = version.strip() or None
+        elif line.startswith("GPU\t"):
+            parts = [part.strip() for part in line[4:].split(",")]
+            if len(parts) < 4:
+                continue
+            try:
+                index = int(parts[0])
+                total_vram_mb = int(float(parts[2]))
+            except ValueError:
+                continue
+            gpus.append(EnvCompileGpuInfo(index=index, model=parts[1], total_vram_mb=total_vram_mb, uuid=parts[3]))
+    return compilers, sorted(gpus, key=lambda item: item.index)
+
+
 def install_package(
     user: UserRecord,
     env_id: int,
@@ -261,6 +381,11 @@ def install_package(
     """创建环境包安装作业；只有环境所有者能修改目标环境。"""
     env = get_env_for_user(user, env_id)
     require_env_owner(user, env)
+    if env.state == "installing":
+        raise validation_error("environment package operation is running")
+    if not is_env_usable_for_mutation(env):
+        raise validation_error("environment is not available")
+    validate_compile_install_selection(payload.compile_on_master, payload.target_node_id, payload.gpu_visibility, payload.visible_gpu_indices)
     package = load_package_model(package_id)
     if package.env_id != env.id:
         raise validation_error("package does not belong to env")
@@ -269,12 +394,15 @@ def install_package(
         package_model = db.get(EnvPackage, package.id)
         if package_model is None:
             raise not_found("package not found")
+        ensure_env_ready_for_package_operation(db, env.id)
         package_model.status = "queued"
         model = EnvInstallJob(
             package_id=package.id,
             env_id=env.id,
             mode=payload.mode,
             target_node_id=payload.target_node_id,
+            compile_on_master=payload.compile_on_master,
+            gpu_visibility=payload.gpu_visibility,
             visible_gpu_indices=payload.visible_gpu_indices,
             command=command,
             log_path=str(env_operation_log_path(env)),
@@ -292,6 +420,7 @@ def install_package(
         {"package_id": package.id, "package": package.filename, "mode": payload.mode},
     )
     record_audit(user.id, "env.package.install", "env_install_job", str(job.id))
+    start_env_install_job_thread(job.id)
     return job
 
 
@@ -299,8 +428,11 @@ def install_local_package(user: UserRecord, env_id: int, payload: EnvLocalPackag
     """创建本机环境安装作业，由 env_install_worker 后台执行，避免 API 请求长时间占用。"""
     env = get_env_for_user(user, env_id)
     require_env_owner(user, env)
+    if env.state == "installing":
+        raise validation_error("environment package operation is running")
     if not is_env_usable_for_mutation(env):
         raise validation_error("environment is not available")
+    validate_compile_install_selection(payload.compile_on_master, payload.target_node_id, payload.gpu_visibility, payload.visible_gpu_indices)
     method, command, cwd, source_path = build_local_install_job_spec(user, payload)
     log_path = str(env_operation_log_path(env))
     with SessionLocal() as db:
@@ -316,13 +448,17 @@ def install_local_package(user: UserRecord, env_id: int, payload: EnvLocalPackag
         )
         db.add(package)
         db.flush()
+        ensure_env_ready_for_package_operation(db, env.id)
         job = EnvInstallJob(
             package_id=package.id,
             env_id=env.id,
-            mode="local",
+            mode="compile" if payload.compile_on_master or payload.target_node_id else "local",
+            target_node_id=payload.target_node_id,
+            compile_on_master=payload.compile_on_master,
+            gpu_visibility=payload.gpu_visibility,
             command=command,
             workdir=str(cwd) if cwd else "",
-            visible_gpu_indices=[],
+            visible_gpu_indices=payload.visible_gpu_indices,
             status="queued",
             log_path=log_path,
             created_by=user.id,
@@ -333,6 +469,7 @@ def install_local_package(user: UserRecord, env_id: int, payload: EnvLocalPackag
         saved = env_install_job_model_to_info(job)
     write_env_operation_log(env, "package_install", "已创建本机环境安装作业", user.id, {"job_id": saved.id, "method": method, "source": source_path})
     record_audit(user.id, "env.package.install_local.queue", "env_install_job", str(saved.id), detail_json={"method": method})
+    start_env_install_job_thread(saved.id)
     return saved
 
 
@@ -357,6 +494,25 @@ def build_local_install_job_spec(
         command = "python setup.py install" if payload.folder_command == "setup_py" else "python -m pip install ."
         return "pip_folder", command, folder, str(folder)
     raise validation_error("unsupported install method")
+
+
+def validate_compile_install_selection(
+    compile_on_master: bool,
+    target_node_id: int | None,
+    gpu_visibility: str,
+    visible_gpu_indices: list[int],
+) -> None:
+    """校验编译安装的节点和 GPU 选择，避免默认/CPU 与具体 GPU 同时生效造成用户误解。"""
+    if compile_on_master and target_node_id:
+        raise validation_error("compile target must be master or one node")
+    if not compile_on_master and target_node_id is None and (gpu_visibility != "default" or visible_gpu_indices):
+        raise validation_error("compile target is required for gpu selection")
+    if gpu_visibility in {"default", "cpu"} and visible_gpu_indices:
+        raise validation_error("gpu indices must be empty for default or cpu mode")
+    if gpu_visibility == "gpu" and not visible_gpu_indices:
+        raise validation_error("visible gpu is required")
+    if len(set(visible_gpu_indices)) != len(visible_gpu_indices) or any(index < 0 for index in visible_gpu_indices):
+        raise validation_error("visible gpu indices are invalid")
 
 
 def install_conda_archive_package(user: UserRecord, env: EnvInfo, payload: EnvLocalPackageInstallRequest) -> EnvLocalPackageInstallResult:
@@ -384,9 +540,16 @@ def install_pip_package(user: UserRecord, env: EnvInfo, payload: EnvLocalPackage
     raise validation_error("pip mode is required")
 
 
-def run_env_install_command(env: EnvInfo, method: str, command: str, cwd: Path | None = None, log_action: str = "package_install_output") -> EnvLocalPackageInstallResult:
+def run_env_install_command(
+    env: EnvInfo,
+    method: str,
+    command: str,
+    cwd: Path | None = None,
+    log_action: str = "package_install_output",
+    env_vars: dict[str, str] | None = None,
+) -> EnvLocalPackageInstallResult:
     """激活目标环境后执行受控安装命令，并把输出追加到单环境日志。"""
-    shell_command = build_conda_shell_command(env, command)
+    shell_command = build_conda_shell_command(env, command, env_vars=env_vars)
     completed = subprocess.run(["bash", "-lc", shell_command], cwd=str(cwd) if cwd else None, check=False, capture_output=True, text=True, timeout=1800)
     result = EnvLocalPackageInstallResult(
         ok=completed.returncode == 0,
@@ -415,10 +578,11 @@ def run_env_install_command(env: EnvInfo, method: str, command: str, cwd: Path |
     return result
 
 
-def build_conda_shell_command(env: EnvInfo, command: str) -> str:
+def build_conda_shell_command(env: EnvInfo, command: str, env_vars: dict[str, str] | None = None) -> str:
     """复用 conda activate 方式构造环境内命令，保持与检测逻辑一致。"""
     activate_path = Path(get_settings().miniconda_python).parent / "activate"
-    return f"source {shlex.quote(str(activate_path))} && conda activate {shlex.quote(env.name)} && {command}"
+    env_prefix = "".join(f"{key}={shlex.quote(value)} " for key, value in (env_vars or {}).items())
+    return f"source {shlex.quote(str(activate_path))} && conda activate {shlex.quote(env.name)} && {env_prefix}{command}"
 
 
 def resolve_required_user_file(user: UserRecord, path: str | None, allowed_suffixes: set[str]) -> Path:
@@ -449,6 +613,55 @@ def is_env_usable_for_mutation(env: EnvInfo) -> bool:
     return env.state in {"available", "registered"}
 
 
+def ensure_env_ready_for_package_operation(db, env_id: int) -> None:
+    """提交安装或删除前检查同一环境锁，避免两个包管理命令同时修改 site-packages/conda 元数据。"""
+    if env_has_active_package_operation(db, env_id):
+        raise validation_error("environment package operation is running")
+
+
+def mark_env_package_delete_started(env_id: int) -> str:
+    """同步删除包会短暂占用 API 线程，因此先把环境置为 installing 作为跨请求锁。"""
+    with SessionLocal() as db:
+        model = db.get(Env, env_id)
+        if model is None:
+            raise not_found("env not found")
+        ensure_env_ready_for_package_operation(db, env_id)
+        previous_state = model.state
+        model.state = "installing"
+        db.commit()
+        return previous_state
+
+
+def restore_env_state(env_id: int, state: str) -> None:
+    """删除包结束后恢复原环境状态；恢复失败只影响页面展示，实际命令结果仍已记录在日志中。"""
+    with SessionLocal() as db:
+        model = db.get(Env, env_id)
+        if model is None:
+            return
+        model.state = state
+        db.commit()
+
+
+def start_env_install_job_thread(job_id: int) -> None:
+    """创建安装作业后拉起后台线程，避免长时间 pip/conda 命令占用 API 请求线程。"""
+    thread = threading.Thread(target=run_env_install_job_thread, args=(job_id,), daemon=True)
+    thread.start()
+
+
+def run_env_install_job_thread(job_id: int) -> None:
+    """只领取指定 queued 作业；独立 worker 已经领取时直接退出，防止重复执行。"""
+    with SessionLocal() as db:
+        job = db.get(EnvInstallJob, job_id)
+        if job is None or job.status != "queued":
+            return
+        job.status = "running"
+        job.started_at = local_datetime()
+        db.commit()
+    from app.workers.env_install_worker import run_install_job
+
+    run_install_job(job_id)
+
+
 def tail_text(value: str, limit: int = 4000) -> str:
     """日志 detail 只保留尾部摘要，完整输出已写入单环境日志。"""
     return value[-limit:] if value and len(value) > limit else value
@@ -458,6 +671,8 @@ def preview_delete_installed_packages(user: UserRecord, env_id: int, payload: En
     """生成已安装包删除确认内容；执行前必须重新检测包来源和保护状态。"""
     env = get_env_for_user(user, env_id)
     require_env_owner(user, env)
+    if env.state == "installing":
+        raise validation_error("environment package operation is running")
     if not is_env_usable_for_mutation(env):
         raise validation_error("environment is not available")
     packages = resolve_delete_target_packages(env, payload.package_names)
@@ -478,34 +693,40 @@ def delete_installed_packages(user: UserRecord, env_id: int, payload: EnvInstall
     """删除目标环境内已安装包，并把卸载命令输出写入单环境日志。"""
     env = get_env_for_user(user, env_id)
     require_env_owner(user, env)
+    if env.state == "installing":
+        raise validation_error("environment package operation is running")
     if not is_env_usable_for_mutation(env):
         raise validation_error("environment is not available")
     preview = preview_delete_installed_packages(user, env_id, payload)
-    write_env_operation_log(env, "package_delete", "开始删除已安装包", user.id, {"packages": [item.name for item in preview.packages], "commands": preview.commands})
-    results = [run_env_install_command(env, "package_delete", command, log_action="package_delete_output") for command in preview.commands]
-    ok = all(result.ok for result in results)
-    return_code = next((result.return_code for result in results if result.return_code != 0), 0)
-    stdout = tail_text("\n".join(result.stdout for result in results if result.stdout), 12000)
-    stderr = tail_text("\n".join(result.stderr for result in results if result.stderr), 12000)
-    write_env_operation_log(
-        env,
-        "package_delete",
-        "已安装包删除完成" if ok else "已安装包删除失败",
-        user.id,
-        {"packages": [item.name for item in preview.packages], "return_code": return_code, "stdout": tail_text(stdout), "stderr": tail_text(stderr)},
-    )
-    record_audit(user.id, "env.package.delete_installed", "env", str(env.id), result="success" if ok else "failed", detail_json={"packages": [item.name for item in preview.packages], "return_code": return_code})
-    return EnvInstalledPackageDeleteResult(
-        ok=ok,
-        env_id=env.id,
-        env_name=env.name,
-        packages=preview.packages,
-        commands=preview.commands,
-        return_code=return_code,
-        stdout=stdout,
-        stderr=stderr,
-        log_path=str(env_operation_log_path(env)),
-    )
+    previous_state = mark_env_package_delete_started(env.id)
+    try:
+        write_env_operation_log(env, "package_delete", "开始删除已安装包", user.id, {"packages": [item.name for item in preview.packages], "commands": preview.commands})
+        results = [run_env_install_command(env, "package_delete", command, log_action="package_delete_output") for command in preview.commands]
+        ok = all(result.ok for result in results)
+        return_code = next((result.return_code for result in results if result.return_code != 0), 0)
+        stdout = tail_text("\n".join(result.stdout for result in results if result.stdout), 12000)
+        stderr = tail_text("\n".join(result.stderr for result in results if result.stderr), 12000)
+        write_env_operation_log(
+            env,
+            "package_delete",
+            "已安装包删除完成" if ok else "已安装包删除失败",
+            user.id,
+            {"packages": [item.name for item in preview.packages], "return_code": return_code, "stdout": tail_text(stdout), "stderr": tail_text(stderr)},
+        )
+        record_audit(user.id, "env.package.delete_installed", "env", str(env.id), result="success" if ok else "failed", detail_json={"packages": [item.name for item in preview.packages], "return_code": return_code})
+        return EnvInstalledPackageDeleteResult(
+            ok=ok,
+            env_id=env.id,
+            env_name=env.name,
+            packages=preview.packages,
+            commands=preview.commands,
+            return_code=return_code,
+            stdout=stdout,
+            stderr=stderr,
+            log_path=str(env_operation_log_path(env)),
+        )
+    finally:
+        restore_env_state(env.id, previous_state)
 
 
 def resolve_delete_target_packages(env: EnvInfo, package_names: list[str]) -> list[EnvPackageVersion]:
@@ -775,6 +996,8 @@ def env_install_job_model_to_info(job: EnvInstallJob) -> EnvInstallJobInfo:
         env_id=job.env_id,
         mode=job.mode,
         target_node_id=job.target_node_id,
+        compile_on_master=bool(getattr(job, "compile_on_master", False)),
+        gpu_visibility=getattr(job, "gpu_visibility", None) or "default",
         visible_gpu_indices=job.visible_gpu_indices or [],
         status=job.status,
         remote_pid=job.remote_pid,
@@ -1250,8 +1473,22 @@ def env_exists(db, name: str, path: str) -> bool:
     return db.scalar(select(Env).where((Env.name == name) | (Env.path == path))) is not None
 
 
+def env_has_active_package_operation(db, env_id: int) -> bool:
+    """判断环境是否有安装/删除类修改正在进行，前端据此把就绪态显示为安装中。"""
+    env_state = db.scalar(select(Env.state).where(Env.id == env_id))
+    if env_state == "installing":
+        return True
+    return db.scalar(
+        select(EnvInstallJob.id)
+        .where(EnvInstallJob.env_id == env_id)
+        .where(EnvInstallJob.status.in_(tuple(ENV_PACKAGE_ACTIVE_JOB_STATES)))
+        .limit(1)
+    ) is not None
+
+
 def env_model_to_info(env: Env, db=None) -> EnvInfo:
     """把数据库环境模型转换成前端响应模型，避免服务层直接暴露 ORM 对象。"""
+    state = "installing" if db is not None and env_has_active_package_operation(db, env.id) else env.state
     return EnvInfo(
         id=env.id,
         owner_user_id=env.owner_user_id,
@@ -1261,7 +1498,7 @@ def env_model_to_info(env: Env, db=None) -> EnvInfo:
         can_modify=False,
         description=env.description,
         source_type=env.source_type,
-        state=env.state,
+        state=state,
         python_version=env.python_version,
         size_bytes=env.size_bytes,
         created_at=ensure_local_datetime(env.created_at).isoformat() if env.created_at else utc_now(),

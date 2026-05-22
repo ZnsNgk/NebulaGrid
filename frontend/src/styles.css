@@ -593,6 +593,29 @@ nav {
   max-width: 1040px;
 }
 
+.settings-table table {
+  table-layout: fixed;
+}
+
+.settings-table th:nth-child(1),
+.settings-table td:nth-child(1) {
+  width: 24%;
+}
+
+.settings-table th:nth-child(2),
+.settings-table td:nth-child(2) {
+  width: 42%;
+}
+
+.settings-table code,
+.setting-description {
+  display: block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
+
 .node-form-card textarea {
   min-height: 128px;
   line-height: 1.55;
@@ -949,6 +972,7 @@ nav {
 .status.copying,
 .status.importing,
 .status.fixing,
+.status.installing,
 .status.testing {
   background: rgba(245, 158, 11, 0.12);
   color: var(--yellow);
@@ -1497,6 +1521,135 @@ td {
 .env-test {
   display: grid;
   gap: 14px;
+}
+
+.compile-picker-modal {
+  width: min(980px, 100%);
+  max-height: min(820px, calc(100vh - 48px));
+  display: grid;
+  grid-template-rows: auto minmax(260px, 1fr) auto;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b1324;
+  padding: 16px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+
+.compile-picker-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(300px, 0.82fr) minmax(360px, 1fr);
+  gap: 14px;
+}
+
+.compile-target-list,
+.compile-gpu-panel {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(7, 16, 33, 0.58);
+  padding: 10px;
+}
+
+.compile-target-option,
+.compile-gpu-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+}
+
+.compile-target-option.active {
+  border-color: rgba(56, 189, 248, 0.45);
+  background: rgba(14, 165, 233, 0.12);
+}
+
+.compile-target-option span,
+.compile-gpu-option span {
+  display: grid;
+  gap: 2px;
+}
+
+.compile-target-option em,
+.compile-gpu-option small {
+  grid-column: 2;
+  color: var(--muted);
+  font-style: normal;
+  font-size: 12px;
+}
+
+.compile-target-detail {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.compile-target-detail h3 {
+  margin: 0;
+}
+
+.compiler-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.compiler-grid span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: #081122;
+}
+
+.compiler-grid b {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.compiler-grid strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #e8f0ff;
+  font-size: 12px;
+}
+
+.compile-gpu-modes,
+.compile-target-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.compile-gpu-modes {
+  margin-bottom: 10px;
+}
+
+.compile-gpu-modes .active {
+  border-color: rgba(134, 239, 172, 0.5);
+  color: var(--green);
+}
+
+.compile-gpu-list {
+  display: grid;
+  gap: 6px;
+}
+
+.compile-target-summary {
+  margin-bottom: 10px;
+}
+
+.compact-kv {
+  margin: 0;
 }
 
 .env-test .table-wrap table {
@@ -2056,6 +2209,7 @@ td {
   .admin-stats,
   .admin-grid,
   .node-management-grid,
+  .compile-picker-grid,
   .task-zone-tabs,
   .metrics,
   .env-package-panel,

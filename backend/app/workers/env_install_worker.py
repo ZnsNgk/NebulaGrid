@@ -60,11 +60,12 @@ def run_install_job(job_id: int) -> None:
         package_type = package.package_type
         command = job.command or build_default_package_command(package)
         cwd = Path(job.workdir) if job.workdir else None
+        env_vars = build_install_env_vars(job, db)
     try:
         if job.target_node_id and job.mode == "compile":
             result = run_remote_install(job_id, command)
         else:
-            result = run_env_install_command(env_info, package_type, command, cwd=cwd)
+            result = run_env_install_command(env_info, package_type, command, cwd=cwd, env_vars=env_vars)
         status = "succeeded" if result.ok else "failed"
         return_code = result.return_code
         message = "环境安装作业完成" if result.ok else "环境安装作业失败"
@@ -90,9 +91,11 @@ def run_remote_install(job_id: int, command: str):
         env = db.get(Env, job.env_id)
         if node is None or env is None:
             raise ValueError("target node or env not found")
-        remote_command = build_remote_install_command(env, job, command)
-        output = subprocess.check_output(build_ssh_command(node, remote_command), text=True, stderr=subprocess.STDOUT, timeout=1800)
-        return_code = parse_remote_return_code(output)
+        env_vars = build_install_env_vars(job, db)
+        remote_command = build_remote_install_command(env, job, command, env_vars)
+        completed = subprocess.run(build_ssh_command(node, remote_command), check=False, capture_output=True, text=True, timeout=1800)
+        output = "\n".join(part for part in [completed.stdout, completed.stderr] if part)
+        return_code = parse_remote_return_code(output, completed.returncode)
         from app.schemas.envs import EnvLocalPackageInstallResult
 
         return EnvLocalPackageInstallResult(
@@ -108,16 +111,53 @@ def run_remote_install(job_id: int, command: str):
         )
 
 
-def build_remote_install_command(env: Env, job: EnvInstallJob, command: str) -> str:
+def build_remote_install_command(env: Env, job: EnvInstallJob, command: str, env_vars: dict[str, str] | None = None) -> str:
     """构造远端安装命令，优先使用 env_installer.py；复杂 conda 命令退回 bash 激活执行。"""
     settings = get_settings()
-    if command.startswith("python -m pip install "):
+    env_prefix = build_shell_env_prefix(env_vars or {})
+    command_parts = shlex.split(command)
+    if command_parts[:4] == ["python", "-m", "pip", "install"] and len(command_parts) == 5 and not job.workdir:
         package_path = shlex.split(command)[-1]
         env_python = f"{env.path.rstrip('/')}/bin/python"
         installer = f"{settings.remote_code_root.rstrip('/')}/env_installer.py"
-        return shlex.join([settings.miniconda_python, installer, "--python", env_python, "--package", package_path, "--log-path", job.log_path])
+        installer_command = shlex.join([settings.miniconda_python, installer, "--python", env_python, "--package", package_path, "--log-path", job.log_path])
+        return f"{env_prefix}{installer_command}"
     activate = Path(settings.miniconda_python).parent / "activate"
-    return f"source {shlex.quote(str(activate))} && conda activate {shlex.quote(env.name)} && {command}"
+    workdir_prefix = f"cd {shlex.quote(job.workdir)} && " if job.workdir else ""
+    return f"source {shlex.quote(str(activate))} && conda activate {shlex.quote(env.name)} && {workdir_prefix}{env_prefix}{command}"
+
+
+def build_install_env_vars(job: EnvInstallJob, db: Session) -> dict[str, str]:
+    """根据用户在编译弹窗中的 GPU 选择生成环境变量；默认模式不限制 CUDA 可见性。"""
+    visibility = getattr(job, "gpu_visibility", None) or "default"
+    if visibility == "default":
+        return {}
+    if visibility == "gpu":
+        indices = [str(index) for index in (job.visible_gpu_indices or [])]
+        return {"CUDA_VISIBLE_DEVICES": ",".join(indices)}
+    if visibility == "cpu":
+        gpu_count = count_target_gpus(job, db)
+        return {"CUDA_VISIBLE_DEVICES": str(gpu_count + 1)}
+    return {}
+
+
+def count_target_gpus(job: EnvInstallJob, db: Session) -> int:
+    """CPU 模式按目标节点 GPU 总数加一设置不可见编号，让 CUDA 程序自然回退到 CPU。"""
+    if job.target_node_id:
+        node = db.get(Node, job.target_node_id)
+        return len(node.gpus or []) if node is not None else 0
+    try:
+        output = subprocess.check_output(["bash", "-lc", "nvidia-smi -L 2>/dev/null | wc -l"], text=True, timeout=5)
+        return int(output.strip() or "0")
+    except Exception:
+        return 0
+
+
+def build_shell_env_prefix(env_vars: dict[str, str]) -> str:
+    """把环境变量转换成 shell 前缀，所有值都经 shlex.quote 处理以避免命令注入。"""
+    if not env_vars:
+        return ""
+    return "".join(f"{key}={shlex.quote(value)} " for key, value in env_vars.items())
 
 
 def build_ssh_command(node: Node, remote_command: str) -> list[str]:
@@ -135,7 +175,7 @@ def build_ssh_command(node: Node, remote_command: str) -> list[str]:
     ]
 
 
-def parse_remote_return_code(output: str) -> int:
+def parse_remote_return_code(output: str, default: int = 1) -> int:
     """解析远端 env_installer JSON 输出；非 JSON 输出视为失败并保留日志。"""
     import json
 
@@ -143,7 +183,7 @@ def parse_remote_return_code(output: str) -> int:
         payload = json.loads(output.splitlines()[-1])
         return int(payload.get("return_code", 1))
     except Exception:
-        return 1
+        return default
 
 
 def finish_job(

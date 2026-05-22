@@ -108,6 +108,8 @@ class EnvPackageInstallRequest(BaseModel):
 
     mode: str = Field(default="normal", pattern="^(normal|compile)$")
     target_node_id: int | None = None
+    compile_on_master: bool = False
+    gpu_visibility: str = Field(default="default", pattern="^(default|cpu|gpu)$")
     visible_gpu_indices: list[int] = []
 
 
@@ -121,6 +123,10 @@ class EnvLocalPackageInstallRequest(BaseModel):
     requirements_path: str | None = Field(default=None, max_length=1024)
     batch: bool = False
     folder_command: str = Field(default="pip", pattern="^(pip|setup_py)$")
+    compile_on_master: bool = False
+    target_node_id: int | None = None
+    gpu_visibility: str = Field(default="default", pattern="^(default|cpu|gpu)$")
+    visible_gpu_indices: list[int] = []
 
 
 class EnvLocalPackageInstallResult(BaseModel):
@@ -175,6 +181,8 @@ class EnvInstallJobInfo(BaseModel):
     env_id: int
     mode: str
     target_node_id: int | None
+    compile_on_master: bool = False
+    gpu_visibility: str = "default"
     visible_gpu_indices: list[int]
     status: str
     remote_pid: int | None = None
@@ -183,3 +191,28 @@ class EnvInstallJobInfo(BaseModel):
     created_by: int
     started_at: str | None = None
     finished_at: str | None = None
+
+
+class EnvCompileGpuInfo(BaseModel):
+    """编译目标上的 GPU 摘要；index 用于 CUDA_VISIBLE_DEVICES，型号和显存用于页面确认。"""
+
+    index: int
+    model: str = ""
+    total_vram_mb: int = 0
+    uuid: str = ""
+
+
+class EnvCompileTargetInfo(BaseModel):
+    """安装包编译目标响应；每次打开选择框时实时探测编译器和 GPU，避免展示过期环境。"""
+
+    id: str
+    node_id: int | None = None
+    is_master: bool = False
+    name: str
+    ip: str
+    ssh_user: str
+    state: str = "unknown"
+    compilers: dict[str, str | None] = Field(default_factory=dict)
+    gpus: list[EnvCompileGpuInfo] = Field(default_factory=list)
+    collected_at: str
+    error: str | None = None

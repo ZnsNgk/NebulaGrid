@@ -27,5 +27,8 @@ class SettingInfo(BaseModel):
 
     key: str
     value: str
+    description: str = ""
+    value_type: str = "string"
+    options: list[dict[str, str]] = Field(default_factory=list)
     updated_by: int | None = None
     updated_at: str | None = None

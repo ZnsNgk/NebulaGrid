@@ -6,6 +6,7 @@ from app.core.security import hash_password
 from app.db.base import Base
 from app.db.models import Setting, User
 from app.db.session import engine
+from app.services.audit_service import default_settings
 
 
 def create_schema() -> None:
@@ -129,6 +130,9 @@ def migrate_existing_schema() -> None:
                     # worker 需要从数据库恢复待执行安装命令，避免 API 请求同步阻塞和进程重启丢任务。
                     "command": "TEXT DEFAULT ''",
                     "workdir": "VARCHAR(1024) DEFAULT ''",
+                    # 编译安装需要区分主节点、本地默认 GPU、CPU 隐藏 GPU 和指定 GPU，避免重启后丢失执行约束。
+                    "compile_on_master": "BOOLEAN DEFAULT false",
+                    "gpu_visibility": "VARCHAR(32) DEFAULT 'default'",
                 },
             )
 
@@ -175,13 +179,7 @@ def seed_defaults(db: Session) -> None:
             admin.home_path = f"/home/{settings.main_linux_user}"
         if not admin.linux_account_name:
             admin.linux_account_name = settings.main_linux_user
-    for key, value in {
-        "scheduler.enabled": "true",
-        "scheduler.instance_lock": "locked-by-row-transaction",
-        "scheduler.interval_seconds": "5",
-        "monitor.enabled": "true",
-        "uploads.max_size_mb": "20480",
-    }.items():
+    for key, value in default_settings().items():
         exists = db.get(Setting, key)
         if exists is None:
             db.add(Setting(key=key, value=value))

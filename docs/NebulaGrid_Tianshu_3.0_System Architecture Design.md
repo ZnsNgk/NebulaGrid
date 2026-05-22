@@ -519,6 +519,8 @@ erDiagram
 | package_type | enum | wheel/archive/source_dir |
 | install_mode | enum | conda_offline/pip_install/compile_install/package_delete |
 | target_node_id | fk nodes.id nullable | 编译安装节点 |
+| compile_on_master | bool | 是否在主节点执行编译安装 |
+| gpu_visibility | enum | default/cpu/gpu，记录 CUDA 可见性策略 |
 | visible_gpu_indices | jsonb | 编译安装可见 GPU |
 | state | enum | pending/running/succeeded/failed/cancelled |
 | command | text | 实际安装命令 |
@@ -1107,12 +1109,14 @@ sequenceDiagram
 
 ### 12.4 编译安装作业
 
-有些 whl 或源码包需要在目标节点编译，甚至需要 CUDA/GPU 环境。此时用户可以选择：
+有些 whl 或源码包需要在目标节点编译，甚至需要 CUDA/GPU 环境。此时用户可以点击“在指定节点”打开实时探测弹窗，并选择：
 
 1. 目标环境；
-2. 目标节点；
-3. 可见 GPU；
+2. 主节点或当前用户可见的计算节点；
+3. CUDA 可见性策略：默认、CPU 或多选具体 GPU；
 4. 安装命令模式。
+
+弹窗每次打开时都会在主节点本机以及计算节点远端执行轻量探测，展示 `gcc`、`g++`、`clang`、`nvcc` 版本和 GPU 清单。未安装的编译器显示“未安装”。执行作业时，默认模式不设置 `CUDA_VISIBLE_DEVICES`；CPU 模式设置为目标节点 GPU 总数加一；指定 GPU 模式设置为逗号分隔的 GPU index。
 
 编译安装作业具有以下特点：
 
@@ -1120,8 +1124,9 @@ sequenceDiagram
 2. 不经过 Scheduler；
 3. 不占用 `gpu_devices.used_by_scheduler` 或 `running_task_count`；
 4. 进入 `env_install_jobs`；
-5. 管理员可查看、中止和审计；
-6. 前端提示该操作可能影响正在运行任务。
+5. API 创建作业后启动后台线程领取执行，生产部署也可由独立 `nebulagrid-env-install-worker` 领取；
+6. 管理员可查看、中止和审计；
+7. 前端提示该操作可能影响正在运行任务。
 
 ### 12.5 环境锁
 
@@ -1134,7 +1139,7 @@ running install job exists -> reject new install job or queue it
 
 规则：
 
-1. 同一环境只能有一个 running/pending 的安装作业；
+1. 同一环境只能有一个 queued/running 的安装作业，删除包期间也会把环境短暂置为 installing 作为互斥锁；
 2. 运行中的环境安装作业不阻止该环境已有任务继续运行，但前端应提示风险；
 3. 若环境处于 importing/error/disabled，不允许提交普通任务；
 4. 若环境处于 installing，可配置是否允许提交新任务，默认不允许。

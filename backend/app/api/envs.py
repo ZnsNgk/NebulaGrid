@@ -12,6 +12,7 @@ from app.services.env_service import (
     delete_installed_packages,
     delete_package,
     get_env_operation_log,
+    list_env_compile_targets,
     get_install_job,
     get_install_job_log,
     import_env_archive,
@@ -109,6 +110,13 @@ def post_package_upload(
     """登记 whl 或源码包上传元数据。"""
     package = upload_package(current_user, env_id, payload)
     return api_success(data=package.model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.get("/compile-targets")
+def get_compile_targets(request: Request, current_user: UserRecord = Depends(get_current_user)):
+    """每次打开编译安装弹窗时实时返回主节点和用户可见节点的编译器/GPU 信息。"""
+    targets = [target.model_dump() for target in list_env_compile_targets(current_user)]
+    return api_success(data=targets, request_id=request.headers.get("x-request-id"))
 
 
 @router.post("/{env_id}/packages/install")
