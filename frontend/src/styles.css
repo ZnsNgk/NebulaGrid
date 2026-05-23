@@ -2343,6 +2343,10 @@ td {
 
 .manual-shell {
   padding: 0;
+  height: calc(100vh - 154px);
+  min-height: 560px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -2357,6 +2361,72 @@ td {
   max-width: 1080px;
 }
 
+.manual-layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.manual-toc {
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 14px;
+  border-right: 1px solid var(--line);
+  background: rgba(8, 17, 32, 0.45);
+}
+
+.manual-layout .markdown-body {
+  height: 100%;
+  max-width: none;
+  min-height: 0;
+  overflow: auto;
+}
+
+.manual-toc strong {
+  display: block;
+  margin-bottom: 10px;
+  color: #f8fbff;
+}
+
+.manual-toc-item {
+  width: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 7px 8px;
+  justify-content: flex-start;
+  border: 0;
+  border-radius: 6px;
+  box-shadow: none;
+  background: transparent;
+  color: #d7e2f7;
+  text-align: left;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.manual-toc-item:hover {
+  background: rgba(74, 163, 255, 0.12);
+}
+
+.manual-toc-item.active {
+  background: rgba(74, 163, 255, 0.16);
+  color: #f8fbff;
+  font-weight: 800;
+}
+
+.manual-toc-item.depth-2 {
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.manual-toc-item.depth-3,
+.manual-toc-item.depth-4 {
+  padding-left: 28px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .markdown-body h2,
 .markdown-body h3,
 .markdown-body h4,
@@ -2364,6 +2434,7 @@ td {
   margin: 22px 0 10px;
   letter-spacing: 0;
   color: #f8fbff;
+  scroll-margin-top: 18px;
 }
 
 .markdown-body p,
@@ -2555,6 +2626,7 @@ td {
   .admin-head,
   .admin-stats,
   .admin-grid,
+  .manual-layout,
   .presenter-metrics,
   .presenter-node-grid,
   .node-management-grid,
@@ -2627,6 +2699,17 @@ td {
   .presenter-gpu-panel {
     grid-column: auto;
   }
+
+  .manual-toc {
+    max-height: 220px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .manual-layout .markdown-body {
+    height: auto;
+    max-height: calc(100vh - 360px);
+  }
 }
 
 @media (max-width: 680px) {
@@ -2678,7 +2761,7 @@ td {
 }
 
 .task-board {
-  height: calc(100vh - 132px);
+  height: calc(100vh - 154px);
   min-height: 520px;
   display: grid;
 }

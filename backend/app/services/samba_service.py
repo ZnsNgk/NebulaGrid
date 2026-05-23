@@ -5,9 +5,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.core.config import Settings, get_settings
 from app.core.errors import validation_error
 from app.core.time_utils import local_now
+from app.db.models import Setting
+from app.db.session import SessionLocal
 
 _SAMBA_ACCOUNT_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _KNOWN_COMMAND_PATHS = {
@@ -71,7 +75,7 @@ def inspect_samba_account(account_name: str, desired_enabled: bool, fallback_sta
     """读取 Samba 后端中的实际账号状态；未启用真实管理时返回数据库最近状态。"""
     settings = get_settings()
     validate_samba_account_name(account_name)
-    if not settings.manage_samba_accounts or os.name != "posix":
+    if not samba_management_enabled(settings) or os.name != "posix":
         status = fallback_status or ("enabled" if desired_enabled else "disabled")
         if desired_enabled and status == "disabled":
             status = "pending"
@@ -152,7 +156,7 @@ def run_samba_commands(
 ) -> SambaAccountPlan:
     """按配置执行 Samba 命令；开发环境默认只返回计划，避免误改本机 Samba 数据库。"""
     status = "enabled" if enabled else "disabled"
-    if not settings.manage_samba_accounts or os.name != "posix":
+    if not samba_management_enabled(settings) or os.name != "posix":
         return SambaAccountPlan(
             account_name=account_name,
             enabled=enabled,
@@ -229,6 +233,19 @@ def samba_failure_plan(account_name: str, enabled: bool, commands: list[list[str
 def redacted_command(command: list[str]) -> list[str]:
     """审计或错误响应里不输出密码；当前命令参数不含明文密码，此函数保留统一出口。"""
     return list(command)
+
+
+def samba_management_enabled(settings: Settings | None = None) -> bool:
+    """读取落库的 Samba 管理总开关；数据库不可用时回退到环境变量默认值。"""
+    resolved = settings or get_settings()
+    try:
+        with SessionLocal() as db:
+            row = db.get(Setting, "manage.samba_accounts")
+            if row is None:
+                return bool(resolved.manage_samba_accounts)
+            return row.value.strip().lower() in {"1", "true", "yes", "on", "开启"}
+    except SQLAlchemyError:
+        return bool(resolved.manage_samba_accounts)
 
 
 def privileged_command(command: list[str]) -> list[str]:

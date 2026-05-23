@@ -234,10 +234,12 @@ nebulagrid/
 │   ├── migrate_2x_tasks.py
 │   ├── health_check.py
 │   └── backup_db.py
-└── docs/
+├── docs/
     ├── deployment.md
-    ├── api.md
-    ├── user_manual.md
+    └── api.md
+└── guides/
+    ├── student_manual.md
+    ├── mentor_manual.md
     └── admin_manual.md
 ```
 
@@ -874,6 +876,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 | 日志页面   | 自己的日志 | 自己+学生日志 | 全部日志          | 不可用       |
 | 文件页面   | 自己的目录 | 自己+学生目录 | 全部用户目录      | 不可用       |
 | 环境页面   | 自己的环境 | 自己+学生环境 | 全部环境          | 不可用       |
+| 使用手册   | 学生手册   | 导师手册      | 管理员手册        | 不可用       |
 | 用户管理   | 个人资料   | 学生管理      | 全局用户管理      | 不可用       |
 | 管理员后台 | 不可用     | 不可用        | 可用              | 不可用       |
 
@@ -892,6 +895,16 @@ def resolve_virtual_path(user, virtual_path, mode):
 - 日志页面应提供“自动刷新/暂停刷新/跳到末尾/下载完整日志/关键字搜索”。
 
 - 展示大屏应隐藏操作按钮和敏感字段，并支持 10-30 秒自动轮播。
+
+## 12.3 使用手册页面
+
+- 使用手册内容存放在仓库根目录 `guides/` 下，按学生、导师和管理员分别维护 `student_manual.md`、`mentor_manual.md`、`admin_manual.md`。
+
+- 前端调用 `/api/manual/current` 获取当前登录角色对应的 Markdown；展示者账号只进入展示大屏，不显示普通控制台手册入口。
+
+- 手册页面左侧根据 Markdown 标题自动生成目录，点击目录项滚动到对应章节。
+
+- 目录区域应固定在页面左侧或在窄屏时吸顶显示，用户滚动正文时目录不应随正文一起离开视野。
 
 # 13. 迁移与开发实施计划
 

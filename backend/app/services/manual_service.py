@@ -7,27 +7,26 @@ from app.services.auth_service import UserRecord
 
 
 MANUAL_BY_ROLE: dict[Role, tuple[str, str]] = {
-    # 先统一展示架构设计书；后续可把不同角色映射到 docs 下各自的使用手册。
-    Role.STUDENT: ("学生使用手册", "NebulaGrid_Tianshu_3.0_System Architecture Design.md"),
-    Role.MENTOR: ("导师使用手册", "NebulaGrid_Tianshu_3.0_System Architecture Design.md"),
-    Role.ADMIN: ("管理员使用手册", "NebulaGrid_Tianshu_3.0_System Architecture Design.md"),
-    Role.VIEWER: ("展示端使用手册", "NebulaGrid_Tianshu_3.0_System Architecture Design.md"),
+    # 使用手册是面向最终用户的轻量文档，独立放在 guides 下；docs 仍保留需求、架构和部署文档。
+    Role.STUDENT: ("学生使用手册", "student_manual.md"),
+    Role.MENTOR: ("导师使用手册", "mentor_manual.md"),
+    Role.ADMIN: ("管理员使用手册", "admin_manual.md"),
 }
 
 
 def get_manual_document(user: UserRecord) -> ManualDocument:
-    """按用户角色选择 docs 下的 Markdown 文件，并返回给前端页面展示。"""
+    """按用户角色选择 guides 下的 Markdown 文件，并返回给前端页面展示。"""
     title, filename = MANUAL_BY_ROLE.get(
         user.role,
-        ("使用手册", "NebulaGrid_Tianshu_3.0_System Architecture Design.md"),
+        ("使用手册", "student_manual.md"),
     )
     repo_root = Path(__file__).resolve().parents[3]
-    doc_path = repo_root / "docs" / filename
+    doc_path = repo_root / "guides" / filename
     if not doc_path.is_file():
         raise not_found(f"manual document not found: {filename}")
     return ManualDocument(
         title=title,
         role=user.role.value,
-        source_path=f"docs/{filename}",
+        source_path=f"guides/{filename}",
         content=doc_path.read_text(encoding="utf-8"),
     )

@@ -227,6 +227,7 @@ nebulagrid/
 │   │   │   ├── envs.py
 │   │   │   ├── files.py
 │   │   │   ├── logs.py
+│   │   │   ├── manual.py
 │   │   │   ├── dashboard.py
 │   │   │   └── admin.py
 │   │   ├── core/
@@ -251,6 +252,7 @@ nebulagrid/
 │   │   │   ├── env_service.py
 │   │   │   ├── file_service.py
 │   │   │   ├── log_service.py
+│   │   │   ├── manual_service.py
 │   │   │   └── audit_service.py
 │   │   ├── workers/
 │   │   │   ├── scheduler.py
@@ -272,7 +274,11 @@ nebulagrid/
 │   ├── nginx.conf
 │   ├── systemd/
 │   └── docker-compose.dev.yml         # 仅用于开发数据库/Redis，不要求计算节点安装 Docker
-└── docs/
+├── docs/
+└── guides/
+    ├── student_manual.md
+    ├── mentor_manual.md
+    └── admin_manual.md
 ```
 
 注意：这里的 Docker Compose 仅用于开发环境快速启动 PostgreSQL/Redis，不代表计算节点必须安装 Docker。
@@ -662,6 +668,12 @@ API Router
 | POST | /api/auth/change-password | 修改密码 |
 | POST | /api/auth/sessions/list | 当前用户登录设备列表，状态字段为 `session_state/status_label/status_category` |
 | POST | /api/auth/sessions/offline | 下线当前用户指定登录设备 |
+
+#### Manual
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/manual/current | 返回当前登录角色对应的 Markdown 使用手册；学生、导师、管理员分别读取 `guides/student_manual.md`、`guides/mentor_manual.md`、`guides/admin_manual.md` |
 
 #### Admin Login Management
 

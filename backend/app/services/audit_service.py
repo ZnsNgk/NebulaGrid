@@ -40,6 +40,7 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "miniconda.python": "主节点 Miniconda Python 解释器路径。",
     "main.linux_user": "主控 Linux 账号名，管理员账号通常映射到该系统用户。",
     "manage.linux_accounts": "是否由 NebulaGrid 自动创建和维护 Linux 子账号。",
+    "manage.samba_accounts": "是否由 NebulaGrid 自动执行 smbpasswd/pdbedit 来维护用户 Samba 账号；关闭时只记录用户期望状态，不改动系统 Samba 数据库。",
     "session.secret": "登录会话签名密钥；生产环境应使用外部密钥并定期轮换。",
     "monitor.interval_seconds": "节点监控 worker 的轮询间隔，单位为秒。",
     "cors.origins": "允许访问 API 的前端来源列表，多个来源用英文逗号分隔。",
@@ -49,6 +50,7 @@ SETTING_VALUE_TYPES: dict[str, str] = {
     "scheduler.enabled": "boolean",
     "monitor.enabled": "boolean",
     "manage.linux_accounts": "boolean",
+    "manage.samba_accounts": "boolean",
     "scheduler.interval_seconds": "integer",
     "monitor.interval_seconds": "integer",
     "uploads.max_size_mb": "integer",
@@ -58,6 +60,7 @@ SETTING_OPTIONS: dict[str, list[dict[str, str]]] = {
     "scheduler.enabled": [{"value": "true", "label": "开启"}, {"value": "false", "label": "关闭"}],
     "monitor.enabled": [{"value": "true", "label": "开启"}, {"value": "false", "label": "关闭"}],
     "manage.linux_accounts": [{"value": "true", "label": "开启"}, {"value": "false", "label": "关闭"}],
+    "manage.samba_accounts": [{"value": "true", "label": "开启"}, {"value": "false", "label": "关闭"}],
     "environment": [
         {"value": "development", "label": "开发环境"},
         {"value": "testing", "label": "测试环境"},
@@ -87,10 +90,24 @@ SETTING_KEY_ALIASES: dict[str, str] = {
     "miniconda_python": "miniconda.python",
     "main_linux_user": "main.linux_user",
     "manage_linux_accounts": "manage.linux_accounts",
+    "manage_samba_accounts": "manage.samba_accounts",
     "session_secret": "session.secret",
     "scheduler_interval_seconds": "scheduler.interval_seconds",
     "monitor_interval_seconds": "monitor.interval_seconds",
     "cors_origins": "cors.origins",
+}
+
+# 这些配置承载数据库、缓存、指标库连接信息或会话密钥，只允许通过环境变量/
+# 部署密钥注入。系统设置页不能展示，settings 表也不能保存历史遗留值，
+# 否则管理员页面和数据库备份都会扩大敏感信息暴露面。
+ENV_ONLY_SETTING_KEYS = {
+    "database.url",
+    "redis.url",
+    "influxdb.url",
+    "influxdb.org",
+    "influxdb.bucket",
+    "influxdb.token",
+    "session.secret",
 }
 
 
@@ -266,14 +283,22 @@ def list_settings(user: UserRecord) -> list[SettingInfo]:
     require_permission(user.role, "admin:settings:read")
     with SessionLocal() as db:
         ensure_default_settings(db)
-        rows = db.scalars(select(Setting).order_by(Setting.key.asc())).all()
+        rows = db.scalars(
+            select(Setting)
+            .where(~Setting.key.in_(ENV_ONLY_SETTING_KEYS))
+            .order_by(Setting.key.asc())
+        ).all()
         return [setting_to_info(row) for row in rows]
 
 
 def update_settings(user: UserRecord, values: dict[str, str]) -> list[SettingInfo]:
     """把系统配置更新到数据库，并记录最后修改人和审计日志。"""
     require_permission(user.role, "admin:settings:write")
-    cleaned_values = {key.strip(): normalize_setting_value(key.strip(), value) for key, value in values.items() if key and key.strip()}
+    cleaned_values = {
+        key.strip(): normalize_setting_value(key.strip(), value)
+        for key, value in values.items()
+        if key and key.strip() and key.strip() not in ENV_ONLY_SETTING_KEYS
+    }
     now = local_datetime()
     with SessionLocal() as db:
         ensure_default_settings(db)
@@ -295,6 +320,9 @@ def update_settings(user: UserRecord, values: dict[str, str]) -> list[SettingInf
 def ensure_default_settings(db) -> None:
     """补齐系统默认配置；只新增缺失键，避免覆盖管理员已经保存到数据库的值。"""
     changed = False
+    deleted = db.query(Setting).filter(Setting.key.in_(ENV_ONLY_SETTING_KEYS)).delete(synchronize_session=False)
+    if deleted:
+        changed = True
     for key, value in default_settings().items():
         if db.get(Setting, key) is not None:
             continue
@@ -310,6 +338,8 @@ def default_settings() -> dict[str, str]:
     values = dict(DEFAULT_SETTINGS)
     for item in fields(settings):
         key = SETTING_KEY_ALIASES.get(item.name, item.name.replace("_", "."))
+        if key in ENV_ONLY_SETTING_KEYS:
+            continue
         values.setdefault(key, setting_value_to_text(getattr(settings, item.name)))
     return values
 

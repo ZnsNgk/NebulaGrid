@@ -3182,15 +3182,24 @@ function renderFrameworkCard(name, info = {}) {
 
 function renderManual() {
   const manual = state.data.manual;
+  const rendered = manual ? renderMarkdownDocument(manual.content) : { html: renderEmpty("手册加载中"), toc: [] };
   return shell(`
     <section class="panel manual-shell">
       <div class="panel-head">
         <div>
           <h2>${escapeHtml(manual?.title || "使用手册")}</h2>
-          <span>${escapeHtml(manual?.source_path || "docs/NebulaGrid_Tianshu_3.0_System Architecture Design.md")} · ${roleName(manual?.role || state.user?.role)}</span>
+          <span>${escapeHtml(manual?.source_path || "guides/student_manual.md")} · ${roleName(manual?.role || state.user?.role)}</span>
         </div>
       </div>
-      <article class="markdown-body">${manual ? renderMarkdown(manual.content) : renderEmpty("手册加载中")}</article>
+      <div class="manual-layout">
+        <aside class="manual-toc" aria-label="使用手册目录">
+          <strong>目录</strong>
+          ${rendered.toc.length
+            ? rendered.toc.map((item) => `<button type="button" class="manual-toc-item depth-${item.level}" data-manual-target="${escapeAttr(item.id)}">${escapeHtml(item.text)}</button>`).join("")
+            : `<span class="muted">暂无目录</span>`}
+        </aside>
+        <article class="markdown-body">${rendered.html}</article>
+      </div>
     </section>
   `);
 }
@@ -3902,8 +3911,14 @@ function vramUsedPercent(gpu) {
 }
 
 function renderMarkdown(markdown) {
+  return renderMarkdownDocument(markdown).html;
+}
+
+function renderMarkdownDocument(markdown) {
   const lines = String(markdown || "").split(/\r?\n/);
   const html = [];
+  const toc = [];
+  const headingIds = new Map();
   let inCode = false;
   let codeLines = [];
   let inList = false;
@@ -3951,7 +3966,10 @@ function renderMarkdown(markdown) {
     if (heading) {
       closeList();
       const level = Math.min(heading[1].length + 1, 5);
-      html.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`);
+      const headingText = stripInlineMarkdown(heading[2]);
+      const id = uniqueMarkdownHeadingId(headingText, headingIds);
+      toc.push({ id, text: headingText, level: heading[1].length });
+      html.push(`<h${level} id="${escapeAttr(id)}">${inlineMarkdown(heading[2])}</h${level}>`);
       continue;
     }
     const list = line.match(/^\s*[-*]\s+(.+)$/);
@@ -3972,7 +3990,7 @@ function renderMarkdown(markdown) {
     html.push(`<p>${inlineMarkdown(line)}</p>`);
   }
   closeList();
-  return html.join("");
+  return { html: html.join(""), toc };
 }
 
 function renderMarkdownTable(lines) {
@@ -3995,6 +4013,25 @@ function inlineMarkdown(value) {
   return escapeHtml(value)
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+
+function stripInlineMarkdown(value) {
+  return String(value || "")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .trim();
+}
+
+function uniqueMarkdownHeadingId(text, usedIds) {
+  const fallback = "section";
+  const base = String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_\u4e00-\u9fff]+/g, "-")
+    .replace(/^-+|-+$/g, "") || fallback;
+  const count = usedIds.get(base) || 0;
+  usedIds.set(base, count + 1);
+  return count ? `${base}-${count + 1}` : base;
 }
 
 function roleName(role) {
@@ -4302,6 +4339,7 @@ function bindEvents() {
     });
   });
   document.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.nav)));
+  bindManualTocEvents();
   document.querySelector("[data-action='logout']")?.addEventListener("click", () => run(logout));
   document.querySelectorAll("[data-action='refresh']").forEach((button) => button.addEventListener("click", () => run(refreshPage, "已刷新")));
   document.querySelector("[name='dashboard_refresh_seconds']")?.addEventListener("change", (event) => setDashboardRefreshSeconds(event.currentTarget.value));
@@ -4409,6 +4447,50 @@ function bindEvents() {
   });
   document.querySelectorAll("#nodeOwnerOptions input[type='checkbox']").forEach((input) => input.addEventListener("change", updateNodeOwnerSummary));
   document.querySelector("[name='owner_user_ids_manual']")?.addEventListener("input", updateNodeOwnerSummary);
+}
+
+function bindManualTocEvents() {
+  const manualBody = document.querySelector(".manual-layout .markdown-body");
+  const manualToc = document.querySelector(".manual-toc");
+  if (!manualBody || !manualToc) return;
+  const updateActive = () => updateManualTocActive(manualBody, manualToc);
+  document.querySelectorAll("[data-manual-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.getElementById(button.dataset.manualTarget)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      window.setTimeout(updateActive, 260);
+    });
+  });
+  manualBody.addEventListener("scroll", updateActive, { passive: true });
+  updateActive();
+}
+
+function updateManualTocActive(manualBody, manualToc) {
+  const headings = Array.from(manualBody.querySelectorAll("h2[id], h3[id], h4[id], h5[id]"));
+  if (!headings.length) return;
+  const bodyTop = manualBody.getBoundingClientRect().top;
+  const threshold = bodyTop + 28;
+  let activeId = headings[0].id;
+  for (const heading of headings) {
+    if (heading.getBoundingClientRect().top <= threshold) activeId = heading.id;
+    else break;
+  }
+  let activeButton = null;
+  manualToc.querySelectorAll("[data-manual-target]").forEach((button) => {
+    const isActive = button.dataset.manualTarget === activeId;
+    button.classList.toggle("active", isActive);
+    if (isActive) activeButton = button;
+  });
+  if (!activeButton) return;
+  const padding = 12;
+  const buttonTop = activeButton.offsetTop;
+  const buttonBottom = buttonTop + activeButton.offsetHeight;
+  const visibleTop = manualToc.scrollTop;
+  const visibleBottom = visibleTop + manualToc.clientHeight;
+  if (buttonTop < visibleTop + padding) {
+    manualToc.scrollTo({ top: Math.max(0, buttonTop - padding), behavior: "smooth" });
+  } else if (buttonBottom > visibleBottom - padding) {
+    manualToc.scrollTo({ top: buttonBottom - manualToc.clientHeight + padding, behavior: "smooth" });
+  }
 }
 
 function bindAdminLoginEvents() {
