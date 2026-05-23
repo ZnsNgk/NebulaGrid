@@ -35,6 +35,7 @@ class Settings:
     miniconda_python: str = "/home/ddltm/envs/miniconda3/bin/python"
     main_linux_user: str = "ddltm"
     manage_linux_accounts: bool = False
+    manage_samba_accounts: bool = False
     session_secret: str = "change-this-session-secret"
     scheduler_interval_seconds: int = 5
     monitor_interval_seconds: int = 5
@@ -84,6 +85,7 @@ def get_settings() -> Settings:
         miniconda_python=os.getenv("NEBULAGRID_MINICONDA_PYTHON", "/home/ddltm/envs/miniconda3/bin/python"),
         main_linux_user=os.getenv("NEBULAGRID_MAIN_LINUX_USER", "ddltm"),
         manage_linux_accounts=os.getenv("NEBULAGRID_MANAGE_LINUX_ACCOUNTS", "false").lower() == "true",
+        manage_samba_accounts=os.getenv("NEBULAGRID_MANAGE_SAMBA_ACCOUNTS", "false").lower() == "true",
         session_secret=os.getenv("NEBULAGRID_SESSION_SECRET", "change-this-session-secret"),
         scheduler_interval_seconds=int(os.getenv("NEBULAGRID_SCHEDULER_INTERVAL_SECONDS", "5")),
         monitor_interval_seconds=int(os.getenv("NEBULAGRID_MONITOR_INTERVAL_SECONDS", "5")),

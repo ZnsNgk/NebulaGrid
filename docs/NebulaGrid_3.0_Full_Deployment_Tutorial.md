@@ -50,7 +50,7 @@ sudo apt update
 sudo apt install -y \
   build-essential curl git rsync nginx \
   nfs-kernel-server postgresql postgresql-contrib redis-server \
-  influxdb2 openssh-client
+  influxdb2 openssh-client samba
 ```
 
 启动基础服务：
@@ -61,6 +61,7 @@ sudo systemctl enable --now influxdb
 sudo systemctl enable --now redis-server
 sudo systemctl enable --now nfs-kernel-server
 sudo systemctl enable --now nginx
+sudo systemctl enable --now smbd
 ```
 
 检查服务：
@@ -71,6 +72,7 @@ systemctl status influxdb --no-pager
 systemctl status redis-server --no-pager
 systemctl status nfs-kernel-server --no-pager
 systemctl status nginx --no-pager
+systemctl status smbd --no-pager
 redis-cli ping
 ```
 
@@ -402,6 +404,7 @@ sudo tee /etc/nebulagrid/backend.env >/dev/null <<'EOF'
 NEBULAGRID_APP_NAME=NebulaGrid
 NEBULAGRID_ENV=production
 NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true
+NEBULAGRID_MANAGE_SAMBA_ACCOUNTS=true
 NEBULAGRID_DATABASE_URL=postgresql+psycopg://nebulagrid:replace-with-strong-password@127.0.0.1:5432/nebulagrid
 NEBULAGRID_REDIS_URL=redis://127.0.0.1:6379/0
 NEBULAGRID_INFLUXDB_URL=http://127.0.0.1:8086
@@ -1094,7 +1097,7 @@ sudo systemctl reload nginx
 - `systemctl restart/reload`。
 - 修改 Nginx 配置。
 
-NebulaGrid API 以 `ddltm` 运行，但创建 SSH 子账户、同步 SSH 密码和删除子账户需要 root 权限。生产环境启用 `NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true` 后，需要给 `ddltm` 添加一条受限 sudoers 规则：
+NebulaGrid API 以 `ddltm` 运行，但创建 SSH 子账户、同步 SSH 密码、维护 Samba 账号和删除子账户需要 root 权限。生产环境启用 `NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true` 和 `NEBULAGRID_MANAGE_SAMBA_ACCOUNTS=true` 后，需要给 `ddltm` 添加一条受限 sudoers 规则：
 
 ```bash
 sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
@@ -1103,10 +1106,28 @@ sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
 写入：
 
 ```text
-ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
+ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /usr/bin/smbpasswd, /usr/bin/pdbedit, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
 ```
 
 这样平台创建用户时会创建同名 Linux 账户，用户可用平台用户名和密码 SSH 到 master，并默认进入 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。用户在 Web 修改密码或管理员重置密码时，会同步执行 `chpasswd`；删除平台用户时会同步执行 `userdel --remove`。所有用户目录按实验室共享策略设置为 `755`，便于互相读取和拷贝文件。
+
+主节点还需要配置 Samba 的 `homes` 动态共享；计算节点不需要安装 Samba。用户在账号管理页当前账号卡片中手动勾选 Samba 服务后，系统才会创建或启用同名 Samba 账号，新建用户默认关闭。开启时用户需要输入当前密码，后端用它初始化 Samba 密码；后续用户改密或管理员重置密码时，已开启 Samba 的账号会同步更新 `smbpasswd`。
+
+```bash
+sudo cp /etc/samba/smb.conf /etc/samba/smb.conf.bak.$(date +%Y%m%d%H%M%S)
+sudo tee -a /etc/samba/smb.conf >/dev/null <<'EOF'
+
+[homes]
+   comment = NebulaGrid user home
+   browseable = no
+   read only = no
+   valid users = %S
+   create mask = 0644
+   directory mask = 0755
+EOF
+sudo testparm
+sudo systemctl restart smbd
+```
 
 保存后，用 API 运行用户验证 `sudo -n` 是否能无交互执行。下面以 `ddltm` 为例：
 
@@ -1114,6 +1135,9 @@ ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userd
 sudo -u ddltm sudo -n /usr/sbin/useradd --create-home --home-dir /home/ddltm/data/user/nebulagrid_sudo_probe --shell /bin/bash nebulagrid_sudo_probe
 printf 'nebulagrid_sudo_probe:temporary-password\n' | sudo -u ddltm sudo -n /usr/sbin/chpasswd
 sudo -u ddltm sudo -n /usr/bin/chown -R nebulagrid_sudo_probe:nebulagrid_sudo_probe /home/ddltm/data/user/nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/bin/pdbedit -L
+printf 'temporary-password\ntemporary-password\n' | sudo -u ddltm sudo -n /usr/bin/smbpasswd -s -a nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/bin/smbpasswd -x nebulagrid_sudo_probe
 sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 sudo systemctl restart nebulagrid-api
 sudo systemctl reload nginx

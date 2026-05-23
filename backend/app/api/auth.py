@@ -3,16 +3,18 @@ from fastapi import APIRouter, Depends, Header, Request
 from app.api.deps import get_current_user
 from app.core.security import parse_authorization_header
 from app.core.responses import api_success
-from app.schemas.auth import AccountUpdateRequest, LoginRequest, PasswordChangeRequest, SessionOfflineRequest
+from app.schemas.auth import AccountUpdateRequest, LoginRequest, PasswordChangeRequest, SambaToggleRequest, SessionOfflineRequest
 from app.services.audit_service import record_audit
 from app.services.auth_service import (
     authenticate_user,
     build_public_user,
     change_current_user_password,
+    refresh_current_user_samba_status,
     list_login_sessions,
     logout_session,
     revoke_login_session,
     update_current_user_profile,
+    update_current_user_samba,
     UserRecord,
 )
 
@@ -74,6 +76,35 @@ def post_password_change(
     change_current_user_password(current_user, payload.current_password, payload.new_password)
     record_audit(current_user.id, "user.password.change", "user", str(current_user.id), ip=get_request_ip(request))
     return api_success(data={"password_changed": True}, request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/samba/status")
+def post_samba_status(
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """刷新并返回当前用户 Samba 访问状态，供账号卡片展示真实服务状态。"""
+    user = refresh_current_user_samba_status(current_user)
+    return api_success(data=build_public_user(user).model_dump(), request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/samba/update")
+def post_samba_update(
+    payload: SambaToggleRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """按当前用户的复选框设置启用或禁用 Samba 访问。"""
+    user = update_current_user_samba(current_user, payload.enabled, payload.current_password)
+    record_audit(
+        current_user.id,
+        "user.samba.update",
+        "user",
+        str(current_user.id),
+        ip=get_request_ip(request),
+        detail_json={"enabled": payload.enabled, "status": user.samba_status},
+    )
+    return api_success(data=build_public_user(user).model_dump(), request_id=request.headers.get("x-request-id"))
 
 
 @router.post("/change-password")

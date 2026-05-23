@@ -278,6 +278,114 @@ def test_user_management_maps_linux_accounts_and_deletes_children() -> None:
     assert login_response.status_code == 401
 
 
+def test_current_user_can_toggle_samba_with_current_password(monkeypatch) -> None:
+    """验证新用户默认关闭 Samba，开启时必须校验当前密码并返回服务状态。"""
+    calls: list[tuple[str, str, str | None]] = []
+
+    def fake_enable(account_name: str, password: str):
+        """模拟生产环境成功创建并启用 Samba 账号，避免测试改动本机系统账户。"""
+        from app.services.samba_service import SambaAccountPlan
+
+        calls.append(("enable", account_name, password))
+        return SambaAccountPlan(account_name, True, "enabled", "已启用", True, [], updated_at="now")
+
+    monkeypatch.setattr("app.services.auth_service.enable_samba_account", fake_enable)
+
+    client = make_client()
+    admin_token = login_as_admin(client)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    create_response = client.post(
+        "/api/users",
+        headers=admin_headers,
+        json={
+            "username": "samba-student",
+            "real_name": "Samba Student",
+            "role": "student",
+            "state": "enabled",
+            "password": "student123",
+        },
+    )
+    student_token = login_user(client, "samba-student", "student123")
+    student_headers = {"Authorization": f"Bearer {student_token}"}
+
+    status_response = client.post("/api/auth/samba/status", headers=student_headers)
+    missing_password_response = client.post("/api/auth/samba/update", headers=student_headers, json={"enabled": True})
+    enable_response = client.post(
+        "/api/auth/samba/update",
+        headers=student_headers,
+        json={"enabled": True, "current_password": "student123"},
+    )
+
+    assert create_response.status_code == 200
+    assert create_response.json()["data"]["samba_enabled"] is False
+    assert create_response.json()["data"]["samba_status"] == "disabled"
+    assert status_response.json()["data"]["samba_status"] == "disabled"
+    assert missing_password_response.status_code == 401
+    assert enable_response.status_code == 200
+    assert enable_response.json()["data"]["samba_enabled"] is True
+    assert enable_response.json()["data"]["samba_status"] == "enabled"
+    assert calls == [("enable", "samba-student", "student123")]
+
+
+def test_samba_password_syncs_when_enabled_user_password_changes(monkeypatch) -> None:
+    """验证已开启 Samba 的用户在自助改密和管理员重置密码时都会同步 SMB 密码。"""
+    calls: list[tuple[str, str, bool]] = []
+
+    def fake_enable(account_name: str, password: str):
+        """模拟开启 Samba，测试重点放在后续密码同步是否被触发。"""
+        from app.services.samba_service import SambaAccountPlan
+
+        return SambaAccountPlan(account_name, True, "enabled", "已启用", True, [], updated_at="now")
+
+    def fake_set_password(account_name: str, password: str, enabled: bool):
+        """记录 Samba 密码同步调用，避免执行真实 smbpasswd 命令。"""
+        from app.services.samba_service import SambaAccountPlan
+
+        calls.append((account_name, password, enabled))
+        return SambaAccountPlan(account_name, enabled, "enabled", "已启用", True, [], updated_at="now")
+
+    monkeypatch.setattr("app.services.auth_service.enable_samba_account", fake_enable)
+    monkeypatch.setattr("app.services.auth_service.set_samba_password", fake_set_password)
+    monkeypatch.setattr("app.services.user_service.set_samba_password", fake_set_password)
+
+    client = make_client()
+    admin_token = login_as_admin(client)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    user = client.post(
+        "/api/users",
+        headers=admin_headers,
+        json={
+            "username": "samba-pass",
+            "real_name": "Samba Password",
+            "role": "student",
+            "state": "enabled",
+            "password": "student123",
+        },
+    ).json()["data"]
+    student_token = login_user(client, "samba-pass", "student123")
+    student_headers = {"Authorization": f"Bearer {student_token}"}
+    client.post("/api/auth/samba/update", headers=student_headers, json={"enabled": True, "current_password": "student123"})
+
+    change_response = client.post(
+        "/api/auth/password/change",
+        headers=student_headers,
+        json={"current_password": "student123", "new_password": "student456"},
+    )
+    admin_token = login_as_admin(client)
+    reset_response = client.post(
+        "/api/users/password/reset",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"user_id": user["id"], "password": "student789"},
+    )
+
+    assert change_response.status_code == 200
+    assert reset_response.status_code == 200
+    assert calls == [
+        ("samba-pass", "student456", True),
+        ("samba-pass", "student789", True),
+    ]
+
+
 def test_last_admin_user_cannot_be_deleted() -> None:
     """验证用户删除流程保护最后一个管理员，避免系统失去管理入口。"""
     client = make_client()

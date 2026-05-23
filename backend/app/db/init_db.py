@@ -34,6 +34,10 @@ def migrate_existing_schema() -> None:
                     "linux_account_name": "VARCHAR(64)",
                     "linux_uid": "INTEGER",
                     "linux_gid": "INTEGER",
+                    "samba_enabled": "BOOLEAN DEFAULT false",
+                    "samba_status": "VARCHAR(32) DEFAULT 'disabled'",
+                    "samba_last_error": "TEXT",
+                    "samba_updated_at": "TIMESTAMP WITH TIME ZONE",
                     "created_at": "TIMESTAMP WITH TIME ZONE DEFAULT now()",
                 },
             )
@@ -169,6 +173,8 @@ def seed_defaults(db: Session) -> None:
                 state="enabled",
                 home_path=f"/home/{settings.main_linux_user}",
                 linux_account_name=settings.main_linux_user,
+                samba_enabled=False,
+                samba_status="disabled",
             )
         )
     else:
@@ -179,6 +185,10 @@ def seed_defaults(db: Session) -> None:
             admin.home_path = f"/home/{settings.main_linux_user}"
         if not admin.linux_account_name:
             admin.linux_account_name = settings.main_linux_user
+        if admin.samba_enabled is None:
+            admin.samba_enabled = False
+        if not admin.samba_status:
+            admin.samba_status = "disabled"
     for key, value in default_settings().items():
         exists = db.get(Setting, key)
         if exists is None:

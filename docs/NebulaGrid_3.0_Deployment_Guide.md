@@ -26,14 +26,14 @@
 sudo apt update
 sudo apt install -y \
   build-essential curl git nginx nfs-kernel-server postgresql postgresql-contrib \
-  redis-server influxdb2 openssh-client
+  redis-server influxdb2 openssh-client samba
 ```
 
 确认服务可用：
 
 ```bash
-sudo systemctl enable --now postgresql influxdb redis-server nfs-kernel-server nginx
-systemctl status postgresql influxdb redis-server nfs-kernel-server nginx
+sudo systemctl enable --now postgresql influxdb redis-server nfs-kernel-server nginx smbd
+systemctl status postgresql influxdb redis-server nfs-kernel-server nginx smbd
 ```
 
 ## 3. 创建统一主账户
@@ -232,6 +232,7 @@ sudo tee /etc/nebulagrid/backend.env >/dev/null <<'EOF'
 NEBULAGRID_APP_NAME=NebulaGrid
 NEBULAGRID_ENV=production
 NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true
+NEBULAGRID_MANAGE_SAMBA_ACCOUNTS=true
 NEBULAGRID_DATABASE_URL=postgresql+psycopg://nebulagrid:replace-with-strong-password@127.0.0.1:5432/nebulagrid
 NEBULAGRID_REDIS_URL=redis://127.0.0.1:6379/0
 NEBULAGRID_INFLUXDB_URL=http://127.0.0.1:8086
@@ -530,7 +531,7 @@ sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
 写入：
 
 ```text
-ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl
+ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /usr/bin/smbpasswd, /usr/bin/pdbedit
 ```
 
 保存后用 API 运行用户和绝对路径验证 sudoers 是否生效：
@@ -545,6 +546,41 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 如果出现 `interactive authentication is required`、`a password is required` 或 `not allowed to execute`，说明 sudoers 没有匹配到 API 实际执行的绝对路径，或者授权用户不是 API 实际运行用户，需要先修正授权。
 
 平台用户可用自己的用户名和密码 SSH 到 master，默认 home 为 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。平台会把用户目录设置为 `755`，便于实验室成员互相读取和拷贝文件。
+
+### 16.1 Samba 用户访问
+
+主节点需要安装并启用 Samba 服务，计算节点不需要安装 Samba。用户在“账号管理”的当前账号卡片中手动勾选 Samba 服务后，API 会用当前系统密码创建或启用同名 Samba 账号；新建用户默认关闭 Samba，只有用户手动开启后才会生成 SMB 凭据。用户后续自助修改密码或管理员重置密码时，已开启 Samba 的账号会同步调用 `smbpasswd` 更新 Samba 密码。
+
+建议使用 Samba 的 `homes` 动态共享，让每个用户只能访问自己的 Linux home，也就是 `/home/ddltm/data/user/<user_name>`：
+
+```bash
+sudo cp /etc/samba/smb.conf /etc/samba/smb.conf.bak.$(date +%Y%m%d%H%M%S)
+sudo tee -a /etc/samba/smb.conf >/dev/null <<'EOF'
+
+[homes]
+   comment = NebulaGrid user home
+   browseable = no
+   read only = no
+   valid users = %S
+   create mask = 0644
+   directory mask = 0755
+EOF
+sudo testparm
+sudo systemctl enable --now smbd
+sudo systemctl restart smbd
+```
+
+如果 `command -v smbpasswd` 或 `command -v pdbedit` 返回的不是 `/usr/bin/...`，需要把 sudoers 中的路径改成现场真实路径。验证授权时不要使用真实用户密码，可创建临时探针账号：
+
+```bash
+sudo -u ddltm sudo -n /usr/sbin/useradd --create-home --home-dir /home/ddltm/data/user/nebulagrid_sudo_probe --shell /bin/bash nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/bin/pdbedit -L
+printf 'temporary-password\ntemporary-password\n' | sudo -u ddltm sudo -n /usr/bin/smbpasswd -s -a nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/bin/smbpasswd -x nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
+```
+
+如果 Samba 状态在页面显示“失败”，优先检查 `journalctl -u nebulagrid-api`、`journalctl -u smbd`、`testparm` 和 sudoers 路径。Samba 协议只暴露主节点上的用户目录，不替代 NFS；NFS 仍然负责 master 与计算节点之间的训练数据和日志共享。
 
 文件管理页面提供“共享文件夹”视图，所有登录用户都可以查看 `NEBULAGRID_SHARED_FOLDER_ROOT` 指向的共享 SSD 目录。默认部署路径为 `/home/ddltm/shared`；如果现场用 `~/ddltm/shared` 这类写法，请在写入 `backend.env` 前先展开成 API 运行用户实际看到的绝对路径，避免 systemd 环境中 `~` 指向不同 home。用户可把个人目录中的文件或文件夹复制到共享文件夹，也可在共享文件夹中把文件或文件夹复制回自己的目录；新建、删除、重命名、上传、打包和解压仍限定在个人文件视图内，避免共享根被误操作。
 

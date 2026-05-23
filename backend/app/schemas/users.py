@@ -15,6 +15,10 @@ class UserInfo(BaseModel):
     linux_account_name: str | None = None
     linux_uid: int | None = None
     linux_gid: int | None = None
+    samba_enabled: bool = False
+    samba_status: str = "disabled"
+    samba_status_label: str = "已禁用"
+    samba_last_error: str | None = None
     supervisor_ids: list[int] = Field(default_factory=list)
     supervisor_names: list[str] = Field(default_factory=list)
     created_at: str
@@ -65,6 +69,7 @@ class UserUpdateRequest(BaseModel):
     real_name: str | None = Field(default=None, min_length=1, max_length=128)
     role: str | None = Field(default=None, pattern="^(student|mentor|admin|viewer)$")
     state: str | None = Field(default=None, pattern="^(enabled|disabled)$")
+    samba_enabled: bool | None = None
     supervisor_ids: list[int] | None = Field(default=None, max_length=2)
 
     @field_validator("username", "real_name", "role", "state", mode="before")

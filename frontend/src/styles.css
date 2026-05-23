@@ -1299,6 +1299,7 @@ nav {
 
 .status.wait,
 .status.on_hold,
+.status.pending,
 .status.preparing,
 .status.dispatching,
 .status.reconnecting,
@@ -1391,6 +1392,18 @@ nav {
 .check input {
   width: auto;
   min-height: 0;
+}
+
+.samba-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.samba-control .check {
+  min-height: 28px;
 }
 
 .path-bar {

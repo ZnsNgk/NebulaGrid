@@ -101,6 +101,8 @@ NEBULAGRID_INFLUXDB_TOKEN=change-this-influx-token
 NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
 NEBULAGRID_INFLUXDB_PRESENTER_RANGE=30m
 NEBULAGRID_INFLUXDB_PRESENTER_WINDOW=30s
+NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true
+NEBULAGRID_MANAGE_SAMBA_ACCOUNTS=true
 NEBULAGRID_SHARED_FOLDER_ROOT=/home/ddltm/shared
 NEBULAGRID_FILE_OPERATION_WORKER_THREADS=2
 ```
@@ -202,7 +204,7 @@ sudo systemctl restart nebulagrid-api nebulagrid-scheduler nebulagrid-node-monit
 sudo systemctl reload nginx
 ```
 
-如果启用了 SSH 子账户同步或希望 `ddltm` 可以执行受控重启，需要配置很窄的 sudoers。API 服务运行在 systemd 中，没有交互终端，所以不能依赖 sudo 密码缓存，也不能让后端保存 sudo 密码；所有需要 API 调用的命令必须使用 `NOPASSWD` 和绝对路径授权。
+如果启用了 SSH 子账户同步、Samba 用户访问或希望 `ddltm` 可以执行受控重启，需要配置很窄的 sudoers。API 服务运行在 systemd 中，没有交互终端，所以不能依赖 sudo 密码缓存，也不能让后端保存 sudo 密码；所有需要 API 调用的命令必须使用 `NOPASSWD` 和绝对路径授权。
 
 先确认 API 实际运行用户：
 
@@ -220,8 +222,22 @@ sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
 写入：
 
 ```text
-ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
+ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /usr/bin/smbpasswd, /usr/bin/pdbedit, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
 ```
+
+Samba 只需要安装在主节点，计算节点仍通过 NFS 使用同一份数据。主节点应安装并启用 `samba`/`smbd`，在 `/etc/samba/smb.conf` 中配置 `[homes]` 动态共享：
+
+```ini
+[homes]
+   comment = NebulaGrid user home
+   browseable = no
+   read only = no
+   valid users = %S
+   create mask = 0644
+   directory mask = 0755
+```
+
+新建平台用户默认关闭 Samba；用户在账号管理页当前账号卡片中勾选 Samba 服务并输入当前密码后，API 才会创建或启用同名 Samba 账号。用户改密或管理员重置密码时，已开启 Samba 的账号会同步更新 `smbpasswd`。
 
 保存后用 API 运行用户和绝对路径验证 sudoers 是否生效：
 
@@ -229,6 +245,9 @@ ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userd
 sudo -u ddltm sudo -n /usr/sbin/useradd --create-home --home-dir /home/ddltm/data/user/nebulagrid_sudo_probe --shell /bin/bash nebulagrid_sudo_probe
 printf 'nebulagrid_sudo_probe:temporary-password\n' | sudo -u ddltm sudo -n /usr/sbin/chpasswd
 sudo -u ddltm sudo -n /usr/bin/chown -R nebulagrid_sudo_probe:nebulagrid_sudo_probe /home/ddltm/data/user/nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/bin/pdbedit -L
+printf 'temporary-password\ntemporary-password\n' | sudo -u ddltm sudo -n /usr/bin/smbpasswd -s -a nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/bin/smbpasswd -x nebulagrid_sudo_probe
 sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 ```
 

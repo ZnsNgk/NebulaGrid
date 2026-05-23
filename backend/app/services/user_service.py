@@ -4,9 +4,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.errors import forbidden, not_found, validation_error
+from app.core.errors import AppError, forbidden, not_found, validation_error
 from app.core.rbac import Role, require_permission
 from app.core.security import hash_password
+from app.core.time_utils import local_datetime
 from app.db.models import User, UserSupervisor
 from app.db.session import SessionLocal
 from app.schemas.users import (
@@ -27,6 +28,7 @@ from app.services.linux_account_service import (
     linux_account_for_role,
     set_child_account_password,
 )
+from app.services.samba_service import delete_samba_account, disable_samba_account, samba_status_label, set_samba_password
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,8 @@ def create_user(user: UserRecord, payload: UserCreateRequest) -> UserInfo:
             password_hash=hash_password(payload.password),
             home_path=home_path,
             linux_account_name=account_name,
+            samba_enabled=False,
+            samba_status="disabled",
         )
         if payload.user_id is not None:
             model.id = payload.user_id
@@ -180,9 +184,19 @@ def update_user(user: UserRecord, payload: UserUpdateRequest) -> UserInfo:
         if not data and not supervisor_ids_changed:
             return to_user_info(target, db)
 
-        for field in ("username", "real_name", "role", "state", "password_hash"):
+        if "samba_enabled" in data and data["samba_enabled"] is not None:
+            next_samba_enabled = bool(data["samba_enabled"])
+            if next_samba_enabled and not target.samba_enabled:
+                raise validation_error("samba enable requires current password")
+            if not next_samba_enabled and target.samba_enabled and target_model.linux_account_name:
+                samba_plan = disable_samba_account(target_model.linux_account_name)
+                data["samba_status"] = samba_plan.status
+                data["samba_last_error"] = samba_plan.message if samba_plan.status == "failed" else None
+        for field in ("username", "real_name", "role", "state", "password_hash", "samba_enabled", "samba_status", "samba_last_error"):
             if field in data and data[field] is not None:
                 setattr(target_model, field, data[field])
+        if any(key.startswith("samba_") for key in data):
+            target_model.samba_updated_at = local_datetime()
         if "username" in data or "role" in data:
             target_model.home_path = home_path_for_user(target_model.username, target_model.role)
             target_model.linux_account_name = linux_account_for_role(target_model.username, target_model.role)
@@ -220,6 +234,18 @@ def reset_user_password(user: UserRecord, payload: UserPasswordResetRequest) -> 
         db.refresh(target_model)
         updated = user_model_to_record(target_model, db)
     account_plan = set_child_account_password(updated.username, updated.role.value, payload.password)
+    samba_plan = None
+    if updated.samba_enabled and updated.linux_account_name:
+        try:
+            samba_plan = set_samba_password(updated.linux_account_name, payload.password, enabled=True)
+        except AppError as exc:
+            update_user_record_samba_status(updated.id, "failed", exc.message)
+            raise
+        updated = update_user_record_samba_status(
+            updated.id,
+            samba_plan.status,
+            samba_plan.message if samba_plan.status == "failed" else None,
+        )
     revoked_sessions = revoke_user_sessions(updated.id)
     record_audit(
         user.id,
@@ -230,6 +256,8 @@ def reset_user_password(user: UserRecord, payload: UserPasswordResetRequest) -> 
             "revoked_sessions": revoked_sessions,
             "linux_account_name": account_plan.account_name,
             "linux_account_executed": account_plan.executed,
+            "samba_status": samba_plan.status if samba_plan is not None else updated.samba_status,
+            "samba_executed": samba_plan.executed if samba_plan is not None else False,
         },
     )
     return to_user_info(updated)
@@ -247,7 +275,10 @@ def delete_user(user: UserRecord, user_id: int) -> UserInfo:
             raise forbidden("last admin user cannot be deleted")
         info = to_user_info(target, db)
         account_plan = None
+        samba_plan = None
         if target.role in {Role.ADMIN, Role.STUDENT, Role.MENTOR}:
+            if target.linux_account_name and (target.samba_enabled or target.samba_status not in {"", "disabled"}):
+                samba_plan = delete_samba_account(target.linux_account_name)
             account_plan = delete_child_account(target.username, target.role.value)
         db.query(UserSupervisor).filter(
             or_(UserSupervisor.student_id == target.id, UserSupervisor.supervisor_id == target.id)
@@ -266,6 +297,8 @@ def delete_user(user: UserRecord, user_id: int) -> UserInfo:
             "role": target.role.value,
             "linux_account_name": account_plan.account_name if account_plan is not None else target.linux_account_name,
             "linux_account_executed": account_plan.executed if account_plan is not None else False,
+            "samba_status": samba_plan.status if samba_plan is not None else target.samba_status,
+            "samba_executed": samba_plan.executed if samba_plan is not None else False,
         },
     )
     return info
@@ -346,6 +379,10 @@ def ensure_existing_user_linux_accounts() -> int:
                     model.home_path = expected_home
                 if not model.linux_account_name:
                     model.linux_account_name = linux_account_for_role(model.username, model.role)
+                if model.samba_enabled is None:
+                    model.samba_enabled = False
+                if not model.samba_status:
+                    model.samba_status = "disabled"
                 if model.role in {Role.ADMIN.value, Role.STUDENT.value, Role.MENTOR.value}:
                     account_plan = ensure_child_account(model.username, model.role)
                     model.home_path = account_plan.home_path
@@ -397,6 +434,10 @@ def to_user_info(record: UserRecord, db: Session | None = None) -> UserInfo:
             linux_account_name=record.linux_account_name or linux_account_for_role(record.username, record.role.value),
             linux_uid=record.linux_uid,
             linux_gid=record.linux_gid,
+            samba_enabled=record.samba_enabled,
+            samba_status=record.samba_status or "disabled",
+            samba_status_label=samba_status_label(record.samba_status or "disabled"),
+            samba_last_error=record.samba_last_error,
             supervisor_ids=list(record.supervisor_ids),
             supervisor_names=supervisor_names,
             created_at=record.created_at or utc_now(),
@@ -404,3 +445,17 @@ def to_user_info(record: UserRecord, db: Session | None = None) -> UserInfo:
     finally:
         if owns_session:
             active_db.close()
+
+
+def update_user_record_samba_status(user_id: int, status: str, last_error: str | None) -> UserRecord:
+    """单独更新 Samba 状态，避免密码重置流程重新拼装整份用户资料。"""
+    with SessionLocal() as db:
+        model = db.get(User, user_id)
+        if model is None:
+            raise not_found("user not found")
+        model.samba_status = status
+        model.samba_last_error = last_error
+        model.samba_updated_at = local_datetime()
+        db.commit()
+        db.refresh(model)
+        return user_model_to_record(model, db)

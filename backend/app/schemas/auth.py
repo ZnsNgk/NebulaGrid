@@ -19,6 +19,12 @@ class PublicUser(BaseModel):
     role: str
     state: str
     permissions: list[str]
+    home_path: str = ""
+    linux_account_name: str | None = None
+    samba_enabled: bool = False
+    samba_status: str = "disabled"
+    samba_status_label: str = "已禁用"
+    samba_last_error: str | None = None
 
 
 class LoginResult(BaseModel):
@@ -40,6 +46,13 @@ class PasswordChangeRequest(BaseModel):
 
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=8, max_length=256)
+
+
+class SambaToggleRequest(BaseModel):
+    """用户自助开关 Samba 访问；开启时需要当前密码用于初始化 Samba 口令。"""
+
+    enabled: bool
+    current_password: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class SessionOfflineRequest(BaseModel):

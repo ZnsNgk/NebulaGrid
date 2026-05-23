@@ -29,6 +29,10 @@ class User(Base, TimestampMixin):
     linux_account_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     linux_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     linux_gid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    samba_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    samba_status: Mapped[str] = mapped_column(String(32), default="disabled", index=True)
+    samba_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    samba_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class UserSupervisor(Base):

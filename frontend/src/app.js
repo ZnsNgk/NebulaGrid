@@ -98,6 +98,10 @@ const errorMessageMap = {
   unauthorized: "登录状态已失效，请重新登录",
   "invalid identity or password": "账号或密码错误",
   "current password is invalid": "当前密码错误",
+  "samba account is unavailable": "当前账号不支持 Samba 服务",
+  "samba enable requires current password": "开启 Samba 需要当前密码",
+  "samba account command failed": "Samba 账号命令执行失败",
+  "samba account command unavailable": "Samba 账号命令不可用",
   "last admin user cannot be deleted": "不能删除最后一个管理员账号",
   "last admin user cannot be disabled": "不能停用最后一个管理员账号",
   "last admin user cannot be downgraded": "不能降级最后一个管理员账号",
@@ -471,6 +475,7 @@ async function refreshPage() {
       state.data.manual = (await api("/manual/current")).data;
     },
     account: async () => {
+      state.user = (await api("/auth/samba/status", { method: "POST" })).data;
       state.data.sessions = (await api("/auth/sessions/list", { method: "POST" })).data;
     },
     students: async () => {
@@ -1709,6 +1714,26 @@ async function changePassword(event) {
     }),
   });
   form.reset();
+}
+
+async function toggleCurrentSamba(input) {
+  const enabled = Boolean(input.checked);
+  const passwordInput = document.querySelector("[name='samba_current_password']");
+  const currentPassword = passwordInput ? passwordInput.value.trim() : "";
+  if (enabled && !currentPassword) {
+    input.checked = false;
+    throw new Error("开启 Samba 需要当前密码");
+  }
+  const payload = await api("/auth/samba/update", {
+    method: "POST",
+    body: JSON.stringify({
+      enabled,
+      ...(enabled ? { current_password: currentPassword } : {}),
+    }),
+  });
+  state.user = payload.data;
+  if (passwordInput) passwordInput.value = "";
+  render();
 }
 
 async function submitUserUpdate(event) {
@@ -3173,6 +3198,7 @@ function renderManual() {
 function renderAccount() {
   const permissions = state.user?.permissions || [];
   const sessions = state.data.sessions || [];
+  const sambaStatus = state.user?.samba_status || "disabled";
   return shell(`
     <section class="split">
       <article class="panel">
@@ -3183,6 +3209,15 @@ function renderAccount() {
           <dt>角色</dt><dd>${roleName(state.user?.role)}</dd>
           <dt>状态</dt><dd>${userStateText(state.user?.state || "enabled")}</dd>
           <dt>SSH 账户</dt><dd><code>${escapeHtml(accountNameForUser(state.user))}</code></dd>
+          <dt>Samba 服务</dt>
+          <dd>
+            <div class="samba-control">
+              <label class="check"><input type="checkbox" data-toggle-samba ${state.user?.samba_enabled ? "checked" : ""}>开启</label>
+              <span class="status ${sambaStatusClass(sambaStatus)}">${sambaStatusText(state.user)}</span>
+            </div>
+            <input name="samba_current_password" type="password" autocomplete="current-password" placeholder="开启时输入当前密码">
+            ${state.user?.samba_last_error ? `<span class="muted">${escapeHtml(state.user.samba_last_error)}</span>` : ""}
+          </dd>
         </dl>
       </article>
       <article class="panel">
@@ -3743,6 +3778,23 @@ function renderSessionPanelOnly() {
   if (!panel || state.page !== "account") return;
   panel.outerHTML = renderSessionPanel(state.data.sessions || []);
   bindSessionEvents();
+}
+
+function sambaStatusText(user) {
+  const status = user?.samba_status || "disabled";
+  return user?.samba_status_label || {
+    enabled: "已启用",
+    disabled: "已禁用",
+    failed: "失败",
+    pending: "未执行",
+  }[status] || "未知";
+}
+
+function sambaStatusClass(status) {
+  if (status === "enabled") return "enabled";
+  if (status === "pending") return "pending";
+  if (status === "failed") return "failed";
+  return "disabled";
 }
 
 function renderSupervisorOptions(selected = []) {
@@ -4335,6 +4387,7 @@ function bindEvents() {
   document.querySelectorAll("[data-reset-user]").forEach((button) => button.addEventListener("click", () => fillPasswordResetForm(button.dataset.resetUser)));
   document.querySelectorAll("[data-delete-user]").forEach((button) => button.addEventListener("click", () => run(() => deleteUser(button.dataset.deleteUser), "账号已删除")));
   document.querySelectorAll("[data-toggle-user]").forEach((button) => button.addEventListener("click", () => run(() => toggleUserState(button.dataset.toggleUser, button.dataset.nextState), button.dataset.nextState === "enabled" ? "账号已启用" : "账号已停用")));
+  document.querySelector("[data-toggle-samba]")?.addEventListener("change", (event) => run(() => toggleCurrentSamba(event.currentTarget), event.currentTarget.checked ? "Samba 服务已启用" : "Samba 服务已禁用"));
   document.querySelectorAll("select[name='supervisor_ids']").forEach((select) => select.addEventListener("change", () => enforceSupervisorLimit(select)));
   bindSessionEvents();
   document.querySelectorAll("[data-reconnect-node]").forEach((button) => button.addEventListener("click", () => run(() => reconnectNode(button.dataset.reconnectNode), "已提交重连")));

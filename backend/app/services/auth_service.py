@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.core.errors import unauthorized
+from app.core.errors import AppError, unauthorized
 from app.core.rbac import Role, list_permissions, require_permission
 from app.core.security import create_session_token, hash_password, verify_password, verify_session_token
 from app.core.time_utils import ensure_local_datetime, local_datetime, local_now, parse_datetime_local
@@ -14,6 +14,13 @@ from app.db.models import LoginSession, User, UserSupervisor
 from app.db.session import SessionLocal
 from app.schemas.auth import AdminOnlineUserInfo, AdminUserLoginSessions, LoginResult, LoginSessionInfo, PublicUser
 from app.services.linux_account_service import home_path_for_user, linux_account_for_role, set_child_account_password
+from app.services.samba_service import (
+    disable_samba_account,
+    enable_samba_account,
+    inspect_samba_account,
+    samba_status_label,
+    set_samba_password,
+)
 
 SESSION_STALE_MINUTES = 30
 
@@ -33,6 +40,9 @@ class UserRecord:
     linux_account_name: str | None = None
     linux_uid: int | None = None
     linux_gid: int | None = None
+    samba_enabled: bool = False
+    samba_status: str = "disabled"
+    samba_last_error: str | None = None
     created_at: str = ""
 
 
@@ -84,6 +94,9 @@ def register_user_record(user: UserRecord) -> None:
                 linux_account_name=user.linux_account_name or linux_account_for_role(user.username, user.role.value),
                 linux_uid=user.linux_uid,
                 linux_gid=user.linux_gid,
+                samba_enabled=user.samba_enabled,
+                samba_status=user.samba_status,
+                samba_last_error=user.samba_last_error,
             )
         )
         for supervisor_id in user.supervisor_ids:
@@ -103,6 +116,8 @@ def update_user_record(user: UserRecord, **changes: object) -> UserRecord:
         for key, value in changes.items():
             if hasattr(model, key):
                 setattr(model, key, value)
+        if any(key.startswith("samba_") for key in changes):
+            model.samba_updated_at = utc_datetime()
         if "username" in changes or "role" in changes:
             model.home_path = home_path_for_user(model.username, model.role)
             model.linux_account_name = linux_account_for_role(model.username, model.role)
@@ -181,6 +196,12 @@ def build_public_user(user: UserRecord) -> PublicUser:
         role=user.role.value,
         state=user.state,
         permissions=list_permissions(user.role),
+        home_path=user.home_path or home_path_for_user(user.username, user.role.value),
+        linux_account_name=user.linux_account_name or linux_account_for_role(user.username, user.role.value),
+        samba_enabled=user.samba_enabled,
+        samba_status=user.samba_status or "disabled",
+        samba_status_label=samba_status_label(user.samba_status or "disabled"),
+        samba_last_error=user.samba_last_error,
     )
 
 
@@ -195,7 +216,59 @@ def change_current_user_password(user: UserRecord, current_password: str, new_pa
         raise unauthorized("current password is invalid")
     updated = update_user_record(user, password_hash=hash_password(new_password))
     set_child_account_password(updated.username, updated.role.value, new_password)
+    if updated.samba_enabled and updated.linux_account_name:
+        try:
+            plan = set_samba_password(updated.linux_account_name, new_password, enabled=True)
+        except AppError as exc:
+            update_user_record(updated, samba_status="failed", samba_last_error=exc.message)
+            raise
+            update_user_record(
+                updated,
+                samba_status=plan.status,
+                samba_last_error=plan.message if plan.status == "failed" else None,
+            )
     revoke_user_sessions(user.id)
+
+
+def update_current_user_samba(user: UserRecord, enabled: bool, current_password: str | None = None) -> UserRecord:
+    """按当前用户的选择启用或禁用 Samba；开启时用当前密码初始化同名 Samba 账号。"""
+    account_name = user.linux_account_name or linux_account_for_role(user.username, user.role.value)
+    if account_name is None:
+        raise unauthorized("samba account is unavailable")
+    if enabled:
+        if not current_password or not verify_password(current_password, user.password_hash):
+            raise unauthorized("current password is invalid")
+        try:
+            plan = enable_samba_account(account_name, current_password)
+        except AppError as exc:
+            update_user_record(user, samba_enabled=True, samba_status="failed", samba_last_error=exc.message)
+            raise
+    else:
+        try:
+            plan = disable_samba_account(account_name)
+        except AppError as exc:
+            update_user_record(user, samba_enabled=False, samba_status="failed", samba_last_error=exc.message)
+            raise
+    updated = update_user_record(
+        user,
+        samba_enabled=enabled,
+        samba_status=plan.status,
+        samba_last_error=plan.message if plan.status == "failed" else None,
+    )
+    return updated
+
+
+def refresh_current_user_samba_status(user: UserRecord) -> UserRecord:
+    """刷新当前用户 Samba 实际状态；真实管理未开启时仅回读数据库最近记录。"""
+    account_name = user.linux_account_name or linux_account_for_role(user.username, user.role.value)
+    if account_name is None:
+        return update_user_record(user, samba_enabled=False, samba_status="disabled", samba_last_error=None)
+    plan = inspect_samba_account(account_name, user.samba_enabled, user.samba_status)
+    return update_user_record(
+        user,
+        samba_status=plan.status,
+        samba_last_error=plan.message if plan.status == "failed" else None,
+    )
 
 
 def record_login_session(user: UserRecord, token: str, login_ip: str, user_agent: str, device_id: str = "") -> LoginSessionRecord:
@@ -682,6 +755,9 @@ def user_model_to_record(user: User, db: Session) -> UserRecord:
         linux_account_name=user.linux_account_name,
         linux_uid=user.linux_uid,
         linux_gid=user.linux_gid,
+        samba_enabled=bool(user.samba_enabled),
+        samba_status=user.samba_status or "disabled",
+        samba_last_error=user.samba_last_error,
         created_at=datetime_to_iso(user.created_at),
     )
 
