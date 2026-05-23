@@ -32,7 +32,7 @@
 
 - 网络互通，主节点能访问计算节点的 SSH 端口。
 - 所有机器都有同名 Linux 主账户，例如 `ddltm`。
-- 所有机器的 `/home/ddltm/data` 和 `/home/ddltm/envs` 路径一致。
+- 所有机器的 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared` 路径一致。
 - 计算节点已经安装 NVIDIA 驱动，并且 `nvidia-smi` 可以正常输出。
 
 计算节点上验证 GPU：
@@ -152,7 +152,7 @@ sudo -u ddltm ssh ddltm@node-a 'hostname && id && nvidia-smi -L'
 
 以下命令在主节点执行。
 
-创建 NebulaGrid 数据目录和环境目录。`/home/ddltm/data` 只放用户数据、任务日志、运行时文件和备份；`/home/ddltm/envs` 放 Miniconda、用户环境以及远端执行脚本，避免环境文件和用户数据混在同一个共享根下。
+创建 NebulaGrid 数据目录、环境目录和共享 SSD 目录。`/home/ddltm/data` 只放用户数据、任务日志、运行时文件和备份；`/home/ddltm/envs` 放 Miniconda、用户环境以及远端执行脚本，避免环境文件和用户数据混在同一个共享根下；`/home/ddltm/shared` 是所有用户可在 Web 文件管理中查看和互相复制文件的共享文件夹。
 
 ```bash
 sudo mkdir -p /home/ddltm/data/user
@@ -164,10 +164,13 @@ sudo mkdir -p /home/ddltm/envs/packages
 sudo mkdir -p /home/ddltm/envs/miniconda3
 sudo mkdir -p /home/ddltm/envs/miniconda3/envs
 sudo mkdir -p /home/ddltm/envs/nebulagrid_remote
+sudo mkdir -p /home/ddltm/shared
 sudo chown -R ddltm:ddltm /home/ddltm/data
 sudo chown -R ddltm:ddltm /home/ddltm/envs
+sudo chown -R ddltm:ddltm /home/ddltm/shared
 sudo chmod 750 /home/ddltm/data
 sudo chmod 750 /home/ddltm/envs
+sudo chmod 775 /home/ddltm/shared
 ```
 
 写入 NFS export 配置。请把 `192.168.1.0/24` 替换成你的实际内网网段。
@@ -176,6 +179,7 @@ sudo chmod 750 /home/ddltm/envs
 sudo tee /etc/exports.d/nebulagrid.exports >/dev/null <<'EOF'
 /home/ddltm/data 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
 /home/ddltm/envs 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
+/home/ddltm/shared 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
 EOF
 ```
 
@@ -203,6 +207,7 @@ sudo apt install -y nfs-common
 ```bash
 sudo mkdir -p /home/ddltm/data
 sudo mkdir -p /home/ddltm/envs
+sudo mkdir -p /home/ddltm/shared
 ```
 
 临时挂载测试。请把 `master` 替换成主节点主机名或 IP。
@@ -210,6 +215,7 @@ sudo mkdir -p /home/ddltm/envs
 ```bash
 sudo mount -t nfs master:/home/ddltm/data /home/ddltm/data
 sudo mount -t nfs master:/home/ddltm/envs /home/ddltm/envs
+sudo mount -t nfs master:/home/ddltm/shared /home/ddltm/shared
 ```
 
 如果使用 IP：
@@ -217,6 +223,7 @@ sudo mount -t nfs master:/home/ddltm/envs /home/ddltm/envs
 ```bash
 sudo mount -t nfs 192.168.1.10:/home/ddltm/data /home/ddltm/data
 sudo mount -t nfs 192.168.1.10:/home/ddltm/envs /home/ddltm/envs
+sudo mount -t nfs 192.168.1.10:/home/ddltm/shared /home/ddltm/shared
 ```
 
 写入开机自动挂载：
@@ -224,6 +231,7 @@ sudo mount -t nfs 192.168.1.10:/home/ddltm/envs /home/ddltm/envs
 ```bash
 echo 'master:/home/ddltm/data /home/ddltm/data nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
 echo 'master:/home/ddltm/envs /home/ddltm/envs nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
+echo 'master:/home/ddltm/shared /home/ddltm/shared nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
 ```
 
 如果使用 IP：
@@ -231,6 +239,7 @@ echo 'master:/home/ddltm/envs /home/ddltm/envs nfs defaults,_netdev 0 0' | sudo 
 ```bash
 echo '192.168.1.10:/home/ddltm/data /home/ddltm/data nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
 echo '192.168.1.10:/home/ddltm/envs /home/ddltm/envs nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
+echo '192.168.1.10:/home/ddltm/shared /home/ddltm/shared nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
 ```
 
 验证 NFS 读写：
@@ -238,8 +247,10 @@ echo '192.168.1.10:/home/ddltm/envs /home/ddltm/envs nfs defaults,_netdev 0 0' |
 ```bash
 sudo -u ddltm touch /home/ddltm/data/runtime/nfs-test-$(hostname)
 sudo -u ddltm touch /home/ddltm/envs/nfs-test-$(hostname)
+sudo -u ddltm touch /home/ddltm/shared/nfs-test-$(hostname)
 ls -l /home/ddltm/data/runtime/
 ls -l /home/ddltm/envs/
+ls -l /home/ddltm/shared/
 ```
 
 主节点和计算节点都应该能看到同一批测试文件。
@@ -398,8 +409,11 @@ NEBULAGRID_INFLUXDB_ORG=nebulagrid
 NEBULAGRID_INFLUXDB_BUCKET=nebulagrid_metrics
 NEBULAGRID_INFLUXDB_TOKEN=replace-with-influx-token
 NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
+NEBULAGRID_INFLUXDB_PRESENTER_RANGE=30m
+NEBULAGRID_INFLUXDB_PRESENTER_WINDOW=30s
 NEBULAGRID_DATA_ROOT=/home/ddltm/data
 NEBULAGRID_USER_HOME_ROOT=/home/ddltm/data/user
+NEBULAGRID_SHARED_FOLDER_ROOT=/home/ddltm/shared
 NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/miniconda3
 NEBULAGRID_CONDA_ENV_ROOT=/home/ddltm/envs/miniconda3/envs
 NEBULAGRID_TASK_LOG_ROOT=/home/ddltm/data/logs/task_logs
@@ -413,6 +427,7 @@ NEBULAGRID_SESSION_SECRET=replace-with-random-secret
 NEBULAGRID_CORS_ORIGINS=http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1,http://localhost,null
 NEBULAGRID_SCHEDULER_INTERVAL_SECONDS=5
 NEBULAGRID_MONITOR_INTERVAL_SECONDS=5
+NEBULAGRID_FILE_OPERATION_WORKER_THREADS=2
 EOF
 ```
 
@@ -850,9 +865,13 @@ curl -s http://127.0.0.1:8000/api/tasks \
   -d '{"description":"smoke test","workdir":"/","command":"python --version","requirement":{"need_gpus":0}}'
 ```
 
-### 17.6 验证文件打包/解压任务
+### 17.6 验证文件操作线程与打包/解压任务
 
 文件管理中的打包和解压任务会写入 PostgreSQL 的 `file_jobs` 表，页面刷新、重新登录或 API 多 worker 部署时仍可读取最近一次任务状态。API 启动时会把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。
+
+文件管理还提供共享文件夹视图，对应 `NEBULAGRID_SHARED_FOLDER_ROOT`，默认绝对路径为 `/home/ddltm/shared`。所有登录用户可以查看共享文件夹，并通过页面按钮把个人目录中的文件或文件夹复制到共享文件夹，也可以在共享文件夹中复制回自己的目录。共享视图只开放查看、下载和复制回个人目录，避免用户误删共享 SSD 根目录或其他人的资料。
+
+列表、预览、上传、创建、保存、复制、移动、删除、打包和解压统一进入专用文件线程池，避免共享盘或 NFS IO 抖动挤占 FastAPI 默认请求线程。线程数由 `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` 控制，默认 `2`；调大前应先确认共享盘吞吐足够。
 
 ```bash
 curl -s http://127.0.0.1:8000/api/files/jobs/latest \
@@ -1051,7 +1070,7 @@ sudo systemctl reload nginx
 
 - 安装 apt 包：`nginx`、`postgresql`、`redis-server`、`nfs-kernel-server`、`nfs-common` 等。
 - 创建 `ddltm` 用户，并保证所有节点 UID/GID 一致。
-- 创建 `/home/ddltm/data` 和 `/home/ddltm/envs` 并配置 NFS。
+- 创建 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared` 并配置 NFS。
 - 创建 PostgreSQL 用户和数据库。
 - 初始化 InfluxDB org、bucket 和 token。
 - 创建 `/etc/nebulagrid/backend.env`。

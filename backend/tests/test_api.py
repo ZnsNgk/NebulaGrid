@@ -1,8 +1,14 @@
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.core.config import get_settings
+from app.core.time_utils import local_datetime
+from app.services.auth_service import hash_session_token
+from app.db.models import LoginSession
+from app.db.session import SessionLocal
 from app.main import create_app
 from app.workers.runtime_guard import expand_pid_tree, parse_gpu_apps, parse_process_table
 
@@ -61,6 +67,46 @@ def test_auth_login_and_me() -> None:
     assert login_response.status_code == 200
     assert me_response.status_code == 200
     assert me_payload["data"]["username"] == "admin"
+
+
+def test_viewer_uses_presenter_endpoint_without_other_permissions() -> None:
+    """验证展示者账号只能访问大屏聚合接口，且静默很久后会话仍保持有效。"""
+    client = make_client()
+    admin_token = login_as_admin(client)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    client.post(
+        "/api/users",
+        headers=admin_headers,
+        json={
+            "username": "screen-viewer",
+            "real_name": "Screen Viewer",
+            "role": "viewer",
+            "state": "enabled",
+            "password": "viewer123",
+        },
+    )
+    login_response = client.post("/api/auth/login", json={"identity": "screen-viewer", "password": "viewer123"})
+    token = login_response.json()["data"]["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 展示者用于公共屏幕，不能因为超过普通 30 分钟在线窗口而被动下线。
+    with SessionLocal() as db:
+        session = db.scalar(select(LoginSession).where(LoginSession.token_hash == hash_session_token(token)))
+        assert session is not None
+        session.last_seen_at = local_datetime() - timedelta(days=365)
+        db.commit()
+
+    me_response = client.get("/api/auth/me", headers=headers)
+    presenter_response = client.get("/api/dashboard/presenter", headers=headers)
+    nodes_response = client.get("/api/nodes", headers=headers)
+    tasks_response = client.get("/api/tasks", headers=headers)
+
+    assert me_response.status_code == 200
+    assert me_response.json()["data"]["permissions"] == ["presenter:read"]
+    assert presenter_response.status_code == 200
+    assert set(presenter_response.json()["data"]) == {"summary", "nodes"}
+    assert nodes_response.status_code == 403
+    assert tasks_response.status_code == 403
 
 
 def test_task_lifecycle_smoke() -> None:
@@ -313,6 +359,77 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
         assert user_root.is_dir()
         assert (user_root / "project" / "note.txt").read_text(encoding="utf-8") == "updated"
         assert not (user_root / "project" / "renamed.txt").exists()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_shared_folder_scope_allows_copy_in_both_directions(monkeypatch, tmp_path: Path) -> None:
+    """验证共享文件夹 scope 使用独立根目录，并允许用户在个人目录和共享目录之间复制。"""
+    user_home_root = tmp_path / "user"
+    shared_root = tmp_path / "shared"
+    monkeypatch.setenv("NEBULAGRID_USER_HOME_ROOT", str(user_home_root))
+    monkeypatch.setenv("NEBULAGRID_VISIBLE_ROOTS", str(user_home_root))
+    monkeypatch.setenv("NEBULAGRID_SHARED_FOLDER_ROOT", str(shared_root))
+    get_settings.cache_clear()
+    try:
+        client = make_client()
+        admin_token = login_as_admin(client)
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        client.post(
+            "/api/users",
+            headers=admin_headers,
+            json={
+                "username": "shared-student",
+                "real_name": "Shared Student",
+                "role": "student",
+                "state": "enabled",
+                "password": "student123",
+            },
+        )
+        user_root = user_home_root / "shared-student"
+        shared_root.mkdir(parents=True, exist_ok=True)
+        (shared_root / "dataset.txt").write_text("shared-data", encoding="utf-8")
+
+        student_token = login_user(client, "shared-student", "student123")
+        headers = {"Authorization": f"Bearer {student_token}"}
+        client.post("/api/files/mkdir", headers=headers, json={"path": "/project"})
+        client.post(
+            "/api/files/create",
+            headers=headers,
+            json={"path": "/project/result.txt", "content": "user-data"},
+        )
+
+        shared_list_response = client.get("/api/files/list?scope=shared&path=/", headers=headers)
+        copy_to_shared_response = client.post(
+            "/api/files/copy",
+            headers=headers,
+            json={
+                "path": "/project/result.txt",
+                "target_path": "/result.txt",
+                "scope": "own",
+                "target_scope": "shared",
+            },
+        )
+        copy_to_own_response = client.post(
+            "/api/files/copy",
+            headers=headers,
+            json={
+                "path": "/dataset.txt",
+                "target_path": "/project/dataset.txt",
+                "scope": "shared",
+                "target_scope": "own",
+            },
+        )
+        preview_response = client.get("/api/files/preview?scope=shared&path=/dataset.txt", headers=headers)
+
+        assert shared_list_response.status_code == 200
+        assert shared_list_response.json()["data"]["display_path"] == "/共享文件夹"
+        assert shared_list_response.json()["data"]["items"][0]["path"] == "/dataset.txt"
+        assert copy_to_shared_response.status_code == 200
+        assert copy_to_own_response.status_code == 200
+        assert preview_response.json()["data"]["content"] == "shared-data"
+        assert (shared_root / "result.txt").read_text(encoding="utf-8") == "user-data"
+        assert (user_root / "project" / "dataset.txt").read_text(encoding="utf-8") == "shared-data"
     finally:
         get_settings.cache_clear()
 

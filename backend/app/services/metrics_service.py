@@ -41,6 +41,22 @@ class LatestMetrics:
     gpus: dict[int, GpuMetricSnapshot] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class MetricPoint:
+    """展示大屏历史曲线中的单个采样点，时间和值都保持轻量结构便于前端绘制。"""
+
+    time: str
+    value: int
+
+
+@dataclass(frozen=True)
+class HistoricalMetrics:
+    """按节点和 GPU ID 归档的 InfluxDB 历史监控序列。"""
+
+    nodes: dict[int, dict[str, list[MetricPoint]]] = field(default_factory=dict)
+    gpus: dict[int, dict[str, list[MetricPoint]]] = field(default_factory=dict)
+
+
 def write_monitor_snapshot(node: Any, payload: dict[str, Any], gpu_rows: list[tuple[Any, dict[str, Any]]]) -> None:
     """把一轮节点监控结果写入 InfluxDB，PostgreSQL 只保留节点和 GPU 清单。"""
     settings = get_settings()
@@ -133,6 +149,38 @@ def get_latest_metrics(node_ids: list[int], gpu_ids: list[int]) -> LatestMetrics
     )
 
 
+def get_historical_metrics(node_ids: list[int], gpu_ids: list[int]) -> HistoricalMetrics:
+    """读取展示大屏需要的历史监控曲线；InfluxDB 未配置时返回空序列，不影响页面展示。"""
+    settings = get_settings()
+    if not influx_enabled(settings) or (not node_ids and not gpu_ids):
+        return HistoricalMetrics()
+    flux = build_history_query(settings, node_ids, gpu_ids)
+    rows = query_flux(settings, flux)
+    node_values: dict[int, dict[str, list[MetricPoint]]] = {}
+    gpu_values: dict[int, dict[str, list[MetricPoint]]] = {}
+    for row in rows:
+        measurement = row.get("_measurement")
+        field_name = row.get("_field") or ""
+        if field_name not in {
+            "cpu_usage",
+            "avail_ram_mb",
+            "upload_mbps",
+            "download_mbps",
+            "gpu_usage",
+            "free_vram_mb",
+            "process_count",
+        }:
+            continue
+        point = MetricPoint(time=row.get("_time") or "", value=coerce_int(row.get("_value")))
+        if measurement == "node_metrics":
+            node_id = coerce_int(row.get("node_id"))
+            node_values.setdefault(node_id, {}).setdefault(field_name, []).append(point)
+        elif measurement == "gpu_metrics":
+            gpu_id = coerce_int(row.get("gpu_id"))
+            gpu_values.setdefault(gpu_id, {}).setdefault(field_name, []).append(point)
+    return HistoricalMetrics(nodes=node_values, gpus=gpu_values)
+
+
 def build_latest_query(settings: Settings, node_ids: list[int], gpu_ids: list[int]) -> str:
     """构造读取节点/GPU 最新值的 Flux 查询。"""
     node_filter = " or ".join(f'r.node_id == "{node_id}"' for node_id in node_ids) or "false"
@@ -146,6 +194,31 @@ from(bucket: "{escape_flux_string(settings.influxdb_bucket)}")
   )
   |> group(columns: ["_measurement", "node_id", "gpu_id", "_field"])
   |> last()
+'''
+
+
+def build_history_query(settings: Settings, node_ids: list[int], gpu_ids: list[int]) -> str:
+    """构造展示大屏历史曲线 Flux 查询，按配置窗口聚合以限制响应体大小。"""
+    node_filter = " or ".join(f'r.node_id == "{node_id}"' for node_id in node_ids) or "false"
+    gpu_filter = " or ".join(f'r.gpu_id == "{gpu_id}"' for gpu_id in gpu_ids) or "false"
+    node_fields = (
+        'r._field == "cpu_usage" or r._field == "avail_ram_mb" or '
+        'r._field == "upload_mbps" or r._field == "download_mbps"'
+    )
+    gpu_fields = (
+        'r._field == "gpu_usage" or r._field == "free_vram_mb" or '
+        'r._field == "process_count"'
+    )
+    return f'''
+from(bucket: "{escape_flux_string(settings.influxdb_bucket)}")
+  |> range(start: -{settings.influxdb_presenter_range})
+  |> filter(fn: (r) =>
+    (r._measurement == "node_metrics" and ({node_filter}) and ({node_fields})) or
+    (r._measurement == "gpu_metrics" and ({gpu_filter}) and ({gpu_fields}))
+  )
+  |> aggregateWindow(every: {settings.influxdb_presenter_window}, fn: mean, createEmpty: false)
+  |> group(columns: ["_measurement", "node_id", "gpu_id", "_field"])
+  |> sort(columns: ["_time"])
 '''
 
 

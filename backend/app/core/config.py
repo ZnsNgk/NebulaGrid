@@ -12,6 +12,7 @@ class Settings:
     environment: str = "development"
     data_root: str = "/home/ddltm/data"
     user_home_root: str = "/home/ddltm/data/user"
+    shared_folder_root: str = "/home/ddltm/shared"
     visible_roots: tuple[str, ...] = (
         "/home/ddltm/data/user",
         "/home/ddltm/envs/miniconda3",
@@ -23,6 +24,8 @@ class Settings:
     influxdb_bucket: str = "nebulagrid_metrics"
     influxdb_token: str = ""
     influxdb_latest_range: str = "30m"
+    influxdb_presenter_range: str = "30m"
+    influxdb_presenter_window: str = "30s"
     task_log_root: str = "/home/ddltm/data/logs/task_logs"
     conda_env_root: str = "/home/ddltm/envs/miniconda3/envs"
     env_package_root: str = "/home/ddltm/envs/packages"
@@ -35,6 +38,7 @@ class Settings:
     session_secret: str = "change-this-session-secret"
     scheduler_interval_seconds: int = 5
     monitor_interval_seconds: int = 5
+    file_operation_worker_threads: int = 2
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
         "http://localhost:5173",
@@ -57,6 +61,7 @@ def get_settings() -> Settings:
         environment=os.getenv("NEBULAGRID_ENV", "development"),
         data_root=os.getenv("NEBULAGRID_DATA_ROOT", "/home/ddltm/data"),
         user_home_root=os.getenv("NEBULAGRID_USER_HOME_ROOT", "/home/ddltm/data/user"),
+        shared_folder_root=os.getenv("NEBULAGRID_SHARED_FOLDER_ROOT", "/home/ddltm/shared"),
         visible_roots=tuple(root.strip() for root in visible_roots.split(",") if root.strip()),
         database_url=os.getenv(
             "NEBULAGRID_DATABASE_URL",
@@ -68,6 +73,8 @@ def get_settings() -> Settings:
         influxdb_bucket=os.getenv("NEBULAGRID_INFLUXDB_BUCKET", "nebulagrid_metrics"),
         influxdb_token=os.getenv("NEBULAGRID_INFLUXDB_TOKEN", ""),
         influxdb_latest_range=os.getenv("NEBULAGRID_INFLUXDB_LATEST_RANGE", "30m"),
+        influxdb_presenter_range=os.getenv("NEBULAGRID_INFLUXDB_PRESENTER_RANGE", "30m"),
+        influxdb_presenter_window=os.getenv("NEBULAGRID_INFLUXDB_PRESENTER_WINDOW", "30s"),
         task_log_root=os.getenv("NEBULAGRID_TASK_LOG_ROOT", "/home/ddltm/data/logs/task_logs"),
         conda_env_root=os.getenv("NEBULAGRID_CONDA_ENV_ROOT", "/home/ddltm/envs/miniconda3/envs"),
         env_package_root=os.getenv("NEBULAGRID_ENV_PACKAGE_ROOT", "/home/ddltm/envs/packages"),
@@ -80,6 +87,7 @@ def get_settings() -> Settings:
         session_secret=os.getenv("NEBULAGRID_SESSION_SECRET", "change-this-session-secret"),
         scheduler_interval_seconds=int(os.getenv("NEBULAGRID_SCHEDULER_INTERVAL_SECONDS", "5")),
         monitor_interval_seconds=int(os.getenv("NEBULAGRID_MONITOR_INTERVAL_SECONDS", "5")),
+        file_operation_worker_threads=int(os.getenv("NEBULAGRID_FILE_OPERATION_WORKER_THREADS", "2")),
         cors_origins=tuple(
             origin.strip()
             for origin in os.getenv(

@@ -35,6 +35,7 @@ const state = {
   userFilters: { user_id: "", keyword: "", role: "", state: "" },
   loginFilters: { user_id: "", keyword: "" },
   autoRefreshSeconds: Number(localStorage.getItem("ng_dashboard_refresh_seconds") || 5),
+  presenterRefreshSeconds: Number(localStorage.getItem("ng_presenter_refresh_seconds") || 5),
   autoRefreshTimer: null,
   autoRefreshBusy: false,
   sessionRefreshTimer: null,
@@ -46,6 +47,7 @@ const state = {
   authWatchTimer: null,
   authWatchBusy: false,
   lastDashboardRefreshAt: null,
+  lastPresenterRefreshAt: null,
   drawer: null,
   fileTargetPicker: null,
   envCompilePicker: null,
@@ -54,6 +56,7 @@ const state = {
   fileViewScope: "own",
   data: {
     dashboard: null,
+    presenter: null,
     nodes: [],
     tasks: { items: [], total: 0, page: 1, page_size: 20 },
     envs: [],
@@ -107,6 +110,7 @@ const errorMessageMap = {
   "mentor can only manage assigned student users": "导师只能管理自己名下的学生",
   "student file scope requires mentor role": "只有导师可以查看学生文件",
   "mentor can only view assigned student files": "导师只能查看自己名下学生的文件",
+  "path is outside shared folder": "路径超出共享文件夹",
   "mentor can only reset assigned student passwords": "导师只能重置自己名下学生的密码",
   "permission required: admin:login:read": "只有管理员可以查看登录管理",
   "permission required: admin:login:write": "只有管理员可以下线登录设备",
@@ -201,6 +205,7 @@ function hasRole(roles) {
 }
 
 function visiblePages() {
+  if (isPresenterUser()) return [];
   return pages.filter((page) => hasRole(page.roles) && can(page.permission));
 }
 
@@ -210,11 +215,22 @@ function currentPageMeta() {
 
 function ensureVisiblePage() {
   if (!state.user) return;
+  if (isPresenterUser()) {
+    state.page = "presenter";
+    if (location.hash !== "#/presenter") {
+      history.replaceState(null, "", "#/presenter");
+    }
+    return;
+  }
   const visible = visiblePages();
   if (!visible.some((page) => page.id === state.page)) {
     state.page = visible[0]?.id || "dashboard";
     location.hash = `/${state.page}`;
   }
+}
+
+function isPresenterUser() {
+  return state.user?.role === "viewer";
 }
 
 function nowText() {
@@ -399,11 +415,12 @@ async function login(event) {
 }
 
 function navigateAfterLogin() {
-  state.page = "dashboard";
+  state.page = isPresenterUser() ? "presenter" : "dashboard";
   state.drawer = null;
   state.envCompilePicker = null;
-  if (location.hash !== "#/dashboard") {
-    history.replaceState(null, "", "#/dashboard");
+  const nextHash = `#/${state.page}`;
+  if (location.hash !== nextHash) {
+    history.replaceState(null, "", nextHash);
   }
 }
 
@@ -421,13 +438,17 @@ async function loadMe() {
   if (!state.token) return;
   const payload = await api("/auth/me", { method: "POST" });
   state.user = payload.data;
-  if (!canViewStudentFiles()) state.fileViewScope = "own";
+  if (isStudentFileView() && !canViewStudentFiles()) state.fileViewScope = "own";
   ensureVisiblePage();
 }
 
 async function refreshPage() {
   await loadMe();
   ensureVisiblePage();
+  if (isPresenterUser()) {
+    await loadPresenterDashboard();
+    return;
+  }
   const loaders = {
     dashboard: async () => {
       state.data.dashboard = (await api("/dashboard/summary")).data;
@@ -478,6 +499,11 @@ async function refreshPage() {
   await loaders[state.page]?.();
 }
 
+async function loadPresenterDashboard() {
+  state.data.presenter = (await api("/dashboard/presenter")).data;
+  state.lastPresenterRefreshAt = new Date();
+}
+
 async function loadTasksPageData({ includeLookups = false } = {}) {
   const params = new URLSearchParams({
     state: state.taskZone,
@@ -519,6 +545,14 @@ function setDashboardRefreshSeconds(value) {
   render();
 }
 
+function setPresenterRefreshSeconds(value) {
+  const seconds = Math.max(0, Math.min(3600, Number(value) || 0));
+  state.presenterRefreshSeconds = seconds;
+  localStorage.setItem("ng_presenter_refresh_seconds", String(seconds));
+  updateRealtimeTimers();
+  render();
+}
+
 function updateRealtimeTimers() {
   updateAutoRefreshTimer();
   updateTaskEventStream();
@@ -534,7 +568,7 @@ function updateTaskEventStream() {
     state.taskEventsSource.close();
     state.taskEventsSource = null;
   }
-  if (!state.user || !state.token || typeof EventSource === "undefined") return;
+  if (!state.user || !state.token || isPresenterUser() || typeof EventSource === "undefined") return;
   const base = state.apiBase.replace(/\/$/, "");
   const source = new EventSource(`${base}/tasks/events?token=${encodeURIComponent(state.token)}`);
   source.addEventListener("tasks", () => {
@@ -568,12 +602,13 @@ function updateAutoRefreshTimer() {
     window.clearInterval(state.autoRefreshTimer);
     state.autoRefreshTimer = null;
   }
-  if (!state.user || state.page !== "dashboard" || state.autoRefreshSeconds <= 0) return;
-  state.autoRefreshTimer = window.setInterval(autoRefreshDashboard, state.autoRefreshSeconds * 1000);
+  const seconds = state.page === "presenter" ? state.presenterRefreshSeconds : state.autoRefreshSeconds;
+  if (!state.user || !["dashboard", "presenter"].includes(state.page) || seconds <= 0) return;
+  state.autoRefreshTimer = window.setInterval(autoRefreshDashboard, seconds * 1000);
 }
 
 async function autoRefreshDashboard() {
-  if (!state.user || state.page !== "dashboard" || state.autoRefreshBusy) return;
+  if (!state.user || !["dashboard", "presenter"].includes(state.page) || state.autoRefreshBusy) return;
   state.autoRefreshBusy = true;
   try {
     await refreshPage();
@@ -681,22 +716,31 @@ function isStudentFileView() {
   return state.fileViewScope === "students";
 }
 
+function isSharedFileView() {
+  return state.fileViewScope === "shared";
+}
+
+function isReadOnlyFileView() {
+  return isStudentFileView() || isSharedFileView();
+}
+
 function canViewStudentFiles() {
   return state.user?.role === "mentor";
 }
 
-function fileQuery(path) {
+function fileQuery(path, scope = state.fileViewScope) {
   const params = new URLSearchParams({ path: path || "/" });
-  if (isStudentFileView()) params.set("scope", "students");
+  if (scope === "students" || scope === "shared") params.set("scope", scope);
   return params.toString();
 }
 
 function requireOwnFileViewForWrite() {
   if (isStudentFileView()) throw new Error("学生文件视图仅支持查看");
+  if (isSharedFileView()) throw new Error("共享文件夹视图仅支持查看和复制到我的文件夹");
 }
 
 function displayFilePath(path) {
-  if (!isStudentFileView()) return path || "/";
+  if (!isReadOnlyFileView()) return path || "/";
   const currentPath = state.data.files.path || "/";
   const currentDisplayPath = state.data.files.display_path || currentPath;
   const normalizedPath = normalizeClientPath(path || "/");
@@ -714,7 +758,7 @@ async function watchCurrentSession() {
   try {
     const payload = await api("/auth/me", { method: "POST" });
     state.user = payload.data;
-    if (!canViewStudentFiles()) state.fileViewScope = "own";
+    if (isStudentFileView() && !canViewStudentFiles()) state.fileViewScope = "own";
   } catch (error) {
     if (!isAuthExpiredMessage(error.message)) {
       console.warn("auth watch failed", error);
@@ -1302,6 +1346,10 @@ async function toggleStudentFileView() {
   await openPath("/", isStudentFileView() ? "own" : "students");
 }
 
+async function toggleSharedFileView() {
+  await openPath("/", isSharedFileView() ? "own" : "shared");
+}
+
 async function createFolderFromPrompt() {
   requireOwnFileViewForWrite();
   const name = prompt("新建文件夹名称");
@@ -1336,6 +1384,16 @@ async function copySelectedPath() {
   await openFileTargetPicker("copy");
 }
 
+async function copySelectedPathToShared() {
+  if (!isSharedFileView()) requireOwnFileViewForWrite();
+  await openFileTargetPicker("copy-to-shared");
+}
+
+async function copySelectedPathToOwn() {
+  if (!isSharedFileView()) throw new Error("请先切换到共享文件夹");
+  await openFileTargetPicker("copy-from-shared");
+}
+
 async function moveSelectedPath() {
   requireOwnFileViewForWrite();
   await openFileTargetPicker("move");
@@ -1367,19 +1425,23 @@ function isSupportedArchivePath(path) {
 async function openFileTargetPicker(mode) {
   const source = requireSelectedPath();
   const startPath = state.data.files.path || parentPath(source);
+  const targetScope = mode === "copy-to-shared" ? "shared" : "own";
   state.fileTargetPicker = {
     mode,
     sourcePath: source,
-    currentPath: startPath,
+    sourceScope: state.fileViewScope,
+    targetScope,
+    listScope: targetScope,
+    currentPath: mode === "copy" || mode === "move" || mode === "extract" ? startPath : "/",
     items: [],
   };
-  await loadFileTargetPickerPath(startPath);
+  await loadFileTargetPickerPath(state.fileTargetPicker.currentPath);
   render();
 }
 
 async function loadFileTargetPickerPath(path) {
   if (!state.fileTargetPicker) return;
-  const payload = await api(`/files/list?path=${encodeURIComponent(path || "/")}`);
+  const payload = await api(`/files/list?${fileQuery(path || "/", state.fileTargetPicker.listScope || "own")}`);
   state.fileTargetPicker.currentPath = payload.data.path || "/";
   const items = payload.data.items || [];
   if (state.fileTargetPicker.mode === "env-import") {
@@ -1444,8 +1506,14 @@ async function confirmFileTargetPicker() {
     return;
   }
   const targetPath = buildPickedTargetPath(picker.sourcePath, picker.currentPath, picker.mode, true);
-  const endpoint = picker.mode === "copy" ? "/files/copy" : "/files/move";
-  await api(endpoint, { method: "POST", body: JSON.stringify({ path: picker.sourcePath, target_path: targetPath }) });
+  const endpoint = picker.mode === "move" ? "/files/move" : "/files/copy";
+  const body = {
+    path: picker.sourcePath,
+    target_path: targetPath,
+    scope: picker.sourceScope || "own",
+    target_scope: picker.targetScope || "own",
+  };
+  await api(endpoint, { method: "POST", body: JSON.stringify(body) });
   state.fileTargetPicker = null;
   if (picker.mode === "move") {
     state.data.preview = null;
@@ -1458,7 +1526,7 @@ function buildPickedTargetPath(sourcePath, targetFolder, mode, strict = false) {
   if (mode === "extract") return normalizeClientPath(targetFolder);
   const sourceItem = currentSelectedFileItem();
   const isDirectory = sourceItem?.type === "directory";
-  if (isDirectory && isSameOrChildPath(targetFolder, sourcePath)) {
+  if (isDirectory && !isCopyBetweenFileScopes(mode) && isSameOrChildPath(targetFolder, sourcePath)) {
     if (strict) throw new Error("不能选择自身或子目录");
     return "";
   }
@@ -1470,6 +1538,10 @@ function buildPickedTargetPath(sourcePath, targetFolder, mode, strict = false) {
     return "";
   }
   return targetPath;
+}
+
+function isCopyBetweenFileScopes(mode) {
+  return mode === "copy-to-shared" || mode === "copy-from-shared";
 }
 
 async function deleteSelectedPath() {
@@ -1507,7 +1579,7 @@ async function saveCurrentFile(content) {
 async function downloadSelectedPath() {
   const source = requireSelectedPath();
   const selectedItem = currentSelectedFileItem();
-  if (isStudentFileView() && selectedItem?.type === "directory") throw new Error("学生文件夹只能进入查看，不能打包下载");
+  if (isReadOnlyFileView() && selectedItem?.type === "directory") throw new Error("只读视图中的文件夹请进入查看或使用复制按钮");
   if (selectedItem?.type === "directory") {
     await archiveSelectedFolder();
     return;
@@ -1583,6 +1655,8 @@ function fileTargetActionText(mode) {
   if (mode === "env-package") return "选择安装资源";
   if (mode === "task-workdir") return "选择项目路径";
   if (mode === "extract") return "解压到";
+  if (mode === "copy-to-shared") return "复制到共享文件夹";
+  if (mode === "copy-from-shared") return "复制到我的文件夹";
   return mode === "move" ? "移动到" : "复制到";
 }
 
@@ -2059,6 +2133,157 @@ function renderNodeCard(node) {
   `;
 }
 
+function renderPresenter() {
+  const payload = state.data.presenter || {};
+  const summary = payload.summary || {};
+  const nodes = payload.nodes || [];
+  const metrics = [
+    ["节点数量", summary.nodes_total ?? "-"],
+    ["在线节点", summary.nodes_online ?? "-"],
+    ["GPU 总数", summary.gpus_total ?? "-"],
+    ["等待任务", summary.tasks_waiting ?? "-"],
+    ["运行任务", summary.tasks_running ?? "-"],
+    ["历史任务", summary.tasks_history_total ?? "-"],
+  ];
+  return `
+    <div class="presenter-layout">
+      <main class="presenter-workspace">
+        <header class="presenter-topbar">
+          <div>
+            <p>NebulaGrid 展示者视图</p>
+            <h1>集群运行状态</h1>
+          </div>
+          <div class="presenter-controls">
+            <span>${state.lastPresenterRefreshAt ? `更新 ${formatTime(state.lastPresenterRefreshAt)}` : "等待刷新"}</span>
+            <label class="refresh-control presenter-refresh">刷新
+              <input name="presenter_refresh_seconds" type="number" min="0" max="3600" step="1" value="${state.presenterRefreshSeconds}">
+              <span>秒</span>
+            </label>
+            <button class="secondary" data-action="refresh">刷新</button>
+          </div>
+        </header>
+        <section class="presenter-metrics">
+          ${metrics.map(([label, value]) => `
+            <article>
+              <span>${escapeHtml(label)}</span>
+              <strong>${escapeHtml(value)}</strong>
+            </article>
+          `).join("")}
+        </section>
+        <section class="presenter-node-wall" data-preserve-scroll="presenter-node-wall">
+          ${nodes.length ? nodes.map(renderPresenterNode).join("") : renderEmpty("暂无计算节点")}
+        </section>
+      </main>
+      <button class="presenter-logout secondary" data-action="logout">退出登录</button>
+      ${state.toast ? `<div class="toast ${state.toast.type}">${escapeHtml(state.toast.text)}</div>` : ""}
+      ${state.loading ? `<div class="loading">正在处理...</div>` : ""}
+    </div>
+  `;
+}
+
+function renderPresenterNode(node) {
+  const gpus = node.gpus || [];
+  return `
+    <article class="presenter-node">
+      <div class="presenter-node-head">
+        <div>
+          <h2>${escapeHtml(node.name)}</h2>
+          <span>${escapeHtml(node.ip || "-")} · ${escapeHtml(gpus.length)} GPU · ${node.scheduling_enabled ? "调度开启" : "调度关闭"}</span>
+        </div>
+        <span class="status ${node.state}">${nodeStateText(node.state)}</span>
+      </div>
+      <div class="presenter-node-grid ${gpus.length ? "has-gpu" : "no-gpu"}">
+        ${presenterMetricCard("CPU 使用率", percent(node.cpu_usage), node.history?.cpu_usage || [], "percent", "cpu")}
+        ${presenterMetricCard("可用内存", formatMb(node.avail_ram_mb), node.history?.avail_ram_mb || [], "memory", "memory")}
+        ${presenterMetricCard("网络接收", speed(node.download_mbps), node.history?.download_mbps || [], "dynamic", "network")}
+        ${presenterMetricCard("网络发送", speed(node.upload_mbps), node.history?.upload_mbps || [], "dynamic", "network")}
+        ${gpus.length ? `${renderPresenterGpuUsagePanel(gpus)}${renderPresenterGpuRamPanel(gpus)}` : ""}
+      </div>
+    </article>
+  `;
+}
+
+function renderPresenterGpuUsagePanel(gpus = []) {
+  return `
+    <section class="presenter-gpu-panel presenter-gpu-usage-panel">
+      <span>GPU 使用率</span>
+      ${gpus.length ? `
+        <div class="presenter-gpu-usage-grid">
+          ${gpus.map((gpu, index) => {
+            const tone = presenterGpuTone(index, gpu);
+            return `
+              <div class="presenter-gpu-usage ${tone} ${gpu.scheduled_occupied ? "occupied" : ""}" title="${escapeAttr(gpu.model || "Unknown")}">
+                <div class="presenter-gpu-lane-head">
+                  <b>GPU ${escapeHtml(gpu.gpu_index)}</b>
+                  <strong>${percent(gpu.gpu_usage)}</strong>
+                </div>
+                ${renderSparkline(gpu.history?.gpu_usage || [], "percent", tone)}
+                <small>${escapeHtml(gpu.process_count ?? 0)} 进程 · ${gpu.scheduled_occupied ? "调度占用" : "空闲"}</small>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      ` : `<div class="presenter-panel-empty">暂无 GPU</div>`}
+    </section>
+  `;
+}
+
+function renderPresenterGpuRamPanel(gpus = []) {
+  return `
+    <section class="presenter-gpu-panel presenter-gpu-ram-panel">
+      <span>可用 GPU 显存</span>
+      ${gpus.length ? `
+        <div class="presenter-vram-bars">
+          ${gpus.map((gpu, index) => {
+            const free = Number(gpu.free_vram_mb || 0);
+            const total = Number(gpu.total_vram_mb || 0);
+            const height = total > 0 ? Math.max(6, Math.min(100, Math.round((free / total) * 100))) : 8;
+            const tone = presenterGpuTone(index, gpu);
+            return `
+              <div class="presenter-vram-bar ${tone} ${gpu.scheduled_occupied ? "occupied" : ""}" style="--h:${height}%" title="${escapeAttr(gpu.model || "Unknown")}">
+                <strong>${formatMb(free)}</strong>
+                <i></i>
+                <b>GPU ${escapeHtml(gpu.gpu_index)}</b>
+                <small>${formatMb(total)}</small>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      ` : `<div class="presenter-panel-empty">暂无 GPU</div>`}
+    </section>
+  `;
+}
+
+function presenterMetricCard(label, value, points, mode, tone = "default") {
+  return `
+    <section class="presenter-metric-card ${tone}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      ${renderSparkline(points, mode)}
+    </section>
+  `;
+}
+
+function renderSparkline(points = [], mode = "dynamic", tone = "") {
+  const values = (points || []).slice(-48).map((point) => Number(point.value || 0));
+  if (!values.length) return `<div class="presenter-sparkline empty"></div>`;
+  const maxValue = mode === "percent" ? 100 : Math.max(1, ...values);
+  return `
+    <div class="presenter-sparkline ${tone}">
+      ${values.map((value) => {
+        const height = Math.max(4, Math.min(100, Math.round((value / maxValue) * 100)));
+        return `<i style="--h:${height}%"></i>`;
+      }).join("")}
+    </div>
+  `;
+}
+
+function presenterGpuTone(index, gpu = {}) {
+  if (Number(gpu.gpu_usage || 0) >= 85) return "hot";
+  if (gpu.scheduled_occupied) return "busy";
+  return index % 2 === 0 ? "cool" : "calm";
+}
+
 function renderTasks() {
   const tasks = state.data.tasks.items || [];
   const zones = [
@@ -2228,6 +2453,7 @@ function renderTaskForm(mode, task = null) {
           ? `<textarea name="commands" required placeholder="python train.py --config /home/ddltm/data/user/${escapeAttr(state.user?.username || "user")}/project/config.yaml&#10;# 空行和注释会被忽略">${escapeHtml(draft.commands || "")}</textarea>`
           : `<input name="command" required value="${escapeAttr(draft.command || "")}" placeholder="python example.py --config ${escapeAttr(taskHomeHint())}/project/config.yaml">`}
         <span class="muted">用户文件夹绝对路径：${escapeHtml(taskHomeHint())}</span>
+        <span class="muted">共享文件夹绝对路径：${escapeHtml(taskSharedHint())}</span>
       </label>
       <label>指定计算节点<select name="node_id" data-task-node-select><option value="">${escapeHtml("<任意>")}</option>${nodeOptions}</select></label>
       <label>需求的 GPU 数量<input name="need_gpus" type="number" min="0" max="16" value="${escapeAttr(draft.need_gpus ?? 1)}"></label>
@@ -2283,6 +2509,10 @@ function taskHomeHint() {
   return `/home/ddltm/data/user/${state.user?.username || "user"}`;
 }
 
+function taskSharedHint() {
+  return "/home/ddltm/shared";
+}
+
 function renderFiles() {
   const files = state.data.files.items || [];
   const currentPath = state.data.files.path || "/";
@@ -2290,9 +2520,12 @@ function renderFiles() {
   const selected = state.data.selectedFilePath;
   const preview = state.data.preview;
   const studentView = isStudentFileView();
+  const sharedView = isSharedFileView();
+  const readOnlyView = isReadOnlyFileView();
   const studentFilesButton = canViewStudentFiles()
     ? `<button class="secondary ${studentView ? "active" : ""}" data-file-students>${studentView ? "查看我的文件" : "查看学生文件"}</button>`
     : "";
+  const sharedFilesButton = `<button class="secondary ${sharedView ? "active" : ""}" data-file-shared>${sharedView ? "查看我的文件" : "共享文件夹"}</button>`;
   return shell(`
     <section class="file-manager">
       <aside class="file-sidebar-panel">
@@ -2301,6 +2534,7 @@ function renderFiles() {
           <button class="secondary" data-file-up>上级</button>
           <button class="secondary" data-action="refresh">刷新</button>
           ${studentFilesButton}
+          ${sharedFilesButton}
         </div>
         <div class="file-path">${escapeHtml(currentDisplayPath)}</div>
         <div class="file-list" role="list" data-preserve-scroll="file-list">
@@ -2313,17 +2547,18 @@ function renderFiles() {
             </div>
           `).join("") : `<div class="file-empty">当前目录为空</div>`}
         </div>
-        ${studentView ? "" : `<div class="file-actions-grid">
+        ${readOnlyView ? "" : `<div class="file-actions-grid">
           <button class="secondary" data-file-new-folder>新建文件夹</button>
           <button class="secondary" data-file-new-file>新建文件</button>
           <button class="secondary" data-file-rename>重命名</button>
           <button class="secondary" data-file-copy>复制到</button>
+          <button class="secondary" data-file-copy-shared>复制到共享文件夹</button>
           <button class="secondary" data-file-move>移动到</button>
           <button class="secondary" data-file-archive>打包成 zip</button>
           <button class="secondary" data-file-extract>解压压缩包</button>
           <button class="danger" data-file-delete>删除</button>
         </div>`}
-        ${studentView ? `<div class="file-transfer-row"><button type="button" class="secondary" data-file-download>下载选中</button></div>` : `<form id="fileUploadForm" class="file-upload-form">
+        ${readOnlyView ? `<div class="file-transfer-row">${sharedView ? `<button type="button" class="secondary" data-file-copy-own>复制到我的文件夹</button>` : ""}<button type="button" class="secondary" data-file-download>下载选中</button></div>` : `<form id="fileUploadForm" class="file-upload-form">
           <input name="file" type="file">
           <div class="file-transfer-row">
             <button type="submit">上传到当前目录</button>
@@ -2334,9 +2569,9 @@ function renderFiles() {
       <section class="file-editor-panel">
         <div class="file-editor-toolbar">
           <span class="status">${preview?.path ? escapeHtml(displayFilePath(preview.path)) : "未打开文件"}</span>
-          <button data-file-save ${preview?.encoding === "text" && !studentView ? "" : "disabled"}>保存</button>
+          <button data-file-save ${preview?.encoding === "text" && !readOnlyView ? "" : "disabled"}>保存</button>
         </div>
-        ${renderFilePreview(preview, studentView)}
+        ${renderFilePreview(preview, readOnlyView)}
         ${renderFileJobProgress(state.data.fileJob)}
       </section>
     </section>
@@ -3917,7 +4152,9 @@ function render() {
   };
   ensureVisiblePage();
   const scrollPositions = capturePreservedScrollPositions();
-  document.querySelector("#app").innerHTML = state.user ? (renderers[state.page] || renderDashboard)() : renderLogin();
+  document.querySelector("#app").innerHTML = state.user
+    ? (isPresenterUser() ? renderPresenter() : (renderers[state.page] || renderDashboard)())
+    : renderLogin();
   bindEvents();
   restorePreservedScrollPositions(scrollPositions);
 }
@@ -3964,10 +4201,13 @@ function bindEvents() {
   document.querySelector("[data-file-root]")?.addEventListener("click", () => run(() => openPath("/")));
   document.querySelector("[data-file-up]")?.addEventListener("click", () => run(openParentPath));
   document.querySelector("[data-file-students]")?.addEventListener("click", () => run(toggleStudentFileView));
+  document.querySelector("[data-file-shared]")?.addEventListener("click", () => run(toggleSharedFileView));
   document.querySelector("[data-file-new-folder]")?.addEventListener("click", () => run(createFolderFromPrompt, "文件夹已创建"));
   document.querySelector("[data-file-new-file]")?.addEventListener("click", () => run(createFileFromPrompt, "文件已创建"));
   document.querySelector("[data-file-rename]")?.addEventListener("click", () => run(renameSelectedPath, "已重命名"));
   document.querySelector("[data-file-copy]")?.addEventListener("click", () => run(copySelectedPath));
+  document.querySelector("[data-file-copy-shared]")?.addEventListener("click", () => run(copySelectedPathToShared));
+  document.querySelector("[data-file-copy-own]")?.addEventListener("click", () => run(copySelectedPathToOwn));
   document.querySelector("[data-file-move]")?.addEventListener("click", () => run(moveSelectedPath));
   document.querySelector("[data-file-archive]")?.addEventListener("click", () => run(archiveSelectedFolder, "已开始打包"));
   document.querySelector("[data-file-extract]")?.addEventListener("click", () => run(extractSelectedZip));
@@ -4013,6 +4253,7 @@ function bindEvents() {
   document.querySelector("[data-action='logout']")?.addEventListener("click", () => run(logout));
   document.querySelectorAll("[data-action='refresh']").forEach((button) => button.addEventListener("click", () => run(refreshPage, "已刷新")));
   document.querySelector("[name='dashboard_refresh_seconds']")?.addEventListener("change", (event) => setDashboardRefreshSeconds(event.currentTarget.value));
+  document.querySelector("[name='presenter_refresh_seconds']")?.addEventListener("change", (event) => setPresenterRefreshSeconds(event.currentTarget.value));
   document.querySelector("[data-action='close-drawer']")?.addEventListener("click", () => {
     if (isEnvPackageInstalling() && !window.confirm("安装正在执行，关闭页面可能导致你无法看到实时结果。确认关闭吗？")) return;
     stopTaskLogRefreshTimer();
@@ -4130,7 +4371,7 @@ function bindSessionEvents() {
 
 window.addEventListener("hashchange", () => {
   const page = location.hash.replace("#/", "") || "dashboard";
-  if (pages.some((item) => item.id === page)) {
+  if (page === "presenter" || pages.some((item) => item.id === page)) {
     state.page = page;
     updateRealtimeTimers();
     run(refreshPage);

@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.responses import api_error
 from app.db.init_db import init_database
+from app.services.file_executor import shutdown_file_operation_executor
 from app.services.file_service import mark_interrupted_file_jobs
 from app.services.user_service import ensure_existing_user_linux_accounts
 
@@ -58,6 +59,11 @@ def register_startup_tasks(app: FastAPI) -> None:
         except Exception:
             # Linux 子账户补齐依赖系统命令和 sudoers；部署遗漏时记录错误但不阻断 API 启动。
             logger.exception("failed to reconcile Linux accounts on startup")
+
+    @app.on_event("shutdown")
+    def shutdown_file_executor_on_stop() -> None:
+        """关闭文件操作线程池，避免热重载后旧线程池继续接收新的文件任务。"""
+        shutdown_file_operation_executor()
 
 
 def register_exception_handlers(app: FastAPI) -> None:

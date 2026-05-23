@@ -164,7 +164,7 @@ def get_user_by_token(token: str) -> UserRecord:
             session_count = db.scalar(select(func.count()).select_from(LoginSession)) or 0
             if session_count:
                 raise unauthorized("session offline")
-        elif not session_model_is_active(session):
+        elif not session_model_is_active(session, never_expires=user.role == Role.VIEWER):
             raise unauthorized("session offline")
         else:
             session.last_seen_at = utc_datetime()
@@ -220,7 +220,14 @@ def record_login_session_model(
     normalized_agent = normalize_user_agent(user_agent)
     device = describe_device(normalized_agent)
     normalized_device_id = normalize_device_id(device_id)
-    reusable = find_mergeable_session_model(db, user.id, normalized_ip, normalized_agent, normalized_device_id)
+    reusable = find_mergeable_session_model(
+        db,
+        user.id,
+        normalized_ip,
+        normalized_agent,
+        normalized_device_id,
+        never_expires=user.role == Role.VIEWER,
+    )
     if reusable is not None:
         reusable.token_hash = hash_session_token(token)
         reusable.ip = normalized_ip
@@ -248,7 +255,14 @@ def record_login_session_model(
     return session_model_to_record(session)
 
 
-def find_mergeable_session_model(db: Session, user_id: int, login_ip: str, user_agent: str, device_id: str) -> LoginSession | None:
+def find_mergeable_session_model(
+    db: Session,
+    user_id: int,
+    login_ip: str,
+    user_agent: str,
+    device_id: str,
+    never_expires: bool = False,
+) -> LoginSession | None:
     """查找同用户同设备的活跃会话，避免重复登录刷出多行设备。"""
     sessions = db.scalars(
         select(LoginSession)
@@ -257,7 +271,7 @@ def find_mergeable_session_model(db: Session, user_id: int, login_ip: str, user_
     ).all()
     for session in sessions:
         record = session_model_to_record(session)
-        if not session_is_active(record):
+        if not session_is_active(record, never_expires=never_expires):
             continue
         if device_id and normalize_device_id(session.device_id) == device_id:
             return session
@@ -285,8 +299,9 @@ def list_login_sessions(user: UserRecord, current_token: str | None = None) -> l
                 .order_by(LoginSession.id.desc())
             ).all()
         ]
-    grouped = aggregate_login_sessions(sessions, current_token)
-    return [build_session_info(session, current_token) for session in grouped]
+    never_expires = user.role == Role.VIEWER
+    grouped = aggregate_login_sessions(sessions, current_token, never_expires=never_expires)
+    return [build_session_info(session, current_token, never_expires=never_expires) for session in grouped]
 
 
 def list_admin_online_users(actor: UserRecord) -> list[AdminOnlineUserInfo]:
@@ -294,15 +309,19 @@ def list_admin_online_users(actor: UserRecord) -> list[AdminOnlineUserInfo]:
     require_permission(actor.role, "admin:login:read")
     with SessionLocal() as db:
         users = db.scalars(select(User).order_by(User.id)).all()
-        online_sessions = [
+        session_records = [
             session_model_to_record(session)
             for session in db.scalars(select(LoginSession).order_by(LoginSession.id.desc())).all()
-            if session_model_is_active(session)
         ]
         result: list[AdminOnlineUserInfo] = []
         for user_model in users:
             user = user_model_to_record(user_model, db)
-            user_sessions = [session for session in online_sessions if session.user_id == user.id]
+            never_expires = user.role == Role.VIEWER
+            user_sessions = [
+                session
+                for session in session_records
+                if session.user_id == user.id and session_is_active(session, never_expires=never_expires)
+            ]
             if not user_sessions:
                 continue
             last_seen = max(user_sessions, key=lambda item: parse_datetime(item.last_seen_at) or local_datetime().replace(year=1, month=1, day=1)).last_seen_at
@@ -314,7 +333,7 @@ def list_admin_online_users(actor: UserRecord) -> list[AdminOnlineUserInfo]:
                 real_name=user.real_name,
                 role=user.role.value,
                 state=user.state,
-                online_sessions=len(aggregate_login_sessions(user_sessions)),
+                online_sessions=len(aggregate_login_sessions(user_sessions, never_expires=never_expires)),
                 login_ips=login_ips,
                 login_devices=login_devices,
                 last_seen_at=last_seen,
@@ -343,8 +362,12 @@ def list_admin_user_login_sessions(
                     .order_by(LoginSession.id.desc())
                 ).all()
             ]
-            grouped = aggregate_login_sessions(sessions, current_token)
-            session_infos = [build_session_info(session, current_token) for session in grouped]
+            never_expires = user.role == Role.VIEWER
+            grouped = aggregate_login_sessions(sessions, current_token, never_expires=never_expires)
+            session_infos = [
+                build_session_info(session, current_token, never_expires=never_expires)
+                for session in grouped
+            ]
             items.append(AdminUserLoginSessions(
                 id=user.id,
                 username=user.username,
@@ -484,14 +507,18 @@ def find_session_by_token(token: str) -> LoginSessionRecord | None:
         return session_model_to_record(session) if session is not None else None
 
 
-def aggregate_login_sessions(sessions: list[LoginSessionRecord], current_token: str | None = None) -> list[LoginSessionRecord]:
+def aggregate_login_sessions(
+    sessions: list[LoginSessionRecord],
+    current_token: str | None = None,
+    never_expires: bool = False,
+) -> list[LoginSessionRecord]:
     """把原始登录流水折叠成设备列表。"""
     current_hash = hash_session_token(current_token) if current_token else None
     ordered = sorted(
         sessions,
         key=lambda item: (
             item.token_hash == current_hash,
-            session_is_active(item),
+            session_is_active(item, never_expires=never_expires),
             parse_datetime(item.last_seen_at) or local_datetime().replace(year=1, month=1, day=1),
             parse_datetime(item.login_time) or local_datetime().replace(year=1, month=1, day=1),
             item.id,
@@ -530,10 +557,14 @@ def normalize_user_agent(value: str | None) -> str:
     return " ".join(value.strip().split())
 
 
-def build_session_info(session: LoginSessionRecord, current_token: str | None = None) -> LoginSessionInfo:
+def build_session_info(
+    session: LoginSessionRecord,
+    current_token: str | None = None,
+    never_expires: bool = False,
+) -> LoginSessionInfo:
     """把内部会话记录转换成前端展示模型。"""
     current_hash = hash_session_token(current_token) if current_token else None
-    active = session_is_active(session)
+    active = session_is_active(session, never_expires=never_expires)
     logout_time = session.logout_time
     if not active and logout_time is None and session.revoked_at is None:
         logout_time = session.last_seen_at
@@ -556,19 +587,21 @@ def build_session_info(session: LoginSessionRecord, current_token: str | None = 
     )
 
 
-def session_is_active(session: LoginSessionRecord) -> bool:
+def session_is_active(session: LoginSessionRecord, never_expires: bool = False) -> bool:
     """会话未退出、未被手动下线且最近有心跳时视为在线。"""
     if session.logout_time is not None or session.revoked_at is not None:
         return False
+    if never_expires:
+        return True
     seen = parse_datetime(session.last_seen_at)
     if seen is None:
         return False
     return utc_datetime() - seen <= timedelta(minutes=SESSION_STALE_MINUTES)
 
 
-def session_model_is_active(session: LoginSession) -> bool:
+def session_model_is_active(session: LoginSession, never_expires: bool = False) -> bool:
     """用数据库模型判断会话在线状态。"""
-    return session_is_active(session_model_to_record(session))
+    return session_is_active(session_model_to_record(session), never_expires=never_expires)
 
 
 def parse_datetime(value: str | None) -> datetime | None:

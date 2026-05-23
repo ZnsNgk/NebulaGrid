@@ -178,17 +178,19 @@ flowchart TB
 ├── redis.service                  # 实时事件与缓存
 ├── /home/ddltm/data/                         # NFS 共享：用户 home、任务日志、环境安装日志、运行时文件
 ├── /home/ddltm/data/user/<user_name>/        # master 子账户 home，只在主节点创建对应 Linux 账户
-└── /home/ddltm/envs/                         # NFS 共享：miniconda、用户环境、节点监控/远端执行代码
+├── /home/ddltm/envs/                         # NFS 共享：miniconda、用户环境、节点监控/远端执行代码
+└── /home/ddltm/shared/                       # NFS 共享：全员可见共享文件夹，建议挂载 SSD
 
 计算节点 node-01/node-02/...
 ├── SSH Server
 ├── NVIDIA Driver / CUDA runtime
 ├── ddltm                          # 与 master 同名、同密码、同 UID、同 GID 的主账户
 ├── /home/ddltm/data                          # 通过 NFS 挂载 master 的 /home/ddltm/data，包含用户 home、日志、运行时文件
-└── /home/ddltm/envs                          # 通过 NFS 挂载 master 的 /home/ddltm/envs，包含环境与 runner/monitor/env_installer
+├── /home/ddltm/envs                          # 通过 NFS 挂载 master 的 /home/ddltm/envs，包含环境与 runner/monitor/env_installer
+└── /home/ddltm/shared                        # 通过 NFS 挂载 master 的 /home/ddltm/shared，包含全员共享数据
 ```
 
-部署约定：master 作为 NFS server，共享 `/home/ddltm/data` 和 `/home/ddltm/envs` 到所有计算节点。`/home/ddltm/data/user/<user_name>` 是平台用户在 master 上的 home 目录；`/home/ddltm/data/logs` 存放任务日志和环境安装日志；`/home/ddltm/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台用户的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户受保护并复用，不由平台修改系统密码或删除。计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/home/ddltm/data/user/<user_name>` 下的文件执行必要的增删查改，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
+部署约定：master 作为 NFS server，共享 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared` 到所有计算节点。`/home/ddltm/data/user/<user_name>` 是平台用户在 master 上的 home 目录；`/home/ddltm/data/logs` 存放任务日志和环境安装日志；`/home/ddltm/envs` 存放统一 miniconda、用户环境目录以及 `nebulagrid_remote` 节点监控/远端执行代码；`/home/ddltm/shared` 对应 `NEBULAGRID_SHARED_FOLDER_ROOT`，用于文件管理中的共享文件夹视图，所有登录用户可查看并在个人目录和共享目录之间复制文件或文件夹。master 与所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，例如 `ddltm`，NebulaGrid 服务、SSH 控制命令和远端 runner 均默认以该主账户运行。平台用户的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户受保护并复用，不由平台修改系统密码或删除。计算节点不创建这些子账户，避免节点侧账户同步和 UID 漂移。主账户必须能对 `/home/ddltm/data/user/<user_name>` 和 `/home/ddltm/shared` 下的文件执行必要的读写，系统再通过 PathResolver、RBAC 和审计限制普通用户的可见范围。
 
 API 服务维护 Linux 子账户时必须使用受限 sudoers。由于 systemd 服务没有交互终端，后端不能保存 sudo 密码，也不能依赖 sudo 密码缓存；部署时必须给 API 运行用户配置 `NOPASSWD`，并使用 `/usr/sbin/useradd`、`/usr/sbin/chpasswd`、`/usr/bin/chown` 等绝对路径授权。
 
@@ -337,6 +339,8 @@ erDiagram
 
 文件管理中的目录打包和压缩包解压属于重 IO 后台任务，状态必须进入数据库，不能只保存在 API 进程内存。`file_jobs` 表用于页面刷新、重新登录、API 多 worker 部署后的进度恢复，也用于限制单用户和全局并发。API 启动时应把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
 
+文件列表、预览、上传、创建、保存、复制、移动、删除、打包和解压应统一提交到专用文件线程池，线程数由 `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` 控制。这样 NFS 或共享盘慢 IO 不会占用 FastAPI 默认请求线程；普通操作保持同步响应语义，打包和解压继续通过 `file_jobs` 返回后台进度。
+
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | id | varchar primary key | 后台文件任务 ID |
@@ -355,6 +359,8 @@ erDiagram
 登录设备与在线状态已经持久化到 PostgreSQL。数据库只保存 token 摘要，不保存原始登录令牌；在线状态由 `last_seen_at`、`logout_at`、`revoked_at` 和后端会话过期窗口共同推断。
 
 登录会话 API 的状态字段必须与其他业务对象分开：登录设备列表返回 `session_state`、`status_label` 和 `status_category`，不返回通用 `state`。这样 `offline` 在登录会话中只表示“已下线”，不会和任务/节点状态里的“节点掉线”混用。
+
+展示者 `viewer` 账号用于长期公共屏幕。该角色登录后不会因为普通 30 分钟静默窗口自动失效，只有主动退出、管理员下线、账号停用或密码变更才会结束会话。这样可以避免展示大屏无人值守时反复跳回登录页，同时仍保留可审计的会话撤销边界。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -583,7 +589,7 @@ erDiagram
 | student | 自己的任务、文件、环境；公共节点；可用私人节点 | 提交任务、停止/删除自己的任务、管理自己的文件和环境 |
 | supervisor | 自己及学生的数据 | 查看学生任务/文件/环境；管理学生账户；默认不能停止学生任务，可配置扩展 |
 | admin | 全部数据 | 管理用户、节点、任务、文件、环境、系统配置、强制下线、审计查看 |
-| visual | 公开汇总数据 | 只读展示，不能执行任何修改操作 |
+| viewer | 公开汇总数据 | 只读展示，不能执行任何修改操作 |
 
 ### 7.2 权限校验位置
 
@@ -607,7 +613,7 @@ API Router
 1. 学生只能看到自己的任务、环境、文件、日志。
 2. 导师可以看到自己学生的任务、环境、文件、日志，但默认无权停止学生正在运行的任务。
 3. 管理员可以看到全部任务、环境、文件、日志和节点敏感字段。
-4. 展示者只能看到汇总指标和脱敏节点状态，不显示 IP、SSH 用户名、真实路径、命令全文和用户隐私字段。
+4. 展示者只能通过 `presenter:read` 查看汇总指标和节点运行状态；节点名与内网 IP 用于定位服务器；GPU 使用率、进程数和可用显存按每张 GPU 独立展示，不以节点平均值替代单卡状态；不显示 SSH 用户名、真实路径、命令全文、任务明细和用户隐私字段。
 
 ---
 
@@ -729,14 +735,19 @@ API Router
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | /api/files/list | 文件列表 |
-| POST | /api/files/upload | 上传 |
-| GET | /api/files/download | 下载 |
+| GET | /api/files/list?path=&scope= | 文件列表；`scope=shared` 表示共享文件夹视图 |
+| POST | /api/files/upload | 上传到当前个人目录 |
+| GET | /api/files/download?path=&scope= | 下载文件；支持个人目录、学生只读视图和共享文件夹视图 |
 | POST | /api/files/mkdir | 创建目录 |
+| POST | /api/files/create | 创建文本文件 |
+| POST | /api/files/save | 保存文本文件 |
+| POST | /api/files/copy | 复制文件或目录；请求体支持 `scope` / `target_scope` 以便个人目录与共享文件夹互拷 |
+| POST | /api/files/move | 移动文件或目录 |
+| POST | /api/files/rename | 重命名文件或目录 |
 | POST | /api/files/archive | 打包文件夹 |
 | POST | /api/files/extract | 解压 zip/tar/tar.gz/tgz/tar.bz2/tbz2/tar.xz/txz |
 | GET | /api/files/jobs/latest | 当前用户最近一次打包/解压任务状态 |
-| GET | /api/files/preview | 文本/图片/音视频预览 |
+| GET | /api/files/preview?path=&scope= | 文本/图片/音视频预览 |
 | DELETE | /api/files | 删除 |
 
 #### Logs
@@ -1185,7 +1196,8 @@ def resolve_virtual_path(user, virtual_path, mode):
 6. 下载接口必须鉴权；
 7. 文本预览限制最大大小；
 8. 图片/音视频预览只读；
-9. 删除、覆盖、解压等危险操作写审计日志。
+9. 文件 IO 进入专用线程池，不挤占 API 默认请求线程；
+10. 删除、覆盖、解压等危险操作写审计日志。
 
 ---
 
@@ -1287,7 +1299,7 @@ frontend/src/
 ├── layouts/            # 管理后台布局/展示大屏布局
 ├── pages/
 │   ├── dashboard/
-│   ├── visual/
+│   ├── presenter/
 │   ├── nodes/
 │   ├── tasks/
 │   ├── logs/
@@ -1324,7 +1336,19 @@ frontend/src/
 | 文件管理 | 上传、下载、预览、打包、解包 |
 | 用户管理 | 账号创建、停用、导师关系、登录设备 |
 | 审计日志 | 管理员查看关键操作 |
-| 展示大屏 | 只读脱敏展示 |
+| 展示大屏 | `viewer` 专用全屏页面，无左侧栏目；顶部展示节点数量、在线节点、GPU 总数、等待任务、运行任务、历史任务总数；下方展示所有计算节点 CPU、内存、网络、GPU 和显存状态，并从 InfluxDB 读取历史曲线 |
+
+### 16.4 展示者接口
+
+展示者账号只拥有 `presenter:read` 权限，不开放任务列表、节点普通列表、环境、文件或账号页面。前端在 `viewer` 登录后固定进入 `#/presenter`，不渲染普通控制台左侧栏目，仅在左下角保留退出登录按钮。
+
+展示者页面通过 `GET /api/dashboard/presenter` 获取聚合数据。该接口一次返回：
+
+1. 全局只读统计：节点总数、在线节点、GPU 总数、等待任务当前数、运行任务当前数、历史任务总数；
+2. 所有计算节点当前快照：节点状态、CPU、可用内存、上传、下载、GPU 使用率、可用显存、GPU 进程数；
+3. InfluxDB 历史曲线：`node_metrics` 中的 `cpu_usage/avail_ram_mb/upload_mbps/download_mbps`，以及 `gpu_metrics` 中的 `gpu_usage/free_vram_mb/process_count`。
+
+历史曲线默认读取最近 `30m`，按 `30s` 窗口聚合。生产环境可通过 `NEBULAGRID_INFLUXDB_PRESENTER_RANGE` 和 `NEBULAGRID_INFLUXDB_PRESENTER_WINDOW` 调整范围和采样窗口；页面刷新间隔由前端展示者界面设置，默认 5 秒。
 
 ---
 
@@ -1400,6 +1424,7 @@ storage:
   nfs_env_root: /home/ddltm/envs
   user_home_root: /home/ddltm/data/user
   user_home_template: /home/ddltm/data/user/{user_name}
+  shared_folder_root: /home/ddltm/shared
   task_log_root: /home/ddltm/data/logs/task_logs
   env_package_root: /home/ddltm/envs/packages
   env_install_log_root: /home/ddltm/data/logs/env_install_logs
@@ -1413,9 +1438,15 @@ metrics:
   url: http://127.0.0.1:8086
   org: nebulagrid
   bucket: nebulagrid_metrics
+  latest_range: 30m
+  presenter_range: 30m
+  presenter_window: 30s
   measurements:
     - node_metrics
     - gpu_metrics
+
+file_operations:
+  worker_threads: 2
 
 accounts:
   main_user: ddltm

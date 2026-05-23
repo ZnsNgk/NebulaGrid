@@ -10,7 +10,7 @@ NebulaGrid 3.0 是纯 B/S 架构的分布式 GPU 任务调度与实验资源管�
 
 - 用户通过浏览器访问统一入口；如确需 SSH，仅登录 master 上的个人子账户，不直接登录计算节点。
 - master 主控节点运行 Web/API、调度器、节点监控、任务执行器、运行守护、环境安装 worker、数据库、时序监控库和缓存。
-- master 与计算节点通过 NFS 共享 `/home/ddltm/data` 和 `/home/ddltm/envs`：`/home/ddltm/data/user/<user_name>` 作为平台用户 home 目录，`/home/ddltm/data/logs` 存放任务与环境日志，`/home/ddltm/envs` 存放 miniconda、用户环境和节点监控/远端执行代码。
+- master 与计算节点通过 NFS 共享 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared`：`/home/ddltm/data/user/<user_name>` 作为平台用户 home 目录，`/home/ddltm/data/logs` 存放任务与环境日志，`/home/ddltm/envs` 存放 miniconda、用户环境和节点监控/远端执行代码，`/home/ddltm/shared` 作为所有用户可查看并互相复制文件的共享 SSD 目录。
 - master 使用统一主账户运行平台与远端 SSH 控制，例如 `ddltm`；所有计算节点必须创建同名、同密码、同 UID、同 GID 的主账户，避免 NFS 权限和远端执行身份不一致。
 - 平台为用户创建的 Linux 子账户只存在于 master，用于用户 SSH 登录主节点和访问自己的 home；计算节点不创建这些子账户，任务由主账户通过受控 runner 在计算节点启动。
 - PostgreSQL 作为任务、节点、GPU、用户、审计和事件的单一事实来源。
@@ -39,7 +39,7 @@ NebulaGrid 3.0 是纯 B/S 架构的分布式 GPU 任务调度与实验资源管�
 ├── PostgreSQL：用户、节点、GPU、任务、事件、审计
 ├── InfluxDB：节点/GPU 历史监控指标
 ├── Redis：实时事件、缓存、日志流辅助
-└── NFS Storage：/home/ddltm/data + /home/ddltm/envs（用户 home、日志、运行时文件、环境、节点监控代码）
+└── NFS Storage：/home/ddltm/data + /home/ddltm/envs + /home/ddltm/shared（用户 home、日志、运行时文件、环境、节点监控代码、共享文件夹）
         |
         | SSH 控制命令 + NFS 共享文件
         v
@@ -63,7 +63,7 @@ NebulaGrid 3.0 是纯 B/S 架构的分布式 GPU 任务调度与实验资源管�
 - Nginx。
 - systemd。
 - 可访问所有计算节点的网络。
-- 作为 NFS server 共享 `/home/ddltm/data` 和 `/home/ddltm/envs`，并具备读写用户 home、任务日志、环境目录和远端脚本目录的权限。
+- 作为 NFS server 共享 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared`，并具备读写用户 home、任务日志、环境目录、远端脚本目录和共享文件夹的权限。
 - 创建平台主账户，例如 `ddltm`，该账户在 master 和所有计算节点上的用户名、密码、UID、GID 必须一致；NebulaGrid 服务、SSH 控制命令和远端任务 runner 默认使用该主账户。
 - master 上的平台子账户由系统按用户名创建，只存在于 master，home 目录统一映射为 `/home/ddltm/data/user/<user_name>`；主账户需要能对这些 home 目录执行增删查改，以便文件管理、任务准备、日志归档和管理员运维。
 
@@ -74,8 +74,10 @@ sudo useradd --create-home --shell /bin/bash ddltm
 sudo mkdir -p /home/ddltm/master /etc/nebulagrid /var/log/nebulagrid
 sudo mkdir -p /home/ddltm/data/user /home/ddltm/data/logs/task_logs /home/ddltm/data/logs/env_install_logs /home/ddltm/data/runtime /home/ddltm/data/backups
 sudo mkdir -p /home/ddltm/envs/miniconda3 /home/ddltm/envs/user_envs /home/ddltm/envs/nebulagrid_remote /home/ddltm/envs/packages
-sudo chown -R ddltm:ddltm /home/ddltm/master /home/ddltm/data /home/ddltm/envs /var/log/nebulagrid
+sudo mkdir -p /home/ddltm/shared
+sudo chown -R ddltm:ddltm /home/ddltm/master /home/ddltm/data /home/ddltm/envs /home/ddltm/shared /var/log/nebulagrid
 sudo chmod 750 /etc/nebulagrid /home/ddltm/data /home/ddltm/envs /var/log/nebulagrid
+sudo chmod 775 /home/ddltm/shared
 ```
 
 ### 3.2 计算节点
@@ -87,7 +89,7 @@ sudo chmod 750 /etc/nebulagrid /home/ddltm/data /home/ddltm/envs /var/log/nebula
 - 已创建与 master 完全一致的主账户，例如 `ddltm`，包括用户名、密码、UID 和 GID。该约束用于保证 NFS 文件属主、远端进程属主和 SSH 执行身份一致。
 - 不需要、也不应在计算节点创建平台子账户；用户 SSH 入口只在 master，计算节点只接受主账户的受控 SSH 执行。
 - NVIDIA 驱动已安装，`nvidia-smi` 可用。
-- 已挂载 master 通过 NFS 共享的 `/home/ddltm/data`，且挂载路径与 master 保持一致。
+- 已挂载 master 通过 NFS 共享的 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared`，且挂载路径与 master 保持一致。
 - `/home/ddltm/data/user/<user_name>` 下可访问对应用户 home，`/home/ddltm/data/logs` 下可访问任务日志和环境安装日志，`/home/ddltm/data/runtime` 下可访问运行时文件。
 - `/home/ddltm/envs` 下可访问 miniconda、用户环境目录和 `nebulagrid_remote` 节点监控/远端执行代码。
 
@@ -289,6 +291,7 @@ storage:
   nfs_data_root: /home/ddltm/data
   user_home_root: /home/ddltm/data/user
   user_home_template: /home/ddltm/data/user/{user_name}
+  shared_folder_root: /home/ddltm/shared
   task_log_root: /home/ddltm/data/logs/task_logs
   env_package_root: /home/ddltm/envs/packages
   env_install_log_root: /home/ddltm/data/logs/env_install_logs
@@ -321,6 +324,9 @@ executor:
 monitor:
   interval_seconds: 5
   watchdog_offline_seconds: 600
+
+file_operations:
+  worker_threads: 2
 
 runtime_guard:
   enabled: true
@@ -692,6 +698,7 @@ Runtime Guard 应检查任务进程树实际使用的 GPU UUID：
 
 - 后端服务层必须执行 RBAC 和资源归属校验，前端隐藏按钮不能作为权限依据。
 - 文件访问必须经过 PathResolver，禁止用户传入真实绝对路径绕过权限。
+- 文件列表、预览、上传、创建、保存、复制、移动、删除、打包和解压统一进入专用文件线程池，避免 NFS 或共享盘 IO 占用 API 默认请求线程；生产环境可通过 `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` 控制并发。
 - 上传和解压必须限制大小、类型、路径穿越、软链接逃逸和临时目录污染。
 - 用户命令保存原文和系统生成后的最终命令，管理员可审计。
 - 任务启动必须统一拼接环境激活和 CUDA 绑定前缀。

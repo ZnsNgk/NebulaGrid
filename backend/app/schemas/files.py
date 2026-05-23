@@ -35,6 +35,8 @@ class FileOperationRequest(BaseModel):
 
     path: str = Field(min_length=1, max_length=1024)
     target_path: str | None = Field(default=None, max_length=1024)
+    scope: str | None = Field(default=None, max_length=32)
+    target_scope: str | None = Field(default=None, max_length=32)
 
 
 class FileContentRequest(BaseModel):

@@ -1,6 +1,6 @@
 ﻿# NebulaGrid 3.0 后端部署文档
 
-本文面向一台主节点和多台计算节点的实验室部署。主节点运行 API、PostgreSQL、InfluxDB、Redis、NFS、调度器和后台 worker；计算节点通过 NFS 挂载 `/home/ddltm/data` 和 `/home/ddltm/envs`，并允许主节点使用统一主账户 SSH 执行受控脚本。
+本文面向一台主节点和多台计算节点的实验室部署。主节点运行 API、PostgreSQL、InfluxDB、Redis、NFS、调度器和后台 worker；计算节点通过 NFS 挂载 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared`，并允许主节点使用统一主账户 SSH 执行受控脚本。
 
 ## 1. 机器规划
 
@@ -17,7 +17,7 @@
 - Linux，推荐 Ubuntu Server 22.04 LTS。
 - 主节点可以 SSH 到所有计算节点。
 - 所有节点都存在同名主账户，例如 `ddltm`。
-- `/home/ddltm/data` 和 `/home/ddltm/envs` 在所有节点路径完全一致。
+- `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared` 在所有节点路径完全一致。
 - 计算节点安装 NVIDIA 驱动，`nvidia-smi` 可用。
 
 ## 2. 主节点系统依赖
@@ -73,10 +73,13 @@ sudo -u ddltm ssh node-a 'hostname && id && nvidia-smi -L'
 sudo mkdir -p /home/ddltm/data/user /home/ddltm/data/logs/task_logs /home/ddltm/data/logs/env_install_logs
 sudo mkdir -p /home/ddltm/data/runtime /home/ddltm/data/backups /home/ddltm/envs/packages
 sudo mkdir -p /home/ddltm/envs/miniconda3/envs /home/ddltm/envs/nebulagrid_remote
+sudo mkdir -p /home/ddltm/shared
 sudo chown -R ddltm:ddltm /home/ddltm/data
 sudo chown -R ddltm:ddltm /home/ddltm/envs
+sudo chown -R ddltm:ddltm /home/ddltm/shared
 sudo chmod 750 /home/ddltm/data
 sudo chmod 750 /home/ddltm/envs
+sudo chmod 775 /home/ddltm/shared
 ```
 
 配置 NFS exports：
@@ -85,6 +88,7 @@ sudo chmod 750 /home/ddltm/envs
 sudo tee /etc/exports.d/nebulagrid.exports >/dev/null <<'EOF'
 /home/ddltm/data 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
 /home/ddltm/envs 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
+/home/ddltm/shared 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
 EOF
 sudo exportfs -ra
 sudo exportfs -v
@@ -97,8 +101,10 @@ sudo apt update
 sudo apt install -y nfs-common
 sudo mkdir -p /home/ddltm/data
 sudo mkdir -p /home/ddltm/envs
+sudo mkdir -p /home/ddltm/shared
 sudo mount -t nfs master:/home/ddltm/data /home/ddltm/data
 sudo mount -t nfs master:/home/ddltm/envs /home/ddltm/envs
+sudo mount -t nfs master:/home/ddltm/shared /home/ddltm/shared
 ```
 
 写入 `/etc/fstab`：
@@ -106,6 +112,7 @@ sudo mount -t nfs master:/home/ddltm/envs /home/ddltm/envs
 ```bash
 echo 'master:/home/ddltm/data /home/ddltm/data nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
 echo 'master:/home/ddltm/envs /home/ddltm/envs nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
+echo 'master:/home/ddltm/shared /home/ddltm/shared nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab
 ```
 
 验证读写：
@@ -113,8 +120,10 @@ echo 'master:/home/ddltm/envs /home/ddltm/envs nfs defaults,_netdev 0 0' | sudo 
 ```bash
 sudo -u ddltm touch /home/ddltm/data/runtime/nfs-test-from-$(hostname)
 sudo -u ddltm touch /home/ddltm/envs/nfs-test-from-$(hostname)
+sudo -u ddltm touch /home/ddltm/shared/nfs-test-from-$(hostname)
 ls -l /home/ddltm/data/runtime/
 ls -l /home/ddltm/envs/
+ls -l /home/ddltm/shared/
 ```
 
 ## 5. PostgreSQL 数据库
@@ -230,8 +239,11 @@ NEBULAGRID_INFLUXDB_ORG=nebulagrid
 NEBULAGRID_INFLUXDB_BUCKET=nebulagrid_metrics
 NEBULAGRID_INFLUXDB_TOKEN=replace-with-influx-token
 NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
+NEBULAGRID_INFLUXDB_PRESENTER_RANGE=30m
+NEBULAGRID_INFLUXDB_PRESENTER_WINDOW=30s
 NEBULAGRID_DATA_ROOT=/home/ddltm/data
 NEBULAGRID_USER_HOME_ROOT=/home/ddltm/data/user
+NEBULAGRID_SHARED_FOLDER_ROOT=/home/ddltm/shared
 NEBULAGRID_VISIBLE_ROOTS=/home/ddltm/data/user,/home/ddltm/envs/miniconda3
 NEBULAGRID_CONDA_ENV_ROOT=/home/ddltm/envs/miniconda3/envs
 NEBULAGRID_TASK_LOG_ROOT=/home/ddltm/data/logs/task_logs
@@ -244,6 +256,7 @@ NEBULAGRID_MAIN_LINUX_USER=ddltm
 NEBULAGRID_SESSION_SECRET=replace-with-random-secret
 NEBULAGRID_SCHEDULER_INTERVAL_SECONDS=5
 NEBULAGRID_MONITOR_INTERVAL_SECONDS=5
+NEBULAGRID_FILE_OPERATION_WORKER_THREADS=2
 EOF
 sudo chown root:ddltm /etc/nebulagrid/backend.env
 sudo chmod 640 /etc/nebulagrid/backend.env
@@ -474,6 +487,29 @@ curl -s http://127.0.0.1:8000/api/nodes \
 
 管理员后台的节点列表提供“修改”“强制下线”“重连”“删除”操作。修改节点时复用新增节点卡片，提交成功后卡片标题会恢复为“新增节点”。强制下线和删除都会写入审计日志，生产环境操作前应确认该节点上没有需要保留的运行任务。
 
+## 15.1 展示者大屏账号
+
+展示者账号角色为 `viewer`，只拥有 `presenter:read` 权限。该账号登录后前端会进入 `#/presenter` 全屏视图，不显示普通控制台左侧栏目，也不会开放任务、文件、环境、节点管理或用户管理入口。页面左下角保留一个退出登录按钮，便于公共屏幕维护时手动结束会话。
+
+展示者大屏通过 `GET /api/dashboard/presenter` 读取聚合数据。接口会返回节点数量、在线节点、GPU 总数、等待任务当前数、运行任务当前数、历史任务总数，以及所有计算节点的 CPU、可用内存、网络、GPU、可用显存和历史曲线。GPU 使用率和可用显存必须按每张 GPU 独立展示，不能只展示节点平均值，便于公共屏幕直接定位单卡满载、空闲或显存不足的节点。历史曲线来自 InfluxDB 的 `node_metrics` 和 `gpu_metrics`，默认读取最近 `30m` 并按 `30s` 聚合，可通过 `NEBULAGRID_INFLUXDB_PRESENTER_RANGE` 和 `NEBULAGRID_INFLUXDB_PRESENTER_WINDOW` 调整。
+
+创建展示者账号示例：
+
+```bash
+curl -s http://127.0.0.1:8000/api/users \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "username":"viewer",
+    "real_name":"展示大屏",
+    "role":"viewer",
+    "state":"enabled",
+    "password":"replace-with-strong-password"
+  }'
+```
+
+展示者会话不受普通 30 分钟静默在线窗口限制，适合无人值守屏幕长期展示。安全边界仍然保留：主动退出、管理员下线、账号停用或密码变更都会使会话失效。
+
 ## 16. SSH 子账户同步
 
 生产环境启用 `NEBULAGRID_MANAGE_LINUX_ACCOUNTS=true` 后，API 服务会在创建用户、启动补齐历史用户、修改密码和删除用户时维护 Linux 子账户。API 服务运行在 systemd 中，没有交互终端，所以不能依赖 sudo 密码缓存，也不能让后端保存 sudo 密码；这里必须给 API 运行用户配置受限的 `NOPASSWD` sudoers。
@@ -510,11 +546,15 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 
 平台用户可用自己的用户名和密码 SSH 到 master，默认 home 为 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。平台会把用户目录设置为 `755`，便于实验室成员互相读取和拷贝文件。
 
-## 17. 文件打包/解压状态持久化
+文件管理页面提供“共享文件夹”视图，所有登录用户都可以查看 `NEBULAGRID_SHARED_FOLDER_ROOT` 指向的共享 SSD 目录。默认部署路径为 `/home/ddltm/shared`；如果现场用 `~/ddltm/shared` 这类写法，请在写入 `backend.env` 前先展开成 API 运行用户实际看到的绝对路径，避免 systemd 环境中 `~` 指向不同 home。用户可把个人目录中的文件或文件夹复制到共享文件夹，也可在共享文件夹中把文件或文件夹复制回自己的目录；新建、删除、重命名、上传、打包和解压仍限定在个人文件视图内，避免共享根被误操作。
+
+## 17. 文件操作线程与任务状态
 
 文件管理中的目录打包和压缩包解压任务会写入 PostgreSQL 的 `file_jobs` 表，而不是保存在 API 进程内存中。这样页面刷新、重新登录、API 重启或多 worker 部署时，前端仍可通过 `/api/files/jobs/latest` 读取当前用户最近一次任务状态。API 启动时会把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
 
 当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。系统限制同一用户同时只能运行一个文件打包/解压任务，并设置全局并发上限，避免共享盘 IO 被大量压缩任务打满。
+
+文件管理的列表、预览、上传、创建、保存、复制、移动、删除、打包和解压都通过专用文件线程池执行。这样 NFS 抖动、大目录复制或大文件上传不会挤占 FastAPI 默认请求线程池；接口仍保持原有响应语义，打包和解压继续通过 `file_jobs` 暴露进度。`NEBULAGRID_FILE_OPERATION_WORKER_THREADS` 默认值为 `2`，现场可按共享盘吞吐调小或调大，但不建议超过存储实际并发能力。
 
 ## 18. 环境管理当前实现
 

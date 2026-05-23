@@ -4,10 +4,10 @@ import shutil
 import stat
 import subprocess
 import tarfile
-import threading
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -22,6 +22,7 @@ from app.db.session import SessionLocal
 from app.schemas.files import FileEntry, FileJobData, FileListData, FilePreviewData
 from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
+from app.services.file_executor import submit_file_operation
 
 TEXT_PREVIEW_LIMIT = 256 * 1024
 BINARY_PREVIEW_LIMIT = 2 * 1024 * 1024
@@ -46,6 +47,7 @@ EDITABLE_TEXT_TYPES = {
     ".yml",
 }
 STUDENT_FILES_SCOPE = "students"
+SHARED_FILES_SCOPE = "shared"
 
 
 def list_files(user: UserRecord, path: str, scope: str = "") -> FileListData:
@@ -54,6 +56,8 @@ def list_files(user: UserRecord, path: str, scope: str = "") -> FileListData:
     normalized = normalize_virtual_path(path)
     if is_student_files_scope(scope):
         return list_student_files(user, normalized)
+    if is_shared_files_scope(scope):
+        return list_shared_files(user, normalized)
     real_path = resolve_user_visible_path(normalized, user.username, user.role.value)
     if not real_path.exists():
         return FileListData(path=normalized, items=[])
@@ -70,6 +74,8 @@ def preview_file(user: UserRecord, path: str, scope: str = "") -> FilePreviewDat
     real_path = (
         resolve_student_readable_existing_path(user, normalized)
         if is_student_files_scope(scope)
+        else resolve_shared_readable_existing_path(user, normalized)
+        if is_shared_files_scope(scope)
         else resolve_user_visible_path(normalized, user.username, user.role.value)
     )
     if not real_path.exists() or not real_path.is_file():
@@ -133,10 +139,16 @@ def save_text_file(user: UserRecord, path: str, content: str) -> dict[str, str |
     return {"accepted": True, "action": "save", "path": normalize_virtual_path(path)}
 
 
-def copy_path(user: UserRecord, path: str, target_path: str) -> dict[str, str | bool]:
+def copy_path(
+    user: UserRecord,
+    path: str,
+    target_path: str,
+    source_scope: str | None = None,
+    target_scope: str | None = None,
+) -> dict[str, str | bool]:
     """复制文件或目录，目标存在时拒绝覆盖，降低批量操作风险。"""
-    source = resolve_readable_existing_path(user, path)
-    target = resolve_writable_path(user, target_path)
+    source = resolve_readable_existing_path(user, path, source_scope)
+    target = resolve_writable_path(user, target_path, target_scope)
     if target.exists():
         raise validation_error("target already exists")
     ensure_parent_directory(target)
@@ -218,12 +230,15 @@ def start_archive_job(user: UserRecord, path: str, target_path: str | None = Non
     ensure_parent_directory(target)
     ensure_no_active_file_job(user)
     job = create_file_job(user, "archive", normalized, normalize_virtual_path(target_virtual))
-    thread = threading.Thread(
-        target=run_archive_job,
-        args=(job.id, user, source, target, normalized, normalize_virtual_path(target_virtual)),
-        daemon=True,
+    submit_file_operation(
+        run_archive_job,
+        job.id,
+        user,
+        source,
+        target,
+        normalized,
+        normalize_virtual_path(target_virtual),
     )
-    thread.start()
     return job
 
 
@@ -240,12 +255,15 @@ def start_extract_job(user: UserRecord, path: str, target_path: str | None = Non
         raise validation_error("target path is not a directory")
     ensure_no_active_file_job(user)
     job = create_file_job(user, "extract", normalized, normalize_virtual_path(target_virtual))
-    thread = threading.Thread(
-        target=run_extract_job,
-        args=(job.id, user, source, target, normalized, normalize_virtual_path(target_virtual)),
-        daemon=True,
+    submit_file_operation(
+        run_extract_job,
+        job.id,
+        user,
+        source,
+        target,
+        normalized,
+        normalize_virtual_path(target_virtual),
     )
-    thread.start()
     return job
 
 
@@ -295,6 +313,8 @@ def build_download_path(user: UserRecord, path: str, scope: str = "") -> Path:
     real_path = (
         resolve_student_readable_existing_path(user, path)
         if is_student_files_scope(scope)
+        else resolve_shared_readable_existing_path(user, path)
+        if is_shared_files_scope(scope)
         else resolve_readable_existing_path(user, path)
     )
     if not real_path.is_file():
@@ -316,6 +336,14 @@ def resolve_upload_target(user: UserRecord, directory_path: str, filename: str) 
     return target
 
 
+def save_upload_file(user: UserRecord, directory_path: str, filename: str, source_file: BinaryIO) -> dict[str, str | bool]:
+    """在文件线程中完成上传落盘和审计，避免大文件写入占用 API 默认请求线程。"""
+    target = resolve_upload_target(user, directory_path, filename)
+    with target.open("wb") as output:
+        shutil.copyfileobj(source_file, output)
+    return complete_upload(user, directory_path, target.name)
+
+
 def complete_upload(user: UserRecord, directory_path: str, filename: str) -> dict[str, str | bool]:
     """上传写入完成后记录审计；真实写入由 API 层按流式分块执行。"""
     normalized = normalize_virtual_path(directory_path)
@@ -324,10 +352,13 @@ def complete_upload(user: UserRecord, directory_path: str, filename: str) -> dic
     return {"accepted": True, "action": "upload", "path": normalized, "target_path": virtual_path}
 
 
-def resolve_readable_existing_path(user: UserRecord, path: str) -> Path:
+def resolve_readable_existing_path(user: UserRecord, path: str, scope: str | None = None) -> Path:
     """解析可读路径并要求目标存在，便于读、复制、打包类操作复用。"""
     require_permission(user.role, "files:read")
-    real_path = resolve_user_visible_path(path, user.username, user.role.value)
+    if is_shared_files_scope(scope):
+        real_path = resolve_shared_visible_path(path)
+    else:
+        real_path = resolve_user_visible_path(path, user.username, user.role.value)
     if not real_path.exists():
         raise not_found("path not found")
     return real_path
@@ -336,6 +367,51 @@ def resolve_readable_existing_path(user: UserRecord, path: str) -> Path:
 def is_student_files_scope(scope: str | None) -> bool:
     """判断是否进入导师查看学生文件的只读视图，避免把学生路径误交给个人文件解析器。"""
     return (scope or "").strip().lower() == STUDENT_FILES_SCOPE
+
+
+def is_shared_files_scope(scope: str | None) -> bool:
+    """判断是否进入共享文件夹视图；共享根独立配置，不依赖用户 home 边界。"""
+    return (scope or "").strip().lower() == SHARED_FILES_SCOPE
+
+
+def list_shared_files(user: UserRecord, normalized: str) -> FileListData:
+    """列出全员可见的共享文件夹，虚拟 / 映射到 NEBULAGRID_SHARED_FOLDER_ROOT。"""
+    require_permission(user.role, "files:read")
+    real_path = resolve_shared_visible_path(normalized)
+    display_path = shared_display_path(normalized)
+    if not real_path.exists():
+        return FileListData(path=normalized, display_path=display_path, items=[])
+    if not real_path.is_dir():
+        raise validation_error("path is not a directory")
+    items = [build_file_entry(child, normalized) for child in sorted(real_path.iterdir(), key=file_sort_key)]
+    return FileListData(path=normalized, display_path=display_path, items=items)
+
+
+def resolve_shared_readable_existing_path(user: UserRecord, path: str) -> Path:
+    """解析共享文件夹中的可读路径，所有有文件读取权限的用户都可访问。"""
+    require_permission(user.role, "files:read")
+    real_path = resolve_shared_visible_path(path)
+    if not real_path.exists():
+        raise not_found("path not found")
+    return real_path
+
+
+def resolve_shared_visible_path(path: str) -> Path:
+    """把共享视图虚拟路径映射到共享根，并防止 .. 或绝对路径写出共享 SSD。"""
+    settings = get_settings()
+    normalized = normalize_virtual_path(path)
+    shared_root = Path(settings.shared_folder_root).expanduser().resolve(strict=False)
+    parts = PurePosixPath(normalized).parts[1:]
+    candidate = shared_root.joinpath(*parts).resolve(strict=False)
+    if candidate != shared_root and shared_root not in candidate.parents:
+        raise forbidden("path is outside shared folder")
+    return candidate
+
+
+def shared_display_path(path: str) -> str:
+    """生成共享文件夹的展示路径，避免前端把共享视图误认为个人根目录。"""
+    normalized = normalize_virtual_path(path)
+    return "/共享文件夹" if normalized == "/" else f"/共享文件夹{normalized}"
 
 
 def list_student_files(user: UserRecord, normalized: str) -> FileListData:
@@ -459,9 +535,11 @@ def ensure_assigned_student(user: UserRecord, student_username: str) -> None:
         raise forbidden("mentor can only view assigned student files")
 
 
-def resolve_writable_path(user: UserRecord, path: str) -> Path:
+def resolve_writable_path(user: UserRecord, path: str, scope: str | None = None) -> Path:
     """解析可写路径；权限检查集中在这里，避免各操作遗漏 RBAC。"""
     require_permission(user.role, "files:write")
+    if is_shared_files_scope(scope):
+        return resolve_shared_visible_path(path)
     return resolve_user_visible_path(path, user.username, user.role.value)
 
 

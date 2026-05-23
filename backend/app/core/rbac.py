@@ -36,7 +36,8 @@ ROLE_PERMISSIONS: dict[Role, set[str]] = {
         "users:create_student",
     },
     Role.ADMIN: {"*"},
-    Role.VIEWER: {"dashboard:read", "nodes:read", "tasks:read", "envs:read"},
+    # 展示者账号只允许访问专用大屏聚合接口，避免复用任务、环境等普通业务 API。
+    Role.VIEWER: {"presenter:read"},
 }
 
 

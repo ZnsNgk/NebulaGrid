@@ -14,7 +14,7 @@
 
 - 安装系统包：`nginx`、`postgresql`、`influxdb2`、`redis-server`、`nfs-kernel-server`、`nfs-common`。
 - 创建 Linux 用户 `ddltm`，并保证主节点和计算节点 UID/GID 一致。
-- 创建和授权 `/home/ddltm/data`、`/home/ddltm/envs`。
+- 创建和授权 `/home/ddltm/data`、`/home/ddltm/envs`、`/home/ddltm/shared`。
 - 配置 NFS：`/etc/exports.d/nebulagrid.exports`。
 - 创建 PostgreSQL 用户和数据库。
 - 初始化 InfluxDB org、bucket 和 token。
@@ -99,11 +99,15 @@ NEBULAGRID_INFLUXDB_ORG=nebulagrid
 NEBULAGRID_INFLUXDB_BUCKET=nebulagrid_metrics
 NEBULAGRID_INFLUXDB_TOKEN=change-this-influx-token
 NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
+NEBULAGRID_INFLUXDB_PRESENTER_RANGE=30m
+NEBULAGRID_INFLUXDB_PRESENTER_WINDOW=30s
+NEBULAGRID_SHARED_FOLDER_ROOT=/home/ddltm/shared
+NEBULAGRID_FILE_OPERATION_WORKER_THREADS=2
 ```
 
 ## 5. 同步远端脚本
 
-`/home/ddltm/data` 和 `/home/ddltm/envs` 归属应为 `ddltm:ddltm`。远端脚本位于 `backend/app/remote/*.py`，优先使用同步工具，确保新增的 `monitor.py`、`runner.py`、`env_probe.py`、`env_installer.py` 等脚本都会被下发：
+`/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared` 归属应为 `ddltm:ddltm`。共享文件夹默认使用 `/home/ddltm/shared`，文件管理页面会把它作为全员可见的只读查看和互相复制入口；如果现场改用其他 SSD 路径，必须同步修改 `NEBULAGRID_SHARED_FOLDER_ROOT`。远端脚本位于 `backend/app/remote/*.py`，优先使用同步工具，确保新增的 `monitor.py`、`runner.py`、`env_probe.py`、`env_installer.py` 等脚本都会被下发：
 
 ```bash
 cd /home/ddltm/master/backend
@@ -232,11 +236,13 @@ sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 
 不要给 `NOPASSWD: ALL`。
 
-## 9. 文件任务状态
+## 9. 文件操作线程与任务状态
 
 文件管理中的目录打包和压缩包解压任务会写入 PostgreSQL 的 `file_jobs` 表，而不是保存在 API 进程内存中。页面刷新、重新登录、API 重启或多 worker 部署后，前端仍可通过 `/api/files/jobs/latest` 读取当前用户最近一次任务状态。API 启动时会把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
 
 当前目录打包生成 zip；解压支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz` 和 `.txz`。同一用户同时只能运行一个文件打包/解压任务，系统也会限制全局并发，避免共享盘 IO 被大量压缩任务打满。
+
+列表、预览、上传、创建、保存、复制、移动、删除、打包和解压都会进入专用文件线程池，避免 NFS 或共享盘 IO 占用 API 默认请求线程。线程数由 `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` 控制，默认 `2`；如果 master 与共享盘 IO 较弱，可以调低以减少并发压力，如果存储吞吐充足，可以谨慎调高。
 
 ## 10. 任务调度状态
 

@@ -150,7 +150,7 @@ NebulaGrid 3.0 的目标是提供一个浏览器即可访问的统一入口，�
 
 ## 3.2 部署拓扑
 
-最小可用部署仍然保持一个主控节点和若干计算节点。主控节点运行 Web 后端、调度器、节点监控器和数据库；主控节点与计算节点通过 NFS 协议共享 `/home/ddltm/data` 和 `/home/ddltm/envs`。`/home/ddltm/data/user/<user_name>` 是平台用户在 master 上的 home 目录，`/home/ddltm/data/logs` 存储任务日志和环境安装日志，`/home/ddltm/data/runtime` 存储运行时文件，`/home/ddltm/envs` 存储 miniconda、用户环境目录和节点监控/远端执行代码。计算节点只需要创建与 master 一致的主账户并允许主控节点通过该账户 SSH 访问，不创建平台用户子账户。若后续要提升可靠性，可以将数据库独立部署，并把调度器保持为单实例以避免重复派发任务。
+最小可用部署仍然保持一个主控节点和若干计算节点。主控节点运行 Web 后端、调度器、节点监控器和数据库；主控节点与计算节点通过 NFS 协议共享 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared`。`/home/ddltm/data/user/<user_name>` 是平台用户在 master 上的 home 目录，`/home/ddltm/data/logs` 存储任务日志和环境安装日志，`/home/ddltm/data/runtime` 存储运行时文件，`/home/ddltm/envs` 存储 miniconda、用户环境目录和节点监控/远端执行代码，`/home/ddltm/shared` 存储所有登录用户可查看并互相复制的共享文件。计算节点只需要创建与 master 一致的主账户并允许主控节点通过该账户 SSH 访问，不创建平台用户子账户。若后续要提升可靠性，可以将数据库独立部署，并把调度器保持为单实例以避免重复派发任务。
 
 ```text
 用户浏览器 / 展示大屏
@@ -226,7 +226,7 @@ nebulagrid/
 │   │   ├── envs/
 │   │   ├── users/
 │   │   ├── admin/
-│   │   └── visual/
+│   │   └── presenter/
 │   ├── src/api/client.ts
 │   └── src/store/
 ├── scripts/
@@ -251,7 +251,7 @@ nebulagrid/
 | 学生     | student    | 普通实验用户，管理自己的文件、环境和任务。                 | 个人工作台   |
 | 导师     | supervisor | 具备学生能力，并可查看和管理自己学生的账号信息与实验资产。 | 导师工作台   |
 | 管理员   | admin      | 系统维护者，可管理所有用户、节点、配置、任务和审计。       | 管理员后台   |
-| 展示者   | visual     | 只读展示账号，只能查看节点状态、任务数量和总体运行情况。   | 展示大屏     |
+| 展示者   | viewer     | 只读展示账号，只能查看展示大屏聚合数据、所有节点状态和任务数量，不进入普通业务页面。 | 展示大屏     |
 
 角色不是页面皮肤，而是 API 权限的基础。所有后端接口必须在服务层进行权限判断，即使前端隐藏了按钮，后端也必须阻止越权调用。
 
@@ -259,8 +259,8 @@ nebulagrid/
 
 | **功能/操作**                     | **学生**             | **导师**                               | **管理员**                   | **展示者**           |
 |-----------------------------------|----------------------|----------------------------------------|------------------------------|----------------------|
-| 查看公共节点与自己可用的私人节点  | 允许                 | 允许                                   | 允许                         | 仅汇总/隐藏敏感字段  |
-| 查看节点 IP、SSH 用户名、配置详情 | 禁止                 | 禁止或仅本人私有节点                   | 允许                         | 禁止                 |
+| 查看公共节点与自己可用的私人节点  | 允许                 | 允许                                   | 允许                         | 展示所有节点状态     |
+| 查看节点 IP、SSH 用户名、配置详情 | 禁止                 | 禁止或仅本人私有节点                   | 允许                         | 仅节点名和内网 IP，不显示 SSH 用户名 |
 | 提交任务                          | 启用状态允许         | 启用状态允许                           | 允许                         | 禁止                 |
 | 停止任务                          | 仅自己的运行任务     | 默认禁止停止学生任务，可停止自己的任务 | 所有任务                     | 禁止                 |
 | 删除等待/历史任务记录             | 仅自己的任务         | 自己的任务；学生任务只读或按配置       | 所有任务                     | 禁止                 |
@@ -290,6 +290,8 @@ nebulagrid/
 
 文件打包和解压任务应持久化到 `file_jobs` 表，字段包括 `user_id`、`action`、`source_path`、`target_path`、`state`、`progress`、`current_file`、`message`、`created_at`、`updated_at` 和 `finished_at`。系统需要限制同一用户只能同时运行一个打包/解压任务，并设置全局并发上限，避免共享盘 IO 被大量压缩任务打满。API 启动时应把上次进程遗留的 `pending/running` 文件任务标记为失败，避免重启后长期占用并发名额。
 
+文件列表、预览、上传、创建、保存、复制、移动、删除、打包和解压应进入专用文件线程池执行，不得占用 FastAPI 默认请求线程；线程数通过 `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` 配置，默认值为 `2`。
+
 ## 4.4 登录与设备状态
 
 系统应记录用户登录 IP、设备指纹、登录时间、退出时间、当前在线会话数量和当前在线 IP/设备。该信息主要用于用户自查是否被盗号，同时也是管理员追踪异常操作的重要依据。
@@ -317,7 +319,7 @@ nebulagrid/
 
 - 显示节点卡片：节点名称、归属、状态、CPU 使用率、内存、网络速率、GPU 使用率、显存占用、GPU 任务数。
 
-- 展示者账号只能看到汇总与公开字段，不显示 IP、登录用户名、用户文件路径、任务命令全文等敏感信息。
+- 展示者账号只能通过专用大屏看到汇总指标、节点名、内网 IP 和节点运行状态，不显示 SSH 用户名、用户文件路径、任务命令全文、任务明细和用户隐私字段。
 
 - 展示大屏应支持自动刷新和全屏模式，适合在实验室展板中长期打开。
 
@@ -387,6 +389,7 @@ nebulagrid/
 | FILE-004     | 所有路径必须通过 PathResolver 验证，禁止 ..、软链接逃逸、绝对路径绕过和越权访问。 | P0         |
 | FILE-005     | 大文件上传应支持大小限制、进度显示和失败重试；管理员可配置 max_upload_size。      | P1         |
 | FILE-006     | 危险操作删除/覆盖/解压需二次确认，并写入审计日志。                                | P0         |
+| FILE-007     | 支持全员共享文件夹视图，默认根目录为 `/home/ddltm/shared`；用户可查看共享文件夹，并在个人目录与共享目录之间复制文件或文件夹。 | P0         |
 
 ## 5.6 日志管理
 
@@ -557,7 +560,8 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | Admin     | POST /api/admin/login-management/online-users          | 获取当前在线用户摘要；用户启停状态仍使用用户对象的 `state`。                | 管理员                           |
 | Admin     | POST /api/admin/login-management/user-sessions         | 查询指定用户登录设备；会话状态使用 `session_state/status_label/status_category`。 | 管理员                           |
 | Admin     | POST /api/admin/login-management/offline-session       | 管理员下线任意用户指定登录设备。                                          | 管理员                           |
-| Dashboard | GET /api/dashboard/summary                            | 获取节点、GPU、任务统计。                                                 | 所有角色，展示者脱敏             |
+| Dashboard | GET /api/dashboard/summary                            | 获取普通仪表盘节点、GPU、任务统计。                                       | 学生/导师/管理员                 |
+| Dashboard | GET /api/dashboard/presenter                          | 获取展示者大屏聚合数据、所有节点状态和 InfluxDB 历史曲线。                | 展示者                           |
 | Nodes     | GET /api/nodes                                        | 节点列表，按角色过滤字段。                                                | 登录用户                         |
 | Nodes     | POST /api/admin/nodes                                 | 新增节点。                                                                | 管理员                           |
 | Nodes     | PUT /api/admin/nodes/{id}                             | 修改节点基础信息、所有人、共享策略和 GPU 顺序清单。                        | 管理员                           |
@@ -572,11 +576,12 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | Tasks     | POST /api/tasks/{task_id}/resubmit                    | 重新提交。                                                                | 拥有者/管理员                    |
 | Logs      | GET /api/tasks/{task_id}/log?tail=200KB               | 读取任务日志尾部。                                                        | 任务可见者                       |
 | Logs      | GET /api/tasks/{task_id}/log/download                 | 下载完整日志。                                                            | 任务可见者                       |
-| Files     | GET /api/files/list?path=/                            | 列当前用户文件根目录。                                                    | 路径可见者                       |
-| Files     | POST /api/files/upload                                | 上传文件。                                                                | 路径可写者                       |
-| Files     | GET /api/files/preview                                | 预览文本/图片/音视频。                                                    | 路径可见者                       |
+| Files     | GET /api/files/list?path=&scope=                      | 列当前用户文件根目录、导师学生文件视图或共享文件夹视图。                  | 路径可见者                       |
+| Files     | POST /api/files/upload                                | 上传文件；共享文件夹视图不开放上传，避免误写共享根。                      | 路径可写者                       |
+| Files     | GET /api/files/preview?path=&scope=                   | 预览文本/图片/音视频；`scope=shared` 时从共享文件夹读取。                 | 路径可见者                       |
+| Files     | POST /api/files/copy                                  | 复制文件或目录；请求体支持 `scope` 和 `target_scope`，用于个人目录与共享文件夹互拷。 | 路径可见者和目标可写者           |
 | Files     | POST /api/files/archive                               | 压缩文件或目录。                                                          | 路径可写者                       |
-| Files     | POST /api/files/extract                               | 解压 zip/tar/tar.gz/tgz/tar.bz2/tbz2/tar.xz/txz。                         | 路径可写者                       |
+| Files     | POST /api/files/extract                               | 解压 zip/tar/tar.gz/tgz/tar.bz2/tar.xz/txz。                              | 路径可写者                       |
 | Envs      | GET /api/envs                                         | 环境列表。                                                                | 按角色过滤                       |
 | Envs      | POST /api/envs/upload-pack                            | 上传并导入 conda-pack 环境。                                              | 用户本人/管理员                  |
 | Envs      | POST /api/envs/{id}/test                              | 测试环境。                                                                | 环境可见者                       |
@@ -747,7 +752,7 @@ export QT_QPA_PLATFORM=offscreen
 
 ## 10.1 路径模型
 
-用户界面统一展示以当前用户文件根目录为基准的虚拟路径，例如 `/project/train.py`；虚拟根目录 `/` 对应 `/home/ddltm/data/user/<user_name>/`。后端 PathResolver 将虚拟路径解析为服务器真实路径，并检查该路径是否落在 NFS 共享的 `/home/ddltm/data/user/<user_name>/`、`/home/ddltm/envs/miniconda3/envs/<env_name>` 或管理员配置的 visible_roots 内。所有文件 API、任务 workdir、环境路径和日志下载都必须调用同一个 PathResolver。master 与计算节点必须以相同路径挂载 `/home/ddltm/data` 和 `/home/ddltm/envs`，否则远端任务可能找不到项目路径、日志路径或环境路径。
+用户界面统一展示以当前用户文件根目录为基准的虚拟路径，例如 `/project/train.py`；虚拟根目录 `/` 对应 `/home/ddltm/data/user/<user_name>/`。共享文件夹视图使用独立 scope，虚拟根目录 `/` 对应 `NEBULAGRID_SHARED_FOLDER_ROOT`，默认 `/home/ddltm/shared`。后端路径解析层将虚拟路径解析为服务器真实路径，并检查该路径是否落在 NFS 共享的 `/home/ddltm/data/user/<user_name>/`、`/home/ddltm/shared`、`/home/ddltm/envs/miniconda3/envs/<env_name>` 或管理员配置的 visible_roots 内。所有文件 API、任务 workdir、环境路径和日志下载都必须走统一路径解析逻辑，不能直接信任用户传入的真实绝对路径。master 与计算节点必须以相同路径挂载 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared`，否则远端任务可能找不到项目路径、日志路径、环境路径或共享文件。
 
 ```python
 def resolve_virtual_path(user, virtual_path, mode):
@@ -862,8 +867,8 @@ def resolve_virtual_path(user, virtual_path, mode):
 | **页面**   | **学生**   | **导师**      | **管理员**        | **展示者**   |
 |------------|------------|---------------|-------------------|--------------|
 | 登录页     | 可用       | 可用          | 可用              | 可用         |
-| 个人仪表盘 | 自己的统计 | 自己+学生统计 | 全局统计          | 只读大屏     |
-| 节点页面   | 可用节点   | 可用节点      | 全部节点+管理按钮 | 脱敏只读     |
+| 个人仪表盘 | 自己的统计 | 自己+学生统计 | 全局统计          | 无侧栏全屏大屏 |
+| 节点页面   | 可用节点   | 可用节点      | 全部节点+管理按钮 | 合并在展示大屏 |
 | 任务页面   | 自己的任务 | 自己+学生任务 | 全部任务          | 任务数量统计 |
 | 提交任务   | 可用       | 可用          | 可用              | 不可用       |
 | 日志页面   | 自己的日志 | 自己+学生日志 | 全部日志          | 不可用       |
@@ -991,7 +996,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 | 继续沿用全局列表和 JSON dump | 历史增长后页面变慢，状态恢复困难，权限和审计难实现。 | 尽早迁移数据库，JSON 只用于导入/导出。                                           |
 | 用户命令具备 shell 能力      | 可能绕过 GPU 分配或误删文件。                        | 限制路径、审计操作、GPU 违规检测、必要时引入容器。                               |
 | 主控节点不联网               | 环境维护困难。                                       | 采用本地/WSL 打包 conda-pack 后上传导入。                                        |
-| NFS 共享目录不一致或主账户 UID/GID 不一致 | 任务在节点上找不到项目路径、日志路径或环境，或写入文件属主异常。 | master 与所有计算节点必须用一致路径挂载 `/home/ddltm/data` 和 `/home/ddltm/envs`，并在上线前检查主账户 UID/GID、文件属主和读写权限。 |
+| NFS 共享目录不一致或主账户 UID/GID 不一致 | 任务在节点上找不到项目路径、日志路径、环境或共享文件，或写入文件属主异常。 | master 与所有计算节点必须用一致路径挂载 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared`，并在上线前检查主账户 UID/GID、文件属主和读写权限。 |
 | 导师权限过大                 | 可能误操作学生任务或文件。                           | 默认导师只读学生任务与文件，写权限显式配置。                                     |
 | 节点异常恢复语义不清         | 任务重复运行或资源不释放。                           | 使用任务事件和节点状态机，危险操作二次确认。                                     |
 | 环境包直接写入 site-packages | 可能污染环境、覆盖已有包或导致难以卸载。             | 当前版本不提供直接复制到 site-packages 的入口，统一走 conda/pip 安装命令。    |
@@ -1021,6 +1026,7 @@ security:
 paths:
   nfs_data_root: /home/ddltm/data
   nfs_env_root: /home/ddltm/envs
+  shared_folder_root: /home/ddltm/shared
   user_home_root: /home/ddltm/data/user
   user_home_template: /home/ddltm/data/user/{user_name}
   env_root: /home/ddltm/envs/miniconda3/envs
@@ -1031,8 +1037,14 @@ paths:
   remote_code_root: /home/ddltm/envs/nebulagrid_remote
   visible_roots:
     - /home/ddltm/data/user
-    - /home/ddltm/data/shared
+    - /home/ddltm/shared
     - /home/ddltm/envs/miniconda3
+
+metrics:
+  backend: influxdb
+  latest_range: 30m
+  presenter_range: 30m
+  presenter_window: 30s
 
 accounts:
   main_user: ddltm
@@ -1058,6 +1070,9 @@ limits:
   max_upload_mb: 10240
   max_log_tail_kb: 512
   max_history_page_size: 100
+
+file_operations:
+  worker_threads: 2
 ```
 
 环境包与守护线程新增配置示例：
@@ -1112,7 +1127,7 @@ dependency_failed --> [*]
 - 学生：登录、查看节点、提交任务、管理自己的文件/环境、查看日志、停止自己的任务、修改个人资料。
 - 导师：继承学生能力，查看学生任务/日志/文件/环境，添加或停用自己的学生。
 - 管理员：管理所有用户、节点、任务、文件、环境、配置和审计。
-- 展示者：查看脱敏后的节点概览与任务统计。
+- 展示者：通过无侧栏全屏大屏查看所有节点运行状态、任务数量统计和 InfluxDB 历史曲线。
 
 # 附录 C. 术语表
 
@@ -1125,7 +1140,7 @@ dependency_failed --> [*]
 | 环境               | 任务运行所需的软件环境，通常为 conda/miniconda 环境。    |
 | 主账户             | master 与每个计算节点都存在的统一执行账户，例如 `ddltm`，要求用户名、密码、UID 和 GID 一致；用于 NebulaGrid 服务、SSH 控制和远端 runner 执行。 |
 | 子账户             | NebulaGrid 为平台用户在 master 上创建的 Linux 账户，用于用户 SSH 到主节点；home 映射到 `/home/ddltm/data/user/<user_name>`，不在计算节点创建。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户受保护并复用。 |
-| NFS 共享目录       | master 通过 NFS 共享给计算节点的 `/home/ddltm/data` 和 `/home/ddltm/envs`；其中 `/home/ddltm/data/user` 保存用户 home，`/home/ddltm/data/logs` 保存日志，`/home/ddltm/envs` 保存 miniconda、环境和节点监控代码。 |
+| NFS 共享目录       | master 通过 NFS 共享给计算节点的 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared`；其中 `/home/ddltm/data/user` 保存用户 home，`/home/ddltm/data/logs` 保存日志，`/home/ddltm/envs` 保存 miniconda、环境和节点监控代码，`/home/ddltm/shared` 保存全员共享文件。 |
 | GPU 复用           | 允许多个轻量任务共享同一 GPU，但受显存和任务数阈值限制。 |
 | 前驱任务           | 当前任务开始前必须完成的依赖任务。                       |
 | 审计日志           | 记录用户对系统资源执行的关键操作，用于追溯和排障。       |
@@ -1180,7 +1195,7 @@ dependency_failed --> [*]
 
 - 本机 conda/pip 离线安装、上传包安装和 compile 安装均创建 `env_install_jobs` 记录，不再由 API 请求同步等待安装完成。
 - `env_install_jobs` 持久化安装命令、工作目录、目标节点、可见 GPU、日志路径、返回码和状态；worker 通过行锁领取 queued 作业，避免多 worker 重复执行。
-- 本机安装由 `nebulagrid-env-install-worker` 在目标环境中执行；compile 安装通过 SSH 在指定计算节点执行远端安装命令，要求 `/home/ddltm/data` 和 `/home/ddltm/envs` 路径一致。
+- 本机安装由 `nebulagrid-env-install-worker` 在目标环境中执行；compile 安装通过 SSH 在指定计算节点执行远端安装命令，要求 `/home/ddltm/data`、`/home/ddltm/envs` 和 `/home/ddltm/shared` 路径一致。
 - Runtime Guard 以 `task_runtime_guards` 中的 root PID/进程组和 allocation GPU ID 为依据，远端展开 PID 树后按 GPU UUID 比对实际 `nvidia-smi` compute-apps 使用情况。
 - 守护检测连续两轮发现未分配 GPU 后，任务进入 `alloc_error`，系统终止远端进程组、释放 allocation，并写入任务日志、任务事件和审计线索。
 
