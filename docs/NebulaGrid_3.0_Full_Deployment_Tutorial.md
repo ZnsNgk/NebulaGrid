@@ -1254,7 +1254,7 @@ sudo systemctl reload nginx
 
 上面的 `nebulagrid_sudo_probe` 只用于验证 sudoers 是否真的允许 API 需要的账户命令。因为 sudoers 会严格匹配命令绝对路径，所以如果这里出现 `interactive authentication is required`、`a password is required` 或 `not allowed to execute`，先修正 `/etc/sudoers.d/nebulagrid-ddltm`，不要只测试 `sudo useradd` 这种相对命令。如果 `command -v systemctl` 返回 `/bin/systemctl`，验证命令和 sudoers 中的 smbd 重启路径也要使用 `/bin/systemctl restart smbd`。
 
-用户在 Windows 资源管理器中不能只访问主节点根路径，例如 `\\10.16.20.253`；`[homes]` 使用 `browseable = no`，服务器根路径不会列出每个用户目录。用户应访问自己的共享名：
+用户在 Windows 资源管理器中不能只访问主节点根路径，例如 `\\192.168.0.1`；`[homes]` 使用 `browseable = no`，服务器根路径不会列出每个用户目录。用户应访问自己的共享名：
 
 ```text
 \\<master-ip>\<user_name>
@@ -1263,22 +1263,22 @@ sudo systemctl reload nginx
 例如用户 `test1` 应访问：
 
 ```text
-\\10.16.20.253\test1
+\\192.168.0.1\test1
 ```
 
 登录时用户名填写平台用户名 `test1`，密码填写该用户在账号管理页开启 Samba 时输入的当前密码。如果 Windows 缓存过旧账号或错误密码，先在 Windows CMD 中清理缓存后再连接：
 
 ```bat
-net use \\10.16.20.253\test1 /delete /y
+net use \\192.168.0.1\test1 /delete /y
 net use * /delete /y
-cmdkey /delete:10.16.20.253
-net use \\10.16.20.253\test1 /user:test1 *
+cmdkey /delete:192.168.0.1
+net use \\192.168.0.1\test1 /user:test1 *
 ```
 
 如果 Windows 提示“无法访问”或“检查名称的拼写”，先从端口、服务、账号和共享名四层排查。Windows 侧确认 445 端口可达：
 
 ```powershell
-Test-NetConnection 10.16.20.253 -Port 445
+Test-NetConnection 192.168.0.1 -Port 445
 ```
 
 主节点侧确认 `smbd` 监听、Linux 子账户存在、Samba 账号存在、`[homes]` 生效，并直接从本机访问同名共享：
