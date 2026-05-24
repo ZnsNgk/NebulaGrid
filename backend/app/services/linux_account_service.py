@@ -65,7 +65,8 @@ def ensure_managed_home_directory(home_path: str, settings: Settings | None = No
         return False
     target.mkdir(parents=True, exist_ok=True)
     try:
-        target.chmod(0o755)
+        # 用户根目录先按最小权限创建；后续账户维护命令再用 ACL 单独放开主账号访问。
+        target.chmod(0o700)
     except OSError:
         # 某些 NFS/Windows 开发环境不支持 chmod；目录已经存在即可满足文件管理入口。
         pass
@@ -162,7 +163,7 @@ def build_permission_commands(account_name: str, home_path: str, settings: Setti
     commands = [
         [command_path("chmod"), "755", settings.data_root, settings.user_home_root, f"{settings.data_root}/logs", settings.task_log_root, settings.env_install_log_root],
         [command_path("chown"), "-R", f"{account_name}:{account_name}", home_path],
-        [command_path("chmod"), "-R", "755", home_path],
+        [command_path("chmod"), "-R", "u+rwX,go-rwx", home_path],
         [command_path("find"), f"{settings.data_root}/logs", "-type", "d", "-exec", command_path("chmod"), "755", "{}", "+"],
         [command_path("find"), f"{settings.data_root}/logs", "-type", "f", "-exec", command_path("chmod"), "644", "{}", "+"],
     ]
@@ -170,10 +171,21 @@ def build_permission_commands(account_name: str, home_path: str, settings: Setti
     if command_exists("setfacl"):
         commands.extend(
             [
-                [setfacl, "-R", "-m", f"u:{account_name}:rwx", home_path],
-                [setfacl, "-R", "-m", f"u:{settings.main_linux_user}:rwx", home_path],
-                [command_path("find"), home_path, "-type", "d", "-exec", setfacl, "-d", "-m", f"u:{account_name}:rwx", "{}", "+"],
-                [command_path("find"), home_path, "-type", "d", "-exec", setfacl, "-d", "-m", f"u:{settings.main_linux_user}:rwx", "{}", "+"],
+                # 主账号和目录用户需要双向写入；other 关闭，避免不同子账号互相操作文件。
+                [setfacl, "-R", "-m", f"u:{account_name}:rwX,u:{settings.main_linux_user}:rwX,m::rwx,o::---", home_path],
+                [
+                    command_path("find"),
+                    home_path,
+                    "-type",
+                    "d",
+                    "-exec",
+                    setfacl,
+                    "-d",
+                    "-m",
+                    f"u:{account_name}:rwx,u:{settings.main_linux_user}:rwx,g::---,m::rwx,o::---",
+                    "{}",
+                    "+",
+                ],
                 [setfacl, "-R", "-m", "o::rX", f"{settings.data_root}/logs"],
                 [command_path("find"), f"{settings.data_root}/logs", "-type", "d", "-exec", setfacl, "-d", "-m", "o::rX", "{}", "+"],
             ]

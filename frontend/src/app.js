@@ -2387,6 +2387,7 @@ function renderTasks() {
 }
 
 function renderTaskZoneTable(tasks) {
+  const preserveKey = `task-list-${state.taskZone}`;
   const headers = ["", "状态", "任务ID", "环境", "路径", "命令", "节点", "GPU数", "GPU型号", "前驱", "紧急", "复用", "所有人", "时间"];
   const rows = tasks.map((task) => {
     const selected = state.selectedTaskId === task.task_id;
@@ -2409,7 +2410,7 @@ function renderTaskZoneTable(tasks) {
     return `<tr class="task-row ${selected ? "selected" : ""}" data-task-row="${escapeAttr(task.task_id)}" title="双击查看日志">${cells.map((cell) => `<td>${cell}</td>`).join("")}</tr>`;
   });
   return `
-    <div class="table-wrap">
+    <div class="table-wrap" data-preserve-scroll="${escapeAttr(preserveKey)}">
       <table>
         <thead><tr>${headers.map((header) => `<th>${header}</th>`).join("")}</tr></thead>
         <tbody>${rows.join("")}</tbody>

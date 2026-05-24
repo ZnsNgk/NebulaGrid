@@ -23,7 +23,6 @@ from app.services.linux_account_service import (
     create_child_account,
     delete_child_account,
     ensure_child_account,
-    ensure_managed_home_directory,
     home_path_for_user,
     linux_account_for_role,
     set_child_account_password,
@@ -108,7 +107,6 @@ def create_user(user: UserRecord, payload: UserCreateRequest) -> UserInfo:
             account_plan = create_child_account(model.username, model.id, model.role, password=payload.password)
             model.home_path = account_plan.home_path
             model.linux_account_name = account_plan.account_name
-            ensure_managed_home_directory(model.home_path)
         for supervisor_id in supervisor_ids:
             db.add(UserSupervisor(student_id=model.id, supervisor_id=supervisor_id))
         db.commit()
@@ -387,8 +385,7 @@ def ensure_existing_user_linux_accounts() -> int:
                     account_plan = ensure_child_account(model.username, model.role)
                     model.home_path = account_plan.home_path
                     model.linux_account_name = account_plan.account_name
-                    if ensure_managed_home_directory(model.home_path):
-                        created_or_existing += 1
+                    created_or_existing += 1
                 db.commit()
             except Exception:
                 # 历史用户可能存在不符合 Linux 用户名规则的账号，或部署机 sudoers 尚未放开 useradd/chpasswd。
