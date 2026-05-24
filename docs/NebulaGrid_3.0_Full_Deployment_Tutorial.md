@@ -1305,6 +1305,9 @@ sudo smbclient //127.0.0.1/test1 -U test1
 
 调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略选择资源。任务未指定节点时，候选节点按“用户自有节点 → 组内共享节点 → 组内他人公开共享的私有节点 → 其他公开节点”的顺序尝试；同一档内部按节点 ID 保持稳定顺序。只指定 GPU 型号时，系统只往所有可见候选节点中满足该型号的 GPU 上分配；只指定节点时，系统只在该节点内选择任意可调度 GPU；两者同时指定时，系统只在指定节点内选择指定型号的 GPU。每轮调度最多成功分配一个任务，并在下一轮开始时清理终态任务的未释放 allocation，避免同一张独占 GPU 在同一轮内被重复占用。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
 
+管理员后台的“强制下线”会立即把目标节点标记为 `offline` 并关闭调度。对于该节点上仍持有未释放 allocation 的运行任务，后端会按远端进程组执行 TERM/KILL、把任务置为 `cancelled`，并释放该节点所有未释放 GPU 调度占用；审计日志会记录受影响任务和释放数量。
+强制下线后的节点不会继续被节点监控 worker 自动 SSH 探测，也不会自动恢复为 `online`；维护完成后需要在节点管理里点击“重连”，下一轮监控成功才会重新上线。
+
 任务日志默认位于 `/home/ddltm/data/logs/task_logs/<task_id>.log`；历史区默认加载最近 100 条可见任务，用户点击“查看所有历史任务”后才会加载全部可见历史任务，避免长时间运行后一次性拉取过多记录。
 
 Runtime Guard 已经以 `task_runtime_guards` 为入口追踪运行任务。执行器启动远端 runner 后会记录 root PID 和进程组，守护进程通过 SSH 展开 PID 树，再读取 `nvidia-smi --query-compute-apps` 返回的 GPU UUID。GPU UUID 是越权判断依据，GPU index 只用于页面展示和 `CUDA_VISIBLE_DEVICES`。连续两轮发现任务使用未分配 GPU 后，系统会终止远端进程组、标记 `alloc_error`、释放 allocation，并把原因写入任务日志和 `task_events`。

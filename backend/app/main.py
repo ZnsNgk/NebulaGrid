@@ -1,4 +1,5 @@
 import logging
+import threading
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -51,14 +52,39 @@ def register_startup_tasks(app: FastAPI) -> None:
 
     @app.on_event("startup")
     def initialize_database_on_startup() -> None:
-        """执行幂等数据库初始化，并补齐历史用户的文件根目录。"""
+        """同步完成登录必需的数据库初始化，再异步执行可延后的启动维护。"""
         init_database()
-        mark_interrupted_file_jobs()
-        try:
-            ensure_existing_user_linux_accounts()
-        except Exception:
-            # Linux 子账户补齐依赖系统命令和 sudoers；部署遗漏时记录错误但不阻断 API 启动。
-            logger.exception("failed to reconcile Linux accounts on startup")
+        start_post_startup_maintenance(app)
+
+    def start_post_startup_maintenance(app: FastAPI) -> None:
+        """后台执行慢维护任务，避免 API lifespan 被 sudo、NFS 或历史数据修复长时间阻塞。
+
+        Nginx 在 FastAPI startup 尚未结束时无法代理到 API，会向登录页返回 502。
+        数据库结构和默认管理员必须同步准备好；中断文件任务清理和历史 Linux 账户补齐
+        可以在服务开始接收请求后执行，以缩短刚启动时的不可用窗口。
+        """
+
+        def run_maintenance() -> None:
+            try:
+                interrupted_jobs = mark_interrupted_file_jobs()
+                logger.info("marked %s interrupted file jobs on startup", interrupted_jobs)
+            except Exception:
+                logger.exception("failed to mark interrupted file jobs on startup")
+
+            try:
+                reconciled_accounts = ensure_existing_user_linux_accounts()
+                logger.info("reconciled %s existing Linux accounts on startup", reconciled_accounts)
+            except Exception:
+                # Linux 子账户补齐依赖系统命令和 sudoers；部署遗漏时记录错误但不阻断 API 启动。
+                logger.exception("failed to reconcile Linux accounts on startup")
+
+        thread = threading.Thread(
+            target=run_maintenance,
+            name="nebulagrid-startup-maintenance",
+            daemon=True,
+        )
+        app.state.startup_maintenance_thread = thread
+        thread.start()
 
     @app.on_event("shutdown")
     def shutdown_file_executor_on_stop() -> None:

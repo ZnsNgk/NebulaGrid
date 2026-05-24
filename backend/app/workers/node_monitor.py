@@ -30,7 +30,7 @@ def node_monitor_tick() -> None:
 
 def monitor_node(db: Session, node: Node, remote_code_root: str, miniconda_python: str) -> None:
     """监控单个节点，SSH 失败时只标记离线，避免中断整轮采集。"""
-    if node.state == "manual_offline":
+    if node_monitor_paused(node):
         return
     try:
         payload = fetch_remote_metrics(node, remote_code_root, miniconda_python)
@@ -99,6 +99,11 @@ def sync_gpu_inventory(db: Session, node: Node, gpus: Any, probe_ok: bool = True
                 node.gpus.remove(gpu)
             db.delete(gpu)
     return metric_rows
+
+
+def node_monitor_paused(node: Node) -> bool:
+    """管理员隔离的离线节点不再自动 SSH 探测，避免强制下线后被下一轮监控重新拉回 online。"""
+    return node.state == "manual_offline" or (node.state == "offline" and not node.scheduling_enabled)
 
 
 def coerce_int(value: Any) -> int:

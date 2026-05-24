@@ -1,3 +1,5 @@
+import subprocess
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -5,7 +7,19 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.errors import not_found, validation_error
 from app.core.rbac import Role
 from app.core.rbac import require_permission
-from app.db.models import EnvInstallJob, Gpu, Node, TaskAllocation, TaskRequirement, TaskRuntimeGuard, User, UserSupervisor
+from app.core.time_utils import local_datetime
+from app.db.models import (
+    EnvInstallJob,
+    Gpu,
+    Node,
+    Task,
+    TaskAllocation,
+    TaskEvent,
+    TaskRequirement,
+    TaskRuntimeGuard,
+    User,
+    UserSupervisor,
+)
 from app.schemas.nodes import GpuInfo, NodeCreateRequest, NodeInfo, NodeUpdateRequest
 from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
@@ -125,14 +139,126 @@ def reconnect_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
 
 
 def force_offline_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
-    """强制节点离线并关闭调度开关，监控器不会自动打开手动下线节点。"""
+    """强制节点离线、关闭调度，并中止该节点上仍持有调度占用的运行任务。"""
     require_permission(user.role, "nodes:write")
     node = require_node_model(node_id, db)
-    node.state = "manual_offline"
+    interrupted = interrupt_node_tasks(node, user.id, db)
+    node.state = "offline"
     node.scheduling_enabled = False
     db.commit()
-    record_audit(user.id, "node.force_offline", "node", str(node.id))
-    return build_node_info(node, load_latest_metrics([node]))
+    record_audit(user.id, "node.force_offline", "node", str(node.id), detail_json=interrupted)
+    return build_node_info(node, load_latest_metrics([node]), load_occupied_gpu_ids([node], db))
+
+
+def interrupt_node_tasks(node: Node, actor_user_id: int, db: Session) -> dict[str, object]:
+    """强制下线是节点级隔离动作：先终止该节点上的运行任务，再释放所有未释放调度占用。"""
+    open_allocations = db.scalars(
+        select(TaskAllocation)
+        .where(TaskAllocation.node_id == node.id)
+        .where(TaskAllocation.released_at.is_(None))
+        .order_by(TaskAllocation.id)
+    ).all()
+    if not open_allocations:
+        return {"interrupted_task_ids": [], "released_allocations": 0, "termination_errors": []}
+
+    now = local_datetime()
+    task_ids = sorted({allocation.task_id for allocation in open_allocations})
+    tasks = db.scalars(select(Task).where(Task.id.in_(task_ids))).all()
+    tasks_by_id = {task.id: task for task in tasks}
+    guards = db.scalars(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id.in_(task_ids))).all()
+    guards_by_task_id = {guard.task_id: guard for guard in guards}
+    interrupted_task_ids: list[str] = []
+    termination_errors: list[dict[str, str]] = []
+
+    for task in tasks:
+        if task.state in {"starting", "running", "dispatching", "preparing"}:
+            guard = guards_by_task_id.get(task.id)
+            if guard is not None and (guard.process_group_id is not None or guard.root_pid is not None):
+                try:
+                    terminate_guard_process(node, guard)
+                    guard.state = "cancelled"
+                except Exception as exc:  # noqa: BLE001 - 节点下线必须落库，远端回收失败通过事件和审计暴露。
+                    guard.state = "cancel_failed"
+                    termination_errors.append({"task_id": task.task_id, "error": str(exc)})
+            task.state = "cancelled"
+            task.on_hold = False
+            task.finished_at = now
+            task.last_block_reason = "节点被管理员强制下线"
+            interrupted_task_ids.append(task.task_id)
+            add_node_force_offline_task_event(db, task, actor_user_id, node, guard)
+
+    for allocation in open_allocations:
+        allocation.released_at = now
+        task = tasks_by_id.get(allocation.task_id)
+        if task is not None and task.task_id not in interrupted_task_ids:
+            db.add(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="allocation_released",
+                    message="节点强制下线已释放该任务的调度占用",
+                    actor_user_id=actor_user_id,
+                    detail_json={"node_id": node.id, "node_name": node.name, "allocation_id": allocation.id},
+                )
+            )
+
+    return {
+        "interrupted_task_ids": interrupted_task_ids,
+        "released_allocations": len(open_allocations),
+        "termination_errors": termination_errors,
+    }
+
+
+def terminate_guard_process(node: Node, guard: TaskRuntimeGuard) -> None:
+    """按进程组优先终止远端任务；TERM 后补 KILL，降低 GPU 继续被占用的时间窗口。"""
+    target = guard.process_group_id or guard.root_pid
+    if target is None:
+        return
+    pid = int(target)
+    command = (
+        f"kill -TERM -{pid} 2>/dev/null || kill -TERM {pid} 2>/dev/null || true; "
+        "sleep 1; "
+        f"kill -KILL -{pid} 2>/dev/null || kill -KILL {pid} 2>/dev/null || true"
+    )
+    subprocess.check_output(build_ssh_command(node, command), text=True, stderr=subprocess.STDOUT, timeout=10)
+
+
+def build_ssh_command(node: Node, remote_command: str) -> list[str]:
+    """构造节点强制下线使用的 SSH 命令，统一保持非交互和短超时边界。"""
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"{node.ssh_user}@{node.ip}",
+        remote_command,
+    ]
+
+
+def add_node_force_offline_task_event(
+    db: Session,
+    task: Task,
+    actor_user_id: int,
+    node: Node,
+    guard: TaskRuntimeGuard | None,
+) -> None:
+    """记录任务被节点强制下线中止的原因，便于用户区分主动取消和节点隔离。"""
+    db.add(
+        TaskEvent(
+            task_id=task.id,
+            event_type="cancelled",
+            message="节点被管理员强制下线，任务已中止",
+            actor_user_id=actor_user_id,
+            detail_json={
+                "node_id": node.id,
+                "node_name": node.name,
+                "root_pid": guard.root_pid if guard else None,
+                "process_group_id": guard.process_group_id if guard else None,
+            },
+        )
+    )
 
 
 def require_node(node_id: int, db: Session) -> NodeInfo:

@@ -84,6 +84,7 @@ const FILE_JOB_REFRESH_MS = 2000;
 const TASK_LOG_TAIL_BYTES = "200KB";
 const TASK_LOG_TAIL_LINES = 200;
 const PRESENTER_HISTORY_OPTIONS = [1, 3, 6, 12, 24];
+const gatewayErrorStatuses = new Set([502, 503, 504]);
 
 const authExpiredMessages = new Set([
   "invalid token",
@@ -273,7 +274,12 @@ async function api(path, options = {}) {
   if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
   headers["X-NG-Device-Id"] = state.deviceId;
   if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  const response = await fetch(`${state.apiBase.replace(/\/$/, "")}${path}`, { ...options, headers });
+  let response;
+  try {
+    response = await fetch(`${state.apiBase.replace(/\/$/, "")}${path}`, { ...options, headers });
+  } catch (error) {
+    throw new Error(normalizeNetworkError(error));
+  }
   const type = response.headers.get("content-type") || "";
   const payload = type.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
@@ -288,18 +294,49 @@ async function api(path, options = {}) {
 }
 
 function normalizeHttpError(status, message) {
+  if (gatewayErrorStatuses.has(status)) {
+    return "后端 API 正在启动或暂时不可达，请稍后再登录；如果持续出现，请检查 nebulagrid-api 服务和 nginx 反向代理。";
+  }
   if (status === 413) {
     return "上传文件过大：请通过scp上传。";
+  }
+  if (isHtmlErrorPage(message)) {
+    return `后端服务返回 HTTP ${status}，请稍后重试或检查服务日志。`;
   }
   return normalizeErrorMessage(message);
 }
 
 function normalizeErrorMessage(message) {
   const text = String(message || "操作失败").trim();
+  if (isNetworkErrorText(text)) {
+    return "无法连接后端 API，请确认服务已启动且 API 地址正确。";
+  }
+  if (isHtmlErrorPage(text)) {
+    return "后端服务暂时不可用，请稍后重试或检查 nginx/API 服务状态。";
+  }
   if (text.includes("413 Request Entity Too Large")) {
     return "上传文件过大：请通过scp上传。";
   }
   return errorMessageMap[text] || text;
+}
+
+function normalizeNetworkError(error) {
+  // 浏览器在 API 进程未监听端口、地址填错或跨域被拦截时只暴露 TypeError，这里统一给出可排查的中文提示。
+  const message = error?.message || "";
+  if (isNetworkErrorText(message)) {
+    return "无法连接后端 API，请确认服务已启动且 API 地址正确。";
+  }
+  return normalizeErrorMessage(message);
+}
+
+function isNetworkErrorText(message) {
+  return /failed to fetch|networkerror|load failed|fetch/i.test(String(message || ""));
+}
+
+function isHtmlErrorPage(message) {
+  // nginx 的 502/503 默认响应是 HTML；登录页只需要展示故障含义，不应暴露整页网关错误源码。
+  const text = String(message || "").trim().toLowerCase();
+  return text.startsWith("<!doctype html") || text.startsWith("<html") || (text.includes("<html") && text.includes("</html>"));
 }
 
 function extractValidationMessage(payload) {

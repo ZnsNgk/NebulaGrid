@@ -995,6 +995,8 @@ proc = subprocess.Popen(
 
 不要只关闭 SSH 连接，因为关闭 SSH 不等于远端 Python 训练进程一定退出。
 
+管理员强制下线节点时复用同一进程回收原则，但触发点在 NodeService：先按该节点未释放 allocation 找到 `dispatching/starting/running/preparing` 任务，优先按进程组执行 TERM/KILL，然后把任务标记为 `cancelled`，最后释放该节点全部未释放 allocation。节点本身必须写为 `offline` 且关闭 `scheduling_enabled`，审计详情记录受影响任务、释放的 allocation 数量和远端回收失败信息。
+
 ### 10.4 master 重启后的任务恢复
 
 master 启动时应执行恢复扫描：
@@ -1261,6 +1263,9 @@ MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在
 4. 释放 allocation；
 5. 写入事件和审计；
 6. 前端提示用户任务因节点掉线中止。
+
+如果 offline 来源是管理员强制下线，则不等待恢复扫描：服务层立即终止该节点运行任务、释放该节点所有未释放 allocation，并通过 `node.force_offline` 审计动作保存影响范围。这样可以避免已下线节点上的 GPU 继续显示为平台调度占用。
+节点监控器遇到 `offline` 且 `scheduling_enabled=false` 的节点时应直接跳过 SSH 探测，直到管理员点击“重连”把节点改为 `reconnecting`。这样强制下线节点不会被下一轮监控自动写回 `online`，也不会因为不可达 SSH 拖慢整轮节点监控。
 
 ---
 

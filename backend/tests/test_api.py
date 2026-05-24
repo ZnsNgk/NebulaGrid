@@ -9,10 +9,10 @@ from app.core.config import get_settings
 from app.core.time_utils import local_datetime
 from app.services.auth_service import hash_session_token
 from app.services.metrics_service import parse_flux_csv
-from app.db.models import LoginSession, Node, Setting, Task, TaskAllocation
+from app.db.models import LoginSession, Node, Setting, Task, TaskAllocation, TaskRuntimeGuard
 from app.db.session import SessionLocal
 from app.main import create_app
-from app.workers.node_monitor import sync_gpu_inventory
+from app.workers.node_monitor import monitor_node, node_monitor_paused, sync_gpu_inventory
 from app.workers.runtime_guard import expand_pid_tree, parse_gpu_apps, parse_process_table
 from app.workers.scheduler import scheduler_tick
 
@@ -211,6 +211,26 @@ def test_monitor_applies_admin_gpu_schedulable_flags() -> None:
     assert [gpu["schedulable"] for gpu in node["gpus"]] == [True, False]
 
 
+def test_monitor_skips_admin_offline_node_until_reconnect(monkeypatch) -> None:
+    """验证强制下线后的 offline 节点不会被监控轮询自动拉回 online。"""
+    node = Node(name="paused-node", ip="10.0.0.36", ssh_user="ddltm", state="offline", scheduling_enabled=False)
+    calls: list[str] = []
+
+    def fake_fetch_remote_metrics(*args, **kwargs):
+        """如果监控暂停生效，这个 SSH 探测替身不应被调用。"""
+        calls.append("called")
+        return {}
+
+    monkeypatch.setattr("app.workers.node_monitor.fetch_remote_metrics", fake_fetch_remote_metrics)
+
+    monitor_node(None, node, "/remote", "/python")
+
+    assert node_monitor_paused(node) is True
+    assert node.state == "offline"
+    assert node.scheduling_enabled is False
+    assert calls == []
+
+
 def test_scheduler_schedules_one_exclusive_task_per_tick() -> None:
     """验证一轮调度只成功分配一个任务，避免同一张独占 GPU 在同一事务里被重复占用。"""
     client = make_client()
@@ -271,6 +291,97 @@ def test_scheduler_schedules_one_exclusive_task_per_tick() -> None:
 
     assert sorted(states.values()) == ["dispatching", "wait"]
     assert sum(1 for allocation in allocations if allocation.gpu_ids) == 1
+
+
+def test_force_offline_node_cancels_running_tasks_and_releases_gpu(monkeypatch) -> None:
+    """验证管理员强制下线节点会中止运行任务，并立即释放该节点 GPU 调度占用。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    node_id = client.post(
+        "/api/admin/nodes",
+        headers=headers,
+        json={"name": f"node-force-offline-{uuid4().hex[:8]}", "ip": "10.0.0.35", "gpu_schedulable_flags": [1]},
+    ).json()["data"]["id"]
+
+    with SessionLocal() as db:
+        db.merge(Setting(key="scheduler.enabled", value="true"))
+        node = db.get(Node, node_id)
+        assert node is not None
+        node.state = "online"
+        node.scheduling_enabled = True
+        sync_gpu_inventory(
+            db,
+            node,
+            [{"index": 0, "uuid": f"GPU-force-{node_id}", "name": "RTX 4090", "memory_total_mb": 24576}],
+        )
+        db.commit()
+
+    task_response = client.post(
+        "/api/tasks",
+        headers=headers,
+        json={
+            "description": "force-offline-running",
+            "workdir": "/",
+            "command": "python train.py",
+            "urgent": True,
+            "requirement": {"need_gpus": 1, "node_id": node_id, "allow_gpu_reuse": False},
+        },
+    )
+    task_id = task_response.json()["data"]["task_id"]
+
+    with SessionLocal() as db:
+        db.query(Task).filter(Task.state == "wait").filter(Task.task_id != task_id).update(
+            {Task.state: "on_hold", Task.on_hold: True},
+            synchronize_session=False,
+        )
+        db.commit()
+
+    scheduler_tick()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+        assert guard is not None
+        task.state = "running"
+        guard.root_pid = 4321
+        guard.process_group_id = 4321
+        guard.state = "running"
+        db.commit()
+
+    ssh_commands: list[list[str]] = []
+
+    def fake_check_output(command, text=True, stderr=None, timeout=None):
+        """记录远端终止命令，避免测试环境真实 SSH 到计算节点。"""
+        ssh_commands.append(list(command))
+        return ""
+
+    monkeypatch.setattr("app.services.node_service.subprocess.check_output", fake_check_output)
+
+    offline_response = client.post(f"/api/admin/nodes/{node_id}/force-offline", headers=headers)
+
+    with SessionLocal() as db:
+        node = db.get(Node, node_id)
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        allocation = db.scalar(select(TaskAllocation).where(TaskAllocation.task_id == task.id))
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+
+    assert offline_response.status_code == 200
+    assert offline_response.json()["data"]["state"] == "offline"
+    assert offline_response.json()["data"]["gpus"][0]["scheduled_occupied"] is False
+    assert node is not None
+    assert node.state == "offline"
+    assert node.scheduling_enabled is False
+    assert task.state == "cancelled"
+    assert task.last_block_reason == "节点被管理员强制下线"
+    assert allocation is not None
+    assert allocation.released_at is not None
+    assert guard is not None
+    assert guard.state == "cancelled"
+    assert ssh_commands
+    assert "kill -KILL -4321" in ssh_commands[0][-1]
 
 
 def test_scheduler_combines_gpu_model_and_node_constraints() -> None:
