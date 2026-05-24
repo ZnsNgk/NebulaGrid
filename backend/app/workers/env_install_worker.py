@@ -115,16 +115,22 @@ def build_remote_install_command(env: Env, job: EnvInstallJob, command: str, env
     """构造远端安装命令，优先使用 env_installer.py；复杂 conda 命令退回 bash 激活执行。"""
     settings = get_settings()
     env_prefix = build_shell_env_prefix(env_vars or {})
+    activation = build_remote_conda_activation(env, settings)
     command_parts = shlex.split(command)
     if command_parts[:4] == ["python", "-m", "pip", "install"] and len(command_parts) == 5 and not job.workdir:
         package_path = shlex.split(command)[-1]
         env_python = f"{env.path.rstrip('/')}/bin/python"
         installer = f"{settings.remote_code_root.rstrip('/')}/env_installer.py"
         installer_command = shlex.join([settings.miniconda_python, installer, "--python", env_python, "--package", package_path, "--log-path", job.log_path])
-        return f"{env_prefix}{installer_command}"
-    activate = Path(settings.miniconda_python).parent / "activate"
+        return f"{activation} && {env_prefix}{installer_command}"
     workdir_prefix = f"cd {shlex.quote(job.workdir)} && " if job.workdir else ""
-    return f"source {shlex.quote(str(activate))} && conda activate {shlex.quote(env.name)} && {workdir_prefix}{env_prefix}{command}"
+    return f"{activation} && {workdir_prefix}{env_prefix}{command}"
+
+
+def build_remote_conda_activation(env: Env, settings) -> str:
+    """先加载远端用户配置再激活目标环境，系统 nvcc 由 .bashrc 中的 PATH 提供。"""
+    activate = Path(settings.miniconda_python).parent / "activate"
+    return f"source ~/.bashrc && source {shlex.quote(str(activate))} && conda activate {shlex.quote(env.name)}"
 
 
 def build_install_env_vars(job: EnvInstallJob, db: Session) -> dict[str, str]:
@@ -162,6 +168,7 @@ def build_shell_env_prefix(env_vars: dict[str, str]) -> str:
 
 def build_ssh_command(node: Node, remote_command: str) -> list[str]:
     """构造批处理 SSH 命令，保持与 task executor 的连接参数一致。"""
+    bash_command = f"bash -lc {shlex.quote(remote_command)}"
     return [
         "ssh",
         "-o",
@@ -171,7 +178,7 @@ def build_ssh_command(node: Node, remote_command: str) -> list[str]:
         "-o",
         "StrictHostKeyChecking=accept-new",
         f"{node.ssh_user}@{node.ip}",
-        remote_command,
+        bash_command,
     ]
 
 

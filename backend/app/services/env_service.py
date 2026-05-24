@@ -309,6 +309,7 @@ def probe_node_compile_target(node) -> EnvCompileTargetInfo:
 
 def build_compile_probe_ssh_command(node) -> list[str]:
     """编译探测复用平台 SSH 连接参数，避免交互式密码阻塞 API 请求。"""
+    remote_command = f"bash -lc {shlex.quote(compile_probe_shell())}"
     return [
         "ssh",
         "-o",
@@ -318,16 +319,22 @@ def build_compile_probe_ssh_command(node) -> list[str]:
         "-o",
         "StrictHostKeyChecking=accept-new",
         f"{node.ssh_user}@{node.ip}",
-        compile_probe_shell(),
+        remote_command,
     ]
 
 
 def compile_probe_shell() -> str:
     """输出稳定的 TSV 探测结果，方便在没有远端 Python 依赖时解析编译器和 GPU。"""
     return r"""
+# 只加载用户 shell 配置，不激活 conda，避免打开编译目标弹窗时额外耗时。
+if [ -f ~/.bashrc ]; then source ~/.bashrc; fi
 for tool in gcc g++ clang nvcc; do
   if command -v "$tool" >/dev/null 2>&1; then
-    version=$("$tool" --version 2>/dev/null | head -n 1)
+    if [ "$tool" = "nvcc" ]; then
+      version=$("$tool" -V 2>/dev/null | grep -m 1 "release" || "$tool" -V 2>/dev/null | head -n 1)
+    else
+      version=$("$tool" --version 2>/dev/null | head -n 1)
+    fi
     printf 'COMPILER\t%s\t%s\n' "$tool" "$version"
   else
     printf 'COMPILER\t%s\t\n' "$tool"
@@ -582,7 +589,7 @@ def build_conda_shell_command(env: EnvInfo, command: str, env_vars: dict[str, st
     """复用 conda activate 方式构造环境内命令，保持与检测逻辑一致。"""
     activate_path = Path(get_settings().miniconda_python).parent / "activate"
     env_prefix = "".join(f"{key}={shlex.quote(value)} " for key, value in (env_vars or {}).items())
-    return f"source {shlex.quote(str(activate_path))} && conda activate {shlex.quote(env.name)} && {env_prefix}{command}"
+    return f"source ~/.bashrc && source {shlex.quote(str(activate_path))} && conda activate {shlex.quote(env.name)} && {env_prefix}{command}"
 
 
 def resolve_required_user_file(user: UserRecord, path: str | None, allowed_suffixes: set[str]) -> Path:
