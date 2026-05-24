@@ -166,13 +166,41 @@ Runtime Guard 重点结果：
 
 | 页面 | 验证内容 | 结果 | 截图 |
 | --- | --- | --- | --- |
-| 登录页 | 页面正常渲染，管理员可登录 | PASS | [frontend_login.png](screenshots/frontend_login.png) |
-| 管理员总览 | 3 节点、7 GPU、GPU 监控卡片显示正常；节点级 CPU/内存/网络显示为 `-` | WARN | [frontend_admin_dashboard.png](screenshots/frontend_admin_dashboard.png) |
-| 任务页 | 添加任务、批量添加、等待区、执行区、历史区入口可见 | PASS | [frontend_tasks.png](screenshots/frontend_tasks.png) |
-| 文件页 | 根目录、上级、刷新、共享文件夹、上传/下载/删除等控件可见 | PASS | [frontend_files.png](screenshots/frontend_files.png) |
-| 环境页 | 环境列表、检测、日志、复制、包管理等控件可见 | PASS | [frontend_envs.png](screenshots/frontend_envs.png) |
-| 管理页 | 总览、节点管理、用户管理、登录管理、系统设置、审计日志入口可见 | PASS | [frontend_admin.png](screenshots/frontend_admin.png) |
-| 展示用户 | 登录后自动进入大屏页，普通导航不可见 | PASS | [frontend_viewer_presenter.png](screenshots/frontend_viewer_presenter.png) |
+| 登录页 | 页面正常渲染，管理员可登录 | PASS | frontend_login |
+| 管理员总览 | 3 节点、7 GPU、GPU 监控卡片显示正常；节点级 CPU/内存/网络显示为 `-` | WARN | frontend_admin_dashboard |
+| 任务页 | 添加任务、批量添加、等待区、执行区、历史区入口可见 | PASS | frontend_tasks |
+| 文件页 | 根目录、上级、刷新、共享文件夹、上传/下载/删除等控件可见 | PASS | frontend_files |
+| 环境页 | 环境列表、检测、日志、复制、包管理等控件可见 | PASS | frontend_envs |
+| 管理页 | 总览、节点管理、用户管理、登录管理、系统设置、审计日志入口可见 | PASS | frontend_admin |
+| 展示用户 | 登录后自动进入大屏页，普通导航不可见 | PASS | frontend_viewer_presenter |
+
+frontend_login：
+
+<img src="/screenshots/frontend_login.png">
+
+frontend_admin_dashboard：
+
+<img src="/screenshots/frontend_admin_dashboard.png">
+
+frontend_tasks：
+
+<img src="/screenshots/frontend_tasks.png">
+
+frontend_files：
+
+<img src="/screenshots/frontend_files.png">
+
+frontend_envs：
+
+<img src="/screenshots/frontend_envs.png">
+
+frontend_admin：
+
+<img src="/screenshots/frontend_admin.png">
+
+frontend_viewer_presenter：
+
+<img src="/screenshots/frontend_viewer_presenter.png">
 
 前端页面已验证的关键行为：
 
