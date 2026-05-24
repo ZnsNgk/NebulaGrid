@@ -17,6 +17,7 @@ _SAMBA_ACCOUNT_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _KNOWN_COMMAND_PATHS = {
     "pdbedit": ("/usr/bin/pdbedit", "/usr/sbin/pdbedit", "/bin/pdbedit", "/sbin/pdbedit"),
     "smbpasswd": ("/usr/bin/smbpasswd", "/usr/sbin/smbpasswd", "/bin/smbpasswd", "/sbin/smbpasswd"),
+    "systemctl": ("/usr/bin/systemctl", "/bin/systemctl"),
 }
 
 
@@ -156,6 +157,8 @@ def run_samba_commands(
 ) -> SambaAccountPlan:
     """按配置执行 Samba 命令；开发环境默认只返回计划，避免误改本机 Samba 数据库。"""
     status = "enabled" if enabled else "disabled"
+    restart_command = samba_restart_command()
+    planned_commands = [*commands, restart_command]
     if not samba_management_enabled(settings) or os.name != "posix":
         return SambaAccountPlan(
             account_name=account_name,
@@ -163,11 +166,11 @@ def run_samba_commands(
             status="pending" if enabled else "disabled",
             status_label=samba_status_label("pending" if enabled else "disabled"),
             executed=False,
-            commands=commands,
+            commands=planned_commands,
             message="Samba 真实管理未启用，命令未执行。",
             updated_at=local_now(),
         )
-    for command in commands:
+    for command in planned_commands:
         try:
             subprocess.run(
                 privileged_command(command),
@@ -193,9 +196,14 @@ def run_samba_commands(
         status=status,
         status_label=samba_status_label(status),
         executed=True,
-        commands=commands,
+        commands=planned_commands,
         updated_at=local_now(),
     )
+
+
+def samba_restart_command() -> list[str]:
+    """账号数据库变更后重启 smbd，让 Windows 客户端尽快看到最新 Samba 账号状态。"""
+    return [command_path("systemctl"), "restart", "smbd"]
 
 
 def samba_password_input(command: list[str], password: str | None) -> str | None:

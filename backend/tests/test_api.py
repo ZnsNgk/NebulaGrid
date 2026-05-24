@@ -354,6 +354,43 @@ def test_main_linux_account_cannot_enable_samba() -> None:
     assert status_response.json()["data"]["samba_status"] == "disabled"
 
 
+def test_samba_account_change_restarts_smbd(monkeypatch) -> None:
+    """验证真实 Samba 账号变更后会自动重启 smbd，让 Windows 共享立即读取最新账号状态。"""
+    from app.core.config import Settings
+    from app.services import samba_service
+
+    calls: list[tuple[list[str], str | None]] = []
+
+    def fake_run(command, input=None, text=True, check=True, capture_output=True):
+        """记录外部命令调用，避免测试环境真实执行 smbpasswd 或 systemctl。"""
+        calls.append((list(command), input))
+
+    monkeypatch.setattr(samba_service.os, "name", "posix")
+    monkeypatch.setattr(samba_service, "samba_management_enabled", lambda settings: True)
+    monkeypatch.setattr(samba_service, "privileged_command", lambda command: command)
+    monkeypatch.setattr(samba_service.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        samba_service,
+        "command_path",
+        lambda name: {("smbpasswd"): "/usr/bin/smbpasswd", ("systemctl"): "/bin/systemctl"}.get(name, name),
+    )
+
+    plan = samba_service.run_samba_commands(
+        "samba-student",
+        True,
+        [["/usr/bin/smbpasswd", "-s", "-a", "samba-student"]],
+        Settings(manage_samba_accounts=True),
+        password="student123",
+    )
+
+    assert plan.executed is True
+    assert plan.commands[-1] == ["/bin/systemctl", "restart", "smbd"]
+    assert calls == [
+        (["/usr/bin/smbpasswd", "-s", "-a", "samba-student"], "student123\nstudent123\n"),
+        (["/bin/systemctl", "restart", "smbd"], None),
+    ]
+
+
 def test_samba_password_syncs_when_enabled_user_password_changes(monkeypatch) -> None:
     """验证已开启 Samba 的用户在自助改密和管理员重置密码时都会同步 SMB 密码。"""
     calls: list[tuple[str, str, bool]] = []

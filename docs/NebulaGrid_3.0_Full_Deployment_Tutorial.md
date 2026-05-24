@@ -1195,12 +1195,12 @@ sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
 写入：
 
 ```text
-ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /usr/bin/smbpasswd, /usr/bin/pdbedit, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
+ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /usr/bin/smbpasswd, /usr/bin/pdbedit, /usr/bin/systemctl restart smbd, /bin/systemctl restart smbd, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
 ```
 
 这样平台创建用户时会创建同名 Linux 账户，用户可用平台用户名和密码 SSH 到 master，并默认进入 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。用户在 Web 修改密码或管理员重置密码时，会同步执行 `chpasswd`；删除平台用户时会同步执行 `userdel --remove`。所有用户目录按实验室共享策略设置为 `755`，便于互相读取和拷贝文件。
 
-主节点还需要配置 Samba 的 `homes` 动态共享；计算节点不需要安装 Samba。用户在账号管理页当前账号卡片中手动勾选 Samba 服务后，系统才会创建或启用同名 Samba 账号，新建用户默认关闭。开启时用户需要输入当前密码，后端会先确保同名 Linux 子账户存在，再用它初始化 Samba 密码；后续用户改密或管理员重置密码时，已开启 Samba 的账号会同步更新 `smbpasswd`。
+主节点还需要配置 Samba 的 `homes` 动态共享；计算节点不需要安装 Samba。用户在账号管理页当前账号卡片中手动勾选 Samba 服务后，系统才会创建或启用同名 Samba 账号，新建用户默认关闭。开启时用户需要输入当前密码，后端会先确保同名 Linux 子账户存在，再用它初始化 Samba 密码；后续用户改密或管理员重置密码时，已开启 Samba 的账号会同步更新 `smbpasswd`。每次真实执行 Samba 账号变更后，后端会自动执行 `systemctl restart smbd`，让 Windows 共享尽快读取最新账号状态。
 
 `[homes]` 必须显式绑定到 `/home/ddltm/data/user/%S`。不要把主账户 `ddltm` 的 home `/home/ddltm` 作为 Samba 共享根，否则任何拿到旧公共账号的人都可能通过 Windows 文件共享看到主目录。
 
@@ -1235,7 +1235,7 @@ sudo smbpasswd -d ddltm || true
 
 同时检查 `/etc/samba/smb.conf` 中不要保留 `[ddltm]`、`[data]`、`[shared]` 或其他 `path = /home/ddltm`、`path = /home/ddltm/data` 这类宽范围共享段落。NebulaGrid 只需要 `[homes]` 暴露个人目录；共享文件夹仍建议走 Web 文件管理的“共享文件夹”视图。
 
-如果 `command -v smbpasswd` 或 `command -v pdbedit` 返回的不是 `/usr/bin/...`，需要把 sudoers 中的路径改成现场真实路径。验证授权时不要使用真实用户密码，可创建临时探针账号。
+如果 `command -v smbpasswd`、`command -v pdbedit` 或 `command -v systemctl` 返回的不是文档中的路径，需要把 sudoers 中的路径改成现场真实路径。验证授权时不要使用真实用户密码，可创建临时探针账号。
 
 保存后，用 API 运行用户验证 `sudo -n` 是否能无交互执行。下面以 `ddltm` 为例：
 
@@ -1246,14 +1246,55 @@ sudo -u ddltm sudo -n /usr/bin/chown -R nebulagrid_sudo_probe:nebulagrid_sudo_pr
 sudo -u ddltm sudo -n /usr/bin/pdbedit -L
 printf 'temporary-password\ntemporary-password\n' | sudo -u ddltm sudo -n /usr/bin/smbpasswd -s -a nebulagrid_sudo_probe
 sudo -u ddltm sudo -n /usr/bin/smbpasswd -x nebulagrid_sudo_probe
+sudo -u ddltm sudo -n /usr/bin/systemctl restart smbd
 sudo -u ddltm sudo -n /usr/sbin/userdel --remove nebulagrid_sudo_probe
 sudo systemctl restart nebulagrid-api
 sudo systemctl reload nginx
 ```
 
-上面的 `nebulagrid_sudo_probe` 只用于验证 sudoers 是否真的允许 API 需要的账户命令。因为 sudoers 会严格匹配命令绝对路径，所以如果这里出现 `interactive authentication is required`、`a password is required` 或 `not allowed to execute`，先修正 `/etc/sudoers.d/nebulagrid-ddltm`，不要只测试 `sudo useradd` 这种相对命令。
+上面的 `nebulagrid_sudo_probe` 只用于验证 sudoers 是否真的允许 API 需要的账户命令。因为 sudoers 会严格匹配命令绝对路径，所以如果这里出现 `interactive authentication is required`、`a password is required` 或 `not allowed to execute`，先修正 `/etc/sudoers.d/nebulagrid-ddltm`，不要只测试 `sudo useradd` 这种相对命令。如果 `command -v systemctl` 返回 `/bin/systemctl`，验证命令和 sudoers 中的 smbd 重启路径也要使用 `/bin/systemctl restart smbd`。
 
-如果 Samba 状态在页面显示“失败”，优先检查 `journalctl -u nebulagrid-api`、`journalctl -u smbd`、`testparm` 和 sudoers 路径。Samba 协议只暴露主节点上的用户目录，不替代 NFS；NFS 仍然负责 master 与计算节点之间的训练数据和日志共享。
+用户在 Windows 资源管理器中不能只访问主节点根路径，例如 `\\10.16.20.253`；`[homes]` 使用 `browseable = no`，服务器根路径不会列出每个用户目录。用户应访问自己的共享名：
+
+```text
+\\<master-ip>\<user_name>
+```
+
+例如用户 `test1` 应访问：
+
+```text
+\\10.16.20.253\test1
+```
+
+登录时用户名填写平台用户名 `test1`，密码填写该用户在账号管理页开启 Samba 时输入的当前密码。如果 Windows 缓存过旧账号或错误密码，先在 Windows CMD 中清理缓存后再连接：
+
+```bat
+net use \\10.16.20.253\test1 /delete /y
+net use * /delete /y
+cmdkey /delete:10.16.20.253
+net use \\10.16.20.253\test1 /user:test1 *
+```
+
+如果 Windows 提示“无法访问”或“检查名称的拼写”，先从端口、服务、账号和共享名四层排查。Windows 侧确认 445 端口可达：
+
+```powershell
+Test-NetConnection 10.16.20.253 -Port 445
+```
+
+主节点侧确认 `smbd` 监听、Linux 子账户存在、Samba 账号存在、`[homes]` 生效，并直接从本机访问同名共享：
+
+```bash
+id test1
+sudo pdbedit -L | grep '^test1:'
+sudo ss -lntp | grep ':445'
+sudo testparm -s | grep -A15 '^\[homes\]'
+sudo smbclient -L //127.0.0.1 -U test1
+sudo smbclient //127.0.0.1/test1 -U test1
+```
+
+排查结论按输出判断：`id test1` 失败说明 Linux 子账户未创建；`pdbedit -L` 没有 `test1` 说明 Samba 账号未创建；`ss` 没有 `:445` 说明 `smbd` 未监听；本机 `smbclient //127.0.0.1/test1 -U test1` 失败说明 Samba 配置、账号或目录权限仍有问题；本机 `smbclient` 成功而 Windows 不成功时，优先检查 Windows 凭据缓存、防火墙和 445 端口。
+
+如果 Samba 状态在页面显示“失败”，优先检查 `journalctl -u nebulagrid-api`、`journalctl -u smbd`、`testparm`、`sudo smbclient //127.0.0.1/<user_name> -U <user_name>` 和 sudoers 路径。Samba 协议只暴露主节点上的用户目录，不替代 NFS；NFS 仍然负责 master 与计算节点之间的训练数据和日志共享。
 
 文件管理页面提供“共享文件夹”视图，所有登录用户都可以查看 `NEBULAGRID_SHARED_FOLDER_ROOT` 指向的共享 SSD 目录。默认部署路径为 `/home/ddltm/shared`；如果现场用 `~/ddltm/shared` 这类写法，请在写入 `backend.env` 前先展开成 API 运行用户实际看到的绝对路径，避免 systemd 环境中 `~` 指向不同 home。用户可把个人目录中的文件或文件夹复制到共享文件夹，也可在共享文件夹中把文件或文件夹复制回自己的目录；新建、删除、重命名、上传、打包和解压仍限定在个人文件视图内，避免共享根被误操作。
 
