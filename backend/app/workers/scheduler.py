@@ -11,7 +11,12 @@ from app.db.models import Gpu, Node, Setting, Task, TaskAllocation, TaskDependen
 from app.db.session import SessionLocal
 from app.services.auth_service import user_model_to_record
 from app.services.metrics_service import LatestMetrics, get_latest_metrics
-from app.services.node_service import can_user_access_node, is_control_plane_node
+from app.services.node_service import (
+    can_user_access_node,
+    is_control_plane_node,
+    load_group_shared_user_ids,
+    normalize_owner_ids,
+)
 from app.services.task_service import TERMINAL_STATES, add_task_event
 
 logger = logging.getLogger(__name__)
@@ -29,6 +34,7 @@ def scheduler_tick() -> None:
         if not acquire_scheduler_lock(db):
             logger.info("scheduler tick skipped because another instance holds the DB lock")
             return
+        released = release_terminal_allocations(db)
         waiting_tasks = db.scalars(
             select(Task)
             .options(selectinload(Task.requirement))
@@ -41,8 +47,15 @@ def scheduler_tick() -> None:
         for task in waiting_tasks:
             if try_schedule_task(db, task):
                 scheduled += 1
+                # 每轮最多成功分配一个任务，确保下一轮基于已提交的 allocation 重新计算占用。
+                break
         db.commit()
-        logger.info("scheduler observed %s waiting tasks, scheduled %s", len(waiting_tasks), scheduled)
+        logger.info(
+            "scheduler released %s terminal allocations, observed %s waiting tasks, scheduled %s",
+            released,
+            len(waiting_tasks),
+            scheduled,
+        )
 
 
 def acquire_scheduler_lock(db: Session) -> bool:
@@ -123,7 +136,7 @@ def dependency_satisfied(db: Session, task: Task) -> bool:
 
 
 def visible_schedulable_nodes(db: Session, user, requested_node_id: int | None) -> list[Node]:
-    """按节点可见性、在线状态和调度开关筛出候选节点。"""
+    """按节点可见性、在线状态、调度开关和用户资源优先级筛出候选节点。"""
     nodes = db.scalars(select(Node).options(selectinload(Node.gpus)).order_by(Node.id)).all()
     candidates: list[Node] = []
     for node in nodes:
@@ -136,7 +149,22 @@ def visible_schedulable_nodes(db: Session, user, requested_node_id: int | None) 
         if user.role.value != "admin" and not can_user_access_node(user, node, db):
             continue
         candidates.append(node)
-    return candidates
+    return sorted(candidates, key=lambda node: (node_schedule_priority(db, user, node), node.id))
+
+
+def node_schedule_priority(db: Session, user, node: Node) -> int:
+    """给候选节点排序：自有节点、组内共享、组内他人公开私有节点、公开节点。"""
+    owner_ids = normalize_owner_ids(node)
+    if user.id in owner_ids:
+        return 0
+    sharing_scope = getattr(node, "sharing_scope", None) or ("public" if node.is_public else "none")
+    access_scope = getattr(node, "access_scope", None) or ("public" if node.is_public else "private")
+    group_visible = bool(owner_ids) and user.id in load_group_shared_user_ids(owner_ids, db)
+    if sharing_scope == "group" and group_visible:
+        return 1
+    if access_scope == "private" and sharing_scope == "public" and group_visible:
+        return 2
+    return 3
 
 
 def select_gpu_allocation(
@@ -236,6 +264,23 @@ def allocate_task(db: Session, task: Task, node: Node, gpus: list[Gpu], mode: st
             "allocation_mode": mode,
         },
     )
+    db.flush()
+
+
+def release_terminal_allocations(db: Session) -> int:
+    """释放已进入终态任务的未释放 allocation，调度器每轮先清理再分配新任务。"""
+    allocations = db.scalars(
+        select(TaskAllocation)
+        .join(Task, TaskAllocation.task_id == Task.id)
+        .where(TaskAllocation.released_at.is_(None))
+        .where(Task.state.in_(TERMINAL_STATES))
+    ).all()
+    now = local_datetime()
+    for allocation in allocations:
+        allocation.released_at = now
+    if allocations:
+        db.flush()
+    return len(allocations)
 
 
 def mark_blocked(db: Session, task: Task, reason: str, message: str) -> None:

@@ -901,8 +901,7 @@ curl -s http://127.0.0.1:8000/api/admin/nodes \
     "ip":"192.168.1.21",
     "ssh_user":"ddltm",
     "max_speed_mbps":10000,
-    "gpu_count":2,
-    "gpu_models":["NVIDIA A100","NVIDIA A100"],
+    "gpu_schedulable_flags":[1,1,0],
     "owner_user_ids":[310001],
     "access_scope":"private",
     "sharing_scope":"group"
@@ -911,12 +910,12 @@ curl -s http://127.0.0.1:8000/api/admin/nodes \
 
 字段说明：
 
-- `gpu_count` 必须等于 `gpu_models` 的条数。
-- `gpu_models` 必须严格按照该节点 `nvidia-smi` 显示顺序填写，调度器会按这个顺序维护 GPU index。
+- GPU 数量、型号、UUID 和显存由 `nebulagrid-node-monitor` 通过 `nvidia-smi` 自动扫描并写入数据库；硬件数量变化时下一轮扫描会同步更新 GPU 清单。
+- `gpu_schedulable_flags` 必须按该节点 `nvidia-smi` 顺序填写，`1` 表示该 index 可调度，`0` 表示该 index 不参与调度。未配置的 index 会被保守视为不可调度，适合屏蔽亮机卡。
 - `owner_user_ids` 是节点所有人 ID 列表，可填写多个用户；管理员后台也提供搜索按钮和复选下拉框选择所有人。
 - `access_scope=public` 表示公开使用，`private` 表示私有使用。
 - `sharing_scope=none` 表示不共享，仅所有人和管理员可见；`group` 表示组内共享；`public` 表示所有用户可见可用。
-- 共享范围只影响普通用户总览页中可用 GPU 和节点卡片的可见性，不影响节点总数、在线节点、GPU 总数和运行任务等全局统计。
+- 共享范围只影响普通用户总览页中可用 GPU 和节点卡片的可见性；不可调度 GPU 不计入 GPU 总数、可用 GPU 数，也不会作为任务 GPU 型号选项的来源。
 
 ### 17.4 查看节点
 
@@ -1304,7 +1303,7 @@ sudo smbclient //127.0.0.1/test1 -U test1
 
 普通训练任务已经以 PostgreSQL 为单一状态源，不再依赖 API 进程内存。任务提交、批量提交、修改、挂起、删除、后继任务确认、中止、重新提交、日志路径、执行时间、结束时间、实际节点和实际 GPU 分配都会写入 `tasks`、`task_requirements`、`task_dependencies`、`task_allocations`、`task_events` 和 `task_runtime_guards`。
 
-调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号和 GPU 复用策略选择资源。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
+调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略选择资源。任务未指定节点时，候选节点按“用户自有节点 → 组内共享节点 → 组内他人公开共享的私有节点 → 其他公开节点”的顺序尝试；同一档内部按节点 ID 保持稳定顺序。只指定 GPU 型号时，系统只往所有可见候选节点中满足该型号的 GPU 上分配；只指定节点时，系统只在该节点内选择任意可调度 GPU；两者同时指定时，系统只在指定节点内选择指定型号的 GPU。每轮调度最多成功分配一个任务，并在下一轮开始时清理终态任务的未释放 allocation，避免同一张独占 GPU 在同一轮内被重复占用。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
 
 任务日志默认位于 `/home/ddltm/data/logs/task_logs/<task_id>.log`；历史区默认加载最近 100 条可见任务，用户点击“查看所有历史任务”后才会加载全部可见历史任务，避免长时间运行后一次性拉取过多记录。
 
@@ -1373,7 +1372,7 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 当前代码适合部署后开始真实机器联调。以下能力还需要继续开发完善：
 
 - 任务服务已切换到数据库 CRUD，并支持任务可见性、批量提交、修改、挂起、删除后继确认、中止、重新提交、日志读取和历史区默认 100 条加载。
-- 调度器已执行真实 GPU 选择和 allocation 事务：紧急任务优先，校验前驱任务、节点可见性、GPU 数量、GPU 型号和 GPU 复用策略，并写入任务事件与运行时守护记录。
+- 调度器已执行真实 GPU 选择和 allocation 事务：紧急任务优先，校验前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略，并写入任务事件与运行时守护记录。
 - 执行器已通过 SSH 调用远端 runner 启动任务，记录 PID/PGID、读取状态文件、归档返回码并释放 allocation；仍需在真实节点验证 SSH key、NFS 路径、conda 激活和中止回收。
 - runtime guard 已按远端 PID 树和 GPU UUID 检查实际 PID/GPU 使用并处理 `alloc_error`；仍需在真实多进程训练和节点异常场景下压测。
 - env install worker 已从 `env_install_jobs` 领取本机和 compile 安装作业，执行受控安装命令并写回返回码、包状态和环境日志；上传文件真实落盘、sha256 校验、运行中安装取消和资源隔离仍需继续完善。

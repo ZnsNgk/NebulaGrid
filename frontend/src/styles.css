@@ -2980,6 +2980,34 @@ td {
   padding: 10px;
 }
 
+.node-gpu-inventory {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(7, 16, 33, 0.48);
+}
+
+.node-gpu-inventory > span {
+  color: #c9d5f0;
+  font-size: 13px;
+}
+
+.node-gpu-inventory > div {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) 72px;
+  gap: 8px;
+  align-items: center;
+  color: var(--text);
+}
+
+.node-gpu-inventory strong {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
 .task-tabs button.active,
 .admin-tabs button.active,
 .task-zone-rail button.active {

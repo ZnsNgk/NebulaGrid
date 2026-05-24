@@ -80,6 +80,7 @@ class Node(Base, TimestampMixin):
     sharing_scope: Mapped[str] = mapped_column(String(32), default="public", index=True)
     is_public: Mapped[bool] = mapped_column(Boolean, default=True)
     max_speed_mbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gpu_schedulable_flags: Mapped[list[int]] = mapped_column(JSON, default=list)
     state: Mapped[str] = mapped_column(String(32), default="offline", index=True)
     scheduling_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     gpus: Mapped[list["Gpu"]] = relationship(back_populates="node", cascade="all, delete-orphan")

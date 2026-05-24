@@ -131,10 +131,10 @@ def bytes_to_mbps(byte_delta: int, elapsed_seconds: float) -> int:
     return max(0, round(byte_delta * 8 / elapsed_seconds / 1_000_000))
 
 
-def collect_gpu_summary() -> list[dict[str, int | str]]:
-    """Collect GPU summary with nvidia-smi; return an empty list when unavailable."""
+def collect_gpu_summary() -> tuple[list[dict[str, int | str]], bool]:
+    """采集 GPU 清单；probe_ok 用来避免 nvidia-smi 短暂失败时清空 master 侧库存。"""
     if shutil.which("nvidia-smi") is None:
-        return []
+        return [], False
     process_counts = collect_gpu_process_counts()
     command = [
         "nvidia-smi",
@@ -144,7 +144,7 @@ def collect_gpu_summary() -> list[dict[str, int | str]]:
     try:
         output = subprocess.check_output(command, text=True, timeout=10)
     except (subprocess.SubprocessError, OSError):
-        return []
+        return [], False
     rows = []
     for line in output.splitlines():
         index, uuid, name, total, free, util = [part.strip() for part in line.split(",", maxsplit=5)]
@@ -159,7 +159,7 @@ def collect_gpu_summary() -> list[dict[str, int | str]]:
                 "process_count": process_counts.get(uuid, 0),
             }
         )
-    return rows
+    return rows, True
 
 
 def collect_gpu_process_counts() -> dict[str, int]:
@@ -185,13 +185,15 @@ def collect_gpu_process_counts() -> dict[str, int]:
 def main() -> None:
     """Print one JSON node-monitor snapshot for the master-side SSH collector."""
     network_metrics: dict[str, Any] = collect_network_metrics()
+    gpus, gpu_probe_ok = collect_gpu_summary()
     print(
         json.dumps(
             {
                 "cpu_usage": collect_cpu_usage(),
                 "avail_ram_mb": collect_available_ram_mb(),
                 **network_metrics,
-                "gpus": collect_gpu_summary(),
+                "gpus": gpus,
+                "gpu_probe_ok": gpu_probe_ok,
             }
         )
     )

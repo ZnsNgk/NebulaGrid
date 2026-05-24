@@ -118,7 +118,7 @@ NebulaGrid 3.0 的目标是提供一个浏览器即可访问的统一入口，�
 | **目标** | **说明**                                                                    | **验收口径**                                             |
 |----------|-----------------------------------------------------------------------------|----------------------------------------------------------|
 | 统一入口 | 所有用户通过浏览器登录，不再依赖 PyQt 客户端；如确需 SSH，仅登录 master 上的个人子账户，不直接登录计算节点。 | 普通用户可在浏览器完成提交任务、看日志、管理文件和环境。 |
-| 轻量调度 | 支持 GPU 数量、GPU 型号、指定节点、GPU 复用、前驱任务、紧急任务和挂起任务。 | 任务可自动匹配可用节点并正确占用/释放资源。              |
+| 轻量调度 | 支持 GPU 数量、GPU 型号、指定节点、GPU 复用、前驱任务、紧急任务和挂起任务。 | 任务可自动匹配可用节点并正确占用/释放资源；GPU 型号和指定节点作为组合硬约束参与调度。              |
 | 权限清晰 | 按学生、导师、管理员、展示者划分可见数据和操作权限。                        | 越权访问 API 返回 403，界面不显示无权按钮。              |
 | 状态一致 | 数据库、调度服务、节点监控、前端页面和日志记录围绕同一事实来源。            | 刷新页面、重启后状态不出现明显分裂。                     |
 | 便于维护 | 支持节点上线/下线/重连/维护，支持配置备份、审计日志、历史分页和故障追踪。   | 管理员可定位谁在何时执行了什么操作以及影响哪些任务。     |
@@ -420,7 +420,7 @@ nebulagrid/
 
 ## 6.1 任务提交流程
 
-1. 用户进入“提交任务”页面，系统读取该用户可见环境、可见项目目录、可用节点和 GPU 型号。
+1. 用户进入“提交任务”页面，系统读取该用户可见环境、可见项目目录、可用节点和可选 GPU 型号。
 
 2. 用户填写任务参数并提交。前端进行基础校验，后端进行权限、路径、环境和资源字段校验。
 
@@ -477,7 +477,7 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | gpu_metrics           | InfluxDB measurement：gpu_id, gpu_usage, free_vram_mb, process_count, called, collected_at                                                         | GPU 监控快照和历史曲线，不再保存为 PostgreSQL 表。              |
 | envs                  | id, owner_user_id, name, path, description, source_type, state, python_version, size_bytes, created_at                                            | 用户环境。                                                      |
 | tasks                 | id, task_id, user_id, description, env_id, workdir, command, state, priority, on_hold, created_at, started_at, finished_at                        | 任务主表。                                                      |
-| task_requirements     | task_id, need_gpus, gpu_types, node_id, allow_gpu_reuse, max_reuse_count                                                                          | 任务资源需求。                                                  |
+| task_requirements     | task_id, need_gpus, gpu_types, node_id, allow_gpu_reuse, max_reuse_count                                                                          | 任务资源需求；`gpu_types` 保存 GPU 型号约束，`node_id` 保存指定节点约束。                                                  |
 | task_dependencies     | task_id, prev_task_id, policy                                                                                                                     | 前驱任务关系。                                                  |
 | task_allocations      | task_id, node_id, gpu_ids, cpu_allocated, allocation_mode, allocated_at, released_at                                                              | 资源占用记录。                                                  |
 | task_events           | task_id, event_type, message, actor_user_id, created_at, detail_json                                                                              | 任务事件流。                                                    |
@@ -610,15 +610,14 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | ip | string | 节点 IP 地址或 hostname。 |
 | ssh_user | string | master 登录该节点使用的主账户，实验室默认 `ddltm`。 |
 | max_speed_mbps | int nullable | 与主节点最大连接带宽，单位 Mbps。 |
-| gpu_count | int | 节点实际 NVIDIA GPU 数量，包括亮机卡。 |
-| gpu_models | string[] | GPU 型号列表，必须严格按 `nvidia-smi` 显示顺序保存；只填写型号后半部分，如 `RTX 2080 Ti`、`RTX 4090`、`Tesla V100`、`NVIDIA A100`。 |
+| gpu_schedulable_flags | int[] | GPU 可调度开关，必须严格按 `nvidia-smi` 顺序填写；`1` 表示可调度，`0` 表示不参与调度。 |
 | owner_user_ids | int[] | 节点所有人 ID 列表，可多选；前端应提供带搜索按钮的复选下拉框，也允许管理员直接输入 ID 兜底。 |
 | access_scope | enum | `public` 表示公开使用，`private` 表示私有使用。 |
 | sharing_scope | enum | `none` 不共享，`group` 组内共享，`public` 公开共享。 |
 
-后端必须校验 `gpu_count` 与 `gpu_models` 条数一致，避免调度器按 GPU index 分配时出现错位。校验失败时应返回 `VALIDATION_ERROR`，HTTP 状态建议为 422，前端提示“GPU 数量必须与 GPU 型号列表条数一致”。
+GPU 数量、型号、UUID 和显存由节点监控通过 `nvidia-smi` 自动扫描并保存到数据库。某次扫描发现 GPU 数量变化时，数据库 GPU 清单必须按新的扫描结果更新。后端必须校验 `gpu_schedulable_flags` 只包含 0/1；缺失配置的 GPU index 默认不可调度，避免亮机卡被误分配任务。
 
-共享范围只影响普通用户在总览页“可用 GPU”和节点卡片中的可见资源，不应影响系统总览中的节点总数、在线节点、GPU 总数、运行任务等全局统计。具体规则如下：
+共享范围只影响普通用户在总览页“可用 GPU”和节点卡片中的可见资源；不可调度 GPU 不计入 GPU 总数或可用 GPU 数，也不应作为任务 GPU 型号选项的来源。具体规则如下：
 
 | sharing_scope | 可见/可用范围 |
 |---|---|
@@ -692,6 +691,15 @@ while True:
     submit_to_executor(task)
 ```
 
+任务未指定节点时，调度器必须在用户可见且可调度的节点中按以下顺序尝试：
+
+1. 用户自有节点。
+2. 组内共享节点，即 `sharing_scope=group` 且当前用户属于节点所有人的共享范围。
+3. 组内他人公开共享的私有节点，即 `access_scope=private`、`sharing_scope=public`，且当前用户与节点所有人存在组内共享关系。
+4. 其他公开节点。
+
+同一优先级内按节点 ID 保持稳定顺序。指定节点时只在指定节点内判断资源是否满足。
+
 ## 9.3 GPU 选择与复用
 
 | **模式** | **条件**                              | **资源占用规则**                                                                             |
@@ -699,7 +707,7 @@ while True:
 | CPU-only | need_gpus=0                           | 不设置可见 GPU，或设置 CUDA_VISIBLE_DEVICES 为空/无效，并记录 cpu_allocation。               |
 | GPU 独占 | need_gpus>0 且 allow_gpu_reuse=false | 只能选择 schedulable=true、未被独占、显存占用低于阈值的 GPU；选中后标记 exclusive。          |
 | GPU 复用 | allow_gpu_reuse=true                  | 允许同一 GPU 多任务，要求 free_vram_ratio >= 阈值且 running_task_count < max_reuse_count。 |
-| 指定型号 | gpu_types 非空                        | 只选择型号在允许列表中的 GPU；型号匹配建议规范化为 RTX4090/A6000/H100 等。                   |
+| GPU 型号 | gpu_types 非空                        | 只检查候选节点中匹配指定型号的可调度 GPU；只指定型号时在所有可见节点内匹配，同时指定节点时仅在该节点内匹配。 |
 | 指定节点 | node_id 非空                          | 候选资源限制在该节点内；节点不可用时任务等待并记录阻塞原因。                                 |
 
 ## 9.4 任务执行命令规范
@@ -949,7 +957,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 | 导师查看学生任务   | 学生绑定导师              | 导师打开任务页                       | 可看到学生任务，但默认不能停止学生运行任务。                             |
 | 管理员新增节点     | 管理员登录                | 填写节点和 GPU 信息保存              | 节点出现在列表，监控线程开始连接。                                       |
 | 提交 GPU 任务      | 存在可用 GPU 和环境       | 提交 need_gpus=1 的任务              | 任务进入 wait 后被调度到匹配 GPU，日志产生。                             |
-| GPU 型号约束       | 存在多型号 GPU            | 指定 RTX4090                         | 任务只被分配到对应型号 GPU。                                             |
+| GPU 型号与节点组合约束 | 存在多台可见节点且 GPU 型号不同 | 仅指定 GPU 型号；再提交一个同时指定节点和型号的任务 | 仅指定型号时可分配到任一可见匹配节点；同时指定节点和型号时只在该节点内匹配。 |
 | GPU 复用           | GPU 空闲显存满足阈值      | 提交允许复用任务                     | 同一 GPU 可运行多个任务且 task_num 正确。                                |
 | 前驱任务           | 任务 A 已提交             | 提交任务 B 依赖 A                    | A 未完成前 B 不运行，A 成功后 B 可运行。                                 |
 | 停止任务           | 任务 running              | 用户停止自己的任务                   | 进程终止，状态 cancelled，资源释放，日志记录停止原因。                   |

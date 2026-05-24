@@ -1,5 +1,6 @@
 from datetime import timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -8,10 +9,12 @@ from app.core.config import get_settings
 from app.core.time_utils import local_datetime
 from app.services.auth_service import hash_session_token
 from app.services.metrics_service import parse_flux_csv
-from app.db.models import LoginSession
+from app.db.models import LoginSession, Node, Setting, Task, TaskAllocation
 from app.db.session import SessionLocal
 from app.main import create_app
+from app.workers.node_monitor import sync_gpu_inventory
 from app.workers.runtime_guard import expand_pid_tree, parse_gpu_apps, parse_process_table
+from app.workers.scheduler import scheduler_tick
 
 
 def make_client() -> TestClient:
@@ -157,11 +160,12 @@ def test_admin_node_and_settings_smoke() -> None:
     client = make_client()
     token = login_as_admin(client)
     headers = {"Authorization": f"Bearer {token}"}
+    node_name = f"node-a-{uuid4().hex[:8]}"
 
     node_response = client.post(
         "/api/admin/nodes",
         headers=headers,
-        json={"name": "node-a", "ip": "10.0.0.10", "gpu_models": ["A100"]},
+        json={"name": node_name, "ip": "10.0.0.10", "gpu_schedulable_flags": [1]},
     )
     settings_response = client.patch(
         "/api/admin/settings",
@@ -170,9 +174,323 @@ def test_admin_node_and_settings_smoke() -> None:
     )
 
     assert node_response.status_code == 200
-    assert node_response.json()["data"]["name"] == "node-a"
+    assert node_response.json()["data"]["name"] == node_name
+    assert node_response.json()["data"]["gpu_schedulable_flags"] == [1]
     assert settings_response.status_code == 200
     assert settings_response.json()["ok"] is True
+
+
+def test_monitor_applies_admin_gpu_schedulable_flags() -> None:
+    """验证 monitor 扫描 GPU 型号和数量，管理员 0/1 列表只决定是否参与调度。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    node_payload = {
+        "name": f"node-flags-{uuid4().hex[:8]}",
+        "ip": "10.0.0.31",
+        "gpu_schedulable_flags": [1, 0],
+    }
+    node_id = client.post("/api/admin/nodes", headers=headers, json=node_payload).json()["data"]["id"]
+
+    with SessionLocal() as db:
+        node = db.get(Node, node_id)
+        assert node is not None
+        sync_gpu_inventory(
+            db,
+            node,
+            [
+                {"index": 0, "uuid": "GPU-visible", "name": "RTX 4090", "memory_total_mb": 24576},
+                {"index": 1, "uuid": "GPU-display", "name": "NVIDIA T400", "memory_total_mb": 4096},
+            ],
+        )
+        db.commit()
+
+    nodes = client.get("/api/nodes", headers=headers).json()["data"]
+    node = next(item for item in nodes if item["id"] == node_id)
+    assert [gpu["model"] for gpu in node["gpus"]] == ["RTX 4090", "NVIDIA T400"]
+    assert [gpu["schedulable"] for gpu in node["gpus"]] == [True, False]
+
+
+def test_scheduler_schedules_one_exclusive_task_per_tick() -> None:
+    """验证一轮调度只成功分配一个任务，避免同一张独占 GPU 在同一事务里被重复占用。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    node_id = client.post(
+        "/api/admin/nodes",
+        headers=headers,
+        json={"name": f"node-exclusive-{uuid4().hex[:8]}", "ip": "10.0.0.32", "gpu_schedulable_flags": [1]},
+    ).json()["data"]["id"]
+
+    with SessionLocal() as db:
+        db.merge(Setting(key="scheduler.enabled", value="true"))
+        node = db.get(Node, node_id)
+        assert node is not None
+        node.state = "online"
+        node.scheduling_enabled = True
+        sync_gpu_inventory(
+            db,
+            node,
+            [{"index": 0, "uuid": "GPU-exclusive", "name": "RTX 4090", "memory_total_mb": 24576}],
+        )
+        db.commit()
+
+    task_ids = []
+    for index in range(2):
+        response = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "description": f"exclusive-{index}",
+                "workdir": "/",
+                "command": "python train.py",
+                "urgent": True,
+                "requirement": {"need_gpus": 1, "node_id": node_id, "allow_gpu_reuse": False},
+            },
+        )
+        task_ids.append(response.json()["data"]["task_id"])
+
+    with SessionLocal() as db:
+        db.query(Task).filter(Task.state == "wait").filter(~Task.task_id.in_(task_ids)).update(
+            {Task.state: "on_hold", Task.on_hold: True},
+            synchronize_session=False,
+        )
+        db.commit()
+
+    scheduler_tick()
+
+    with SessionLocal() as db:
+        tasks = db.scalars(select(Task).where(Task.task_id.in_(task_ids))).all()
+        states = {task.task_id: task.state for task in tasks}
+        task_pks = [task.id for task in tasks]
+        allocations = db.scalars(
+            select(TaskAllocation)
+            .where(TaskAllocation.task_id.in_(task_pks))
+            .where(TaskAllocation.released_at.is_(None))
+        ).all()
+
+    assert sorted(states.values()) == ["dispatching", "wait"]
+    assert sum(1 for allocation in allocations if allocation.gpu_ids) == 1
+
+
+def test_scheduler_combines_gpu_model_and_node_constraints() -> None:
+    """验证 GPU 型号和指定节点是组合约束：只选型号看所有可见节点，同时选节点时只看该节点。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    suffix = uuid4().hex[:8]
+    small_node_id = client.post(
+        "/api/admin/nodes",
+        headers=headers,
+        json={"name": f"node-model-small-{suffix}", "ip": "10.0.0.33", "gpu_schedulable_flags": [1]},
+    ).json()["data"]["id"]
+    large_node_id = client.post(
+        "/api/admin/nodes",
+        headers=headers,
+        json={"name": f"node-model-large-{suffix}", "ip": "10.0.0.34", "gpu_schedulable_flags": [1]},
+    ).json()["data"]["id"]
+
+    with SessionLocal() as db:
+        db.merge(Setting(key="scheduler.enabled", value="true"))
+        small_node = db.get(Node, small_node_id)
+        large_node = db.get(Node, large_node_id)
+        assert small_node is not None
+        assert large_node is not None
+        small_node.state = "online"
+        small_node.scheduling_enabled = True
+        large_node.state = "online"
+        large_node.scheduling_enabled = True
+        sync_gpu_inventory(
+            db,
+            small_node,
+            [{"index": 0, "uuid": f"GPU-small-{suffix}", "name": "RTX 3060", "memory_total_mb": 12288}],
+        )
+        sync_gpu_inventory(
+            db,
+            large_node,
+            [{"index": 0, "uuid": f"GPU-large-{suffix}", "name": "RTX 4090", "memory_total_mb": 24576}],
+        )
+        db.commit()
+
+    first_response = client.post(
+        "/api/tasks",
+        headers=headers,
+        json={
+            "description": "model-constraint-first",
+            "workdir": "/",
+            "command": "python train.py",
+            "urgent": True,
+            "requirement": {"need_gpus": 1, "gpu_types": ["RTX 4090"], "allow_gpu_reuse": False},
+        },
+    )
+    first_task_id = first_response.json()["data"]["task_id"]
+    first_requirement = first_response.json()["data"]["requirement"]
+    assert first_requirement["gpu_types"] == ["RTX 4090"]
+    assert first_requirement["node_id"] is None
+
+    with SessionLocal() as db:
+        db.query(Task).filter(Task.state == "wait").filter(Task.task_id != first_task_id).update(
+            {Task.state: "on_hold", Task.on_hold: True},
+            synchronize_session=False,
+        )
+        db.commit()
+
+    scheduler_tick()
+
+    with SessionLocal() as db:
+        first_task = db.scalar(select(Task).where(Task.task_id == first_task_id))
+        assert first_task is not None
+        first_allocation = db.scalar(select(TaskAllocation).where(TaskAllocation.task_id == first_task.id))
+        assert first_allocation is not None
+        assert first_allocation.node_id == large_node_id
+
+    second_response = client.post(
+        "/api/tasks",
+        headers=headers,
+        json={
+            "description": "model-constraint-second",
+            "workdir": "/",
+            "command": "python train.py",
+            "urgent": True,
+            "requirement": {
+                "need_gpus": 1,
+                "node_id": small_node_id,
+                "gpu_types": ["RTX 4090"],
+                "allow_gpu_reuse": False,
+            },
+        },
+    )
+    second_task_id = second_response.json()["data"]["task_id"]
+
+    with SessionLocal() as db:
+        db.query(Task).filter(Task.state == "wait").filter(Task.task_id != second_task_id).update(
+            {Task.state: "on_hold", Task.on_hold: True},
+            synchronize_session=False,
+        )
+        db.commit()
+
+    scheduler_tick()
+
+    with SessionLocal() as db:
+        second_task = db.scalar(select(Task).where(Task.task_id == second_task_id))
+        assert second_task is not None
+        second_allocation = db.scalar(select(TaskAllocation).where(TaskAllocation.task_id == second_task.id))
+
+    assert second_task.state == "wait"
+    assert second_allocation is None
+    assert second_task.last_block_reason
+
+
+def test_scheduler_prefers_user_owned_then_group_then_public_nodes() -> None:
+    """验证任务在所有可见节点里优先使用本人节点，其后才考虑组内和公开节点。"""
+    client = make_client()
+    admin_token = login_as_admin(client)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    suffix = uuid4().hex[:8]
+
+    mentor = client.post(
+        "/api/users",
+        headers=admin_headers,
+        json={
+            "username": f"sched-mentor-{suffix}",
+            "real_name": "Scheduler Mentor",
+            "role": "mentor",
+            "state": "enabled",
+            "password": "mentor123",
+        },
+    ).json()["data"]
+    student = client.post(
+        "/api/users",
+        headers=admin_headers,
+        json={
+            "username": f"sched-student-{suffix}",
+            "real_name": "Scheduler Student",
+            "role": "student",
+            "state": "enabled",
+            "password": "student123",
+            "supervisor_ids": [mentor["id"]],
+        },
+    ).json()["data"]
+    peer = client.post(
+        "/api/users",
+        headers=admin_headers,
+        json={
+            "username": f"sched-peer-{suffix}",
+            "real_name": "Scheduler Peer",
+            "role": "student",
+            "state": "enabled",
+            "password": "student123",
+            "supervisor_ids": [mentor["id"]],
+        },
+    ).json()["data"]
+
+    def create_node(label: str, owner_ids: list[int], access_scope: str, sharing_scope: str) -> int:
+        response = client.post(
+            "/api/admin/nodes",
+            headers=admin_headers,
+            json={
+                "name": f"sched-{label}-{suffix}",
+                "ip": f"10.0.1.{len(label) + len(owner_ids) + 10}",
+                "gpu_schedulable_flags": [1],
+                "owner_user_ids": owner_ids,
+                "access_scope": access_scope,
+                "sharing_scope": sharing_scope,
+            },
+        )
+        return response.json()["data"]["id"]
+
+    public_node_id = create_node("public", [], "public", "public")
+    peer_public_private_node_id = create_node("peer-public-private", [peer["id"]], "private", "public")
+    group_node_id = create_node("group", [mentor["id"]], "private", "group")
+    own_node_id = create_node("own", [student["id"]], "private", "none")
+    node_ids = [public_node_id, peer_public_private_node_id, group_node_id, own_node_id]
+
+    with SessionLocal() as db:
+        db.merge(Setting(key="scheduler.enabled", value="true"))
+        for node_id in node_ids:
+            node = db.get(Node, node_id)
+            assert node is not None
+            node.state = "online"
+            node.scheduling_enabled = True
+            sync_gpu_inventory(
+                db,
+                node,
+                [{"index": 0, "uuid": f"GPU-{node_id}", "name": "RTX 4090", "memory_total_mb": 24576}],
+            )
+        db.commit()
+
+    student_token = login_user(client, student["username"], "student123")
+    student_headers = {"Authorization": f"Bearer {student_token}"}
+    task_response = client.post(
+        "/api/tasks",
+        headers=student_headers,
+        json={
+            "description": "priority-order",
+            "workdir": "/",
+            "command": "python train.py",
+            "urgent": True,
+            "requirement": {"need_gpus": 1, "allow_gpu_reuse": False},
+        },
+    )
+    task_id = task_response.json()["data"]["task_id"]
+
+    with SessionLocal() as db:
+        db.query(Task).filter(Task.state == "wait").filter(Task.task_id != task_id).update(
+            {Task.state: "on_hold", Task.on_hold: True},
+            synchronize_session=False,
+        )
+        db.commit()
+
+    scheduler_tick()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        allocation = db.scalar(select(TaskAllocation).where(TaskAllocation.task_id == task.id))
+
+    assert task.state == "dispatching"
+    assert allocation is not None
+    assert allocation.node_id == own_node_id
 
 
 def login_as_admin(client: TestClient) -> str:

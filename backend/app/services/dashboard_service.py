@@ -29,7 +29,7 @@ def build_dashboard_summary(user: UserRecord, db: Session) -> DashboardSummary:
     nodes = list_nodes(user, db, visible_only=False)
     visible_nodes = list_nodes(user, db, visible_only=True)
     tasks, _ = list_tasks(user, db, state=None, search=None, page=1, page_size=200)
-    gpus_total = sum(len(node.gpus) for node in nodes)
+    gpus_total = sum(1 for node in nodes for gpu in node.gpus if gpu.schedulable)
     return DashboardSummary(
         nodes_total=len(nodes),
         nodes_online=sum(1 for node in nodes if node.state == "online"),
@@ -65,7 +65,7 @@ def build_presenter_dashboard(user: UserRecord, db: Session, history_hours: int 
         summary=PresenterSummary(
             nodes_total=len(node_infos),
             nodes_online=sum(1 for node in node_infos if node.state == "online"),
-            gpus_total=sum(len(node.gpus) for node in node_infos),
+            gpus_total=sum(1 for node in node_infos for gpu in node.gpus if gpu.schedulable),
             tasks_waiting=count_tasks_by_states(db, WAIT_STATES),
             tasks_running=count_tasks_by_states(db, RUNNING_STATES),
             tasks_history_total=count_tasks_by_states(db, TERMINAL_STATES),
@@ -100,6 +100,7 @@ def build_presenter_dashboard(user: UserRecord, db: Session, history_hours: int 
                         history=metric_history_to_payload(historical_metrics.gpus.get(gpu.id, {})),
                     )
                     for gpu in node.gpus
+                    if gpu.schedulable
                 ],
             )
             for node in node_infos

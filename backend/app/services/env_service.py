@@ -41,6 +41,7 @@ from app.schemas.envs import (
     EnvPackageUploadRequest,
     EnvUploadRequest,
 )
+from app.services.node_service import gpu_index_schedulable
 from app.services.audit_service import record_audit, utc_now
 from app.services.auth_service import UserRecord
 
@@ -289,6 +290,7 @@ def probe_master_compile_target() -> EnvCompileTargetInfo:
 def probe_node_compile_target(node) -> EnvCompileTargetInfo:
     """通过 SSH 在计算节点执行一次轻量探测；失败时仍返回节点卡片并展示错误原因。"""
     probe = run_compile_probe(build_compile_probe_ssh_command(node))
+    probed_gpus = [gpu for gpu in (probe["gpus"] or []) if gpu_index_schedulable(node, gpu.index)]
     return EnvCompileTargetInfo(
         id=f"node:{node.id}",
         node_id=node.id,
@@ -298,9 +300,10 @@ def probe_node_compile_target(node) -> EnvCompileTargetInfo:
         ssh_user=node.ssh_user,
         state=node.state if probe["ok"] else "offline",
         compilers=probe["compilers"],
-        gpus=probe["gpus"] or [
+        gpus=probed_gpus or [
             EnvCompileGpuInfo(index=gpu.gpu_index, model=gpu.model, total_vram_mb=gpu.total_vram_mb, uuid=gpu.gpu_uuid)
             for gpu in (node.gpus or [])
+            if gpu.schedulable
         ],
         collected_at=utc_now(),
         error=probe["error"],

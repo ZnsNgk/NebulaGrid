@@ -97,6 +97,7 @@ def migrate_existing_schema() -> None:
                     "owner_user_ids": "JSON DEFAULT '[]'::json",
                     "access_scope": "VARCHAR(32) DEFAULT 'public'",
                     "sharing_scope": "VARCHAR(32) DEFAULT 'public'",
+                    "gpu_schedulable_flags": "JSON DEFAULT '[]'::json",
                 },
             )
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_nodes_access_scope ON nodes (access_scope)"))

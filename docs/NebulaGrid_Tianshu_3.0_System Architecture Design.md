@@ -441,7 +441,7 @@ erDiagram
 | command | text | 用户命令主体 |
 | generated_command | text | 系统生成后的完整命令，可管理员查看 |
 | need_gpus | int | 所需 GPU 数 |
-| gpu_type | jsonb | GPU 型号约束 |
+| gpu_types | jsonb | GPU 型号约束 |
 | target_node_id | fk nodes.id nullable | 指定节点 |
 | prev_task_id | fk tasks.id nullable | 前驱任务 |
 | is_urgent | bool | 紧急任务 |
@@ -822,7 +822,7 @@ stateDiagram-v2
 
 1. 周期性扫描 `tasks.state = wait` 且 `is_onhold = false` 的任务；
 2. 按紧急程度、优先级、提交时间排序；
-3. 检查用户状态、前驱任务、可见节点、节点状态、GPU 型号、复用策略；
+3. 检查用户状态、前驱任务、可见节点、节点状态、GPU 型号约束、复用策略；
 4. 在数据库事务中锁定任务和候选 GPU；
 5. 写入 `task_allocations`；
 6. 更新任务状态为 `dispatching`；
@@ -893,9 +893,18 @@ GPU 选择应分为硬约束和软评分。
 2. 节点 schedulable；
 3. 用户对该节点有权限；
 4. GPU enabled；
-5. GPU 型号符合 `gpu_type`；
+5. 未指定 GPU 型号时按可调度 GPU 自动选择；只指定 GPU 型号时在所有可见候选节点中匹配该型号，同时指定节点和型号时只在该节点内匹配该型号；
 6. 非复用任务要求 `used_by_scheduler = false` 且显存占用低于阈值；
 7. 复用任务要求 `running_task_count < max_reuse_tasks` 且可用显存比例大于阈值。
+
+节点优先级：
+
+1. 用户自有节点；
+2. 组内共享节点；
+3. 组内他人公开共享的私有节点；
+4. 其他公开节点。
+
+指定节点时跳过上述排序，只校验该节点是否可见、在线、允许调度并满足 GPU 条件。
 
 软评分：
 
@@ -1341,7 +1350,7 @@ frontend/src/
 |---|---|
 | 仪表盘 | 节点总览、GPU 总览、任务统计、最近错误 |
 | 任务列表 | wait/running/history 统一列表，支持状态筛选 |
-| 提交任务 | 选择环境、路径、命令、GPU 数量、型号、节点、前驱、复用、紧急 |
+| 提交任务 | 选择环境、路径、命令、GPU 数量、GPU 型号、节点、前驱、复用、紧急 |
 | 任务详情 | 状态机、分配 GPU、日志、事件流、停止按钮 |
 | 节点管理 | 节点状态、GPU 卡片、启停调度、强制下线 |
 | 环境管理 | 环境列表、conda-pack 导入、whl 安装、压缩包导入、编译安装 |
@@ -1568,7 +1577,7 @@ Nginx 负责：
 1. 提交 CPU 任务；
 2. 提交单 GPU 任务；
 3. 提交多 GPU 任务；
-4. GPU 型号筛选；
+4. GPU 型号与节点组合约束；
 5. GPU 复用；
 6. 前驱任务；
 7. 用户中止任务；
@@ -1731,7 +1740,7 @@ while True:
 
 - 任务主表新增 `generated_command`、`urgent`、`last_block_reason`、`log_path` 和 `return_code`，GPU 表新增 `gpu_uuid`，初始化脚本会对旧库补列和索引。
 - API 支持单任务、批量任务、等待/执行/历史分区、任务变化 SSE、日志 tail、日志增量 SSE、删除后继预览、递归删除、重新提交和运行时守护摘要。
-- scheduler 以 PostgreSQL 为单一状态源，按紧急任务、优先级、提交时间、前驱依赖、节点可见性、GPU 数量、GPU 型号和 GPU 复用策略写入 allocation，并同步创建 `task_events` 与 `task_runtime_guards`。
+- scheduler 以 PostgreSQL 为单一状态源，按紧急任务、优先级、提交时间、前驱依赖、节点可见性、节点归属优先级、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略写入 allocation；每轮最多成功分配一个任务，并同步创建 `task_events` 与 `task_runtime_guards`。只指定 GPU 型号时在用户可见候选节点中匹配该型号；只指定节点时只在该节点中匹配任意可调度 GPU；两者同时指定时只在该节点内匹配指定型号。
 - executor 通过 SSH 调用远端 `runner.py`，生成环境激活、CUDA 绑定和用户命令组合后的执行命令；远端 wrapper 写入 PID/PGID 元数据和状态文件，executor 回收返回码、结束时间并释放 allocation。
 - Runtime Guard 通过远端 PID 树和 `nvidia-smi --query-compute-apps` 采集实际 GPU UUID，连续两轮发现越权后终止远端进程组、标记 `alloc_error`、释放 allocation，并写入任务日志与事件。
 - 部署自检脚本 `backend/scripts/deployment_self_check.py` 用于上线前只读检查本机共享目录、远端脚本、数据库节点、SSH、NFS 路径和 `nvidia-smi` 可用性。

@@ -539,10 +539,10 @@ sudo -u ddltm backend/.venv/bin/python scripts/init_admin.py
 - SSH 端口和主账户 SSH 用户，默认应为跨节点一致的 `ddltm`。
 - 公共/私人归属。
 - 私人节点所有人和开放范围。
-- GPU index、GPU UUID、型号、显存、是否可调度。
+- GPU 可调度开关：按 `nvidia-smi` 顺序填写 0/1，亮机卡或维护卡填 0。
 - watchdog 超时时间和是否允许调度。
 
-GPU UUID 建议作为运行时守护检测的核心依据，GPU index 只用于显示和 `CUDA_VISIBLE_DEVICES`。
+GPU index、GPU UUID、型号和显存由节点监控通过 `nvidia-smi` 自动扫描并写入数据库；硬件数量变化时下一轮监控会同步更新清单。GPU UUID 建议作为运行时守护检测的核心依据，GPU index 只用于显示和 `CUDA_VISIBLE_DEVICES`。
 
 ## 11. 上线验证
 
@@ -576,7 +576,7 @@ curl -f http://127.0.0.1:8000/api/health
 
 1. 提交 CPU-only 测试任务。
 2. 提交 `need_gpus=1` 的 GPU 测试任务。
-3. 指定 GPU 型号或指定节点提交任务。
+3. 指定 GPU 型号或指定节点提交任务；只指定型号时应在所有可见节点中匹配该型号，只指定节点时只在该节点内调度，两者同时指定时只在指定节点内匹配指定型号。
 4. 查看运行中日志 tail。
 5. 停止自己的运行任务。
 6. 查看任务事件流和审计记录。

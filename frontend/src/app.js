@@ -142,6 +142,7 @@ const errorMessageMap = {
   "node name already exists": "节点名称已存在",
   "node owner not found": "节点所有人不存在，请刷新用户列表后重试",
   "gpu_count must match gpu_models length": "GPU 数量必须与 GPU 型号列表条数一致",
+  "gpu schedulable flags must be 0 or 1": "GPU 可用性列表只能填写 0 或 1",
   "command must be a single line": "单个任务的执行命令不允许换行",
   "batch commands are empty": "批量命令中没有可提交的有效行",
   "running task cannot be edited": "运行中的任务不能修改",
@@ -386,6 +387,14 @@ function parseList(value) {
   return value.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean);
 }
 
+function parseGpuSchedulableFlags(value) {
+  return parseList(value).map((item) => {
+    if (item === "0" || item.toLowerCase() === "false") return 0;
+    if (item === "1" || item.toLowerCase() === "true") return 1;
+    throw new Error("GPU 可用性列表只能填写 0 或 1");
+  });
+}
+
 function checkedValues(containerId) {
   return Array.from(document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)).map((input) => input.value);
 }
@@ -520,10 +529,10 @@ async function loadTasksPageData({ includeLookups = false } = {}) {
   if (state.taskZone === "history" && state.taskHistoryAllLoaded) params.set("all_history", "true");
   const tasksRequest = api(`/tasks?${params.toString()}`);
   const lookupRequests = [];
-  if (includeLookups && can("envs:read") && !(state.data.envs || []).length) {
+  if (includeLookups && can("envs:read")) {
     lookupRequests.push(api("/envs").then((payload) => { state.data.envs = payload.data; }));
   }
-  if (includeLookups && can("nodes:read") && !(state.data.nodes || []).length) {
+  if (includeLookups && can("nodes:read")) {
     lookupRequests.push(api("/nodes").then((payload) => { state.data.nodes = payload.data; }));
   }
   const [tasksPayload] = await Promise.all([tasksRequest, ...lookupRequests]);
@@ -804,8 +813,7 @@ async function submitNode(event) {
     ip: formValue(form, "ip"),
     ssh_user: formValue(form, "ssh_user") || "ddltm",
     max_speed_mbps: formValue(form, "max_speed_mbps") ? Number(formValue(form, "max_speed_mbps")) : null,
-    gpu_count: Number(formValue(form, "gpu_count") || 0),
-    gpu_models: parseList(formValue(form, "gpu_models")),
+    gpu_schedulable_flags: parseGpuSchedulableFlags(formValue(form, "gpu_schedulable_flags")),
     owner_user_ids: uniqueNumbers([...checkedOwnerIds, ...manualOwnerIds]),
     access_scope: formValue(form, "access_scope") || "public",
     sharing_scope: formValue(form, "sharing_scope") || "public",
@@ -2123,7 +2131,7 @@ function renderDashboard() {
 }
 
 function renderNodeCard(node) {
-  const gpus = node.gpus || [];
+  const gpus = schedulableGpus(node);
   const bandwidth = speed(node.network_bandwidth_mbps ?? node.max_speed_mbps);
   return `
     <article class="node-card">
@@ -2217,7 +2225,7 @@ function renderPresenter() {
 }
 
 function renderPresenterNode(node) {
-  const gpus = node.gpus || [];
+  const gpus = schedulableGpus(node);
   return `
     <article class="presenter-node">
       <div class="presenter-node-title">
@@ -2437,7 +2445,10 @@ function isTaskActionDisabled(action) {
 }
 
 function taskGpuModelText(task) {
-  if (task.gpu_models?.length) return task.gpu_models.join(", ");
+  if (task.gpu_indices?.length) {
+    const models = task.gpu_models?.length ? ` · ${task.gpu_models.join(", ")}` : "";
+    return `GPU ${task.gpu_indices.join(", GPU ")}${models}`;
+  }
   const requested = task.requirement?.gpu_types || [];
   return requested.length ? requested.join(", ") : "不限型号";
 }
@@ -2549,12 +2560,28 @@ function renderTaskNodeOptions(selectedId = "") {
 function renderTaskGpuTypeOptions(nodeId = "", selectedTypes = []) {
   const selected = new Set((selectedTypes || []).map(String));
   const nodes = nodeId ? (state.data.nodes || []).filter((node) => String(node.id) === String(nodeId)) : (state.data.nodes || []);
-  const models = [];
-  nodes.forEach((node) => (node.gpus || []).forEach((gpu) => {
-    if (gpu.model && !models.includes(gpu.model)) models.push(gpu.model);
-  }));
-  return models.length
-    ? models.map((model) => `<label class="checkline"><input type="checkbox" value="${escapeAttr(model)}" ${selected.has(String(model)) ? "checked" : ""}>${escapeHtml(model)}</label>`).join("")
+  const models = new Map();
+  nodes.forEach((node) => {
+    (node.gpus || [])
+      .filter((gpu) => gpu.schedulable)
+      .forEach((gpu) => {
+        const model = gpu.model || "Unknown";
+        const item = models.get(model) || { total: 0, free: 0 };
+        item.total += 1;
+        if (!gpu.scheduled_occupied) item.free += 1;
+        models.set(model, item);
+      });
+  });
+  return models.size
+    ? Array.from(models.entries())
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([model, count]) => `
+        <label class="checkline">
+          <input type="checkbox" value="${escapeAttr(model)}" ${selected.has(String(model)) ? "checked" : ""}>
+          ${escapeHtml(model)}
+          <small class="muted">${escapeHtml(count.free)} / ${escapeHtml(count.total)} 可用</small>
+        </label>
+      `).join("")
     : `<span class="muted">暂无可选 GPU 型号</span>`;
 }
 
@@ -2571,6 +2598,10 @@ function taskHomeHint() {
 
 function taskSharedHint() {
   return "/home/ddltm/shared";
+}
+
+function schedulableGpus(node) {
+  return (node?.gpus || []).filter((gpu) => gpu.schedulable);
 }
 
 function renderFiles() {
@@ -3410,7 +3441,7 @@ function renderAdminNodes(nodes) {
   const editingNode = nodes.find((node) => node.id === state.adminNodeEditId) || null;
   const formTitle = editingNode ? "修改节点" : "新增节点";
   const selectedOwners = editingNode?.owner_user_ids || [];
-  const gpuModels = (editingNode?.gpus || []).map((gpu) => gpu.model).join("\n");
+  const gpuFlags = nodeGpuSchedulableFlagsText(editingNode);
   return `
     <section class="node-management-grid">
       <article class="panel admin-card node-list-card">
@@ -3419,7 +3450,7 @@ function renderAdminNodes(nodes) {
           `<strong>${escapeHtml(node.name)}</strong><br><span class="muted">${escapeHtml(node.ip)}</span>`,
           escapeHtml(node.ssh_user || "-"),
           speed(node.max_speed_mbps),
-          `${(node.gpus || []).length} 块<br><span class="muted">${escapeHtml(nodeGpuModelsText(node))}</span>`,
+          `${schedulableGpus(node).length} / ${(node.gpus || []).length} 可调度<br><span class="muted">${escapeHtml(nodeGpuModelsText(node))}</span>`,
           escapeHtml(nodeOwnerNames(node)),
           `${nodeAccessScopeText(node.access_scope)}<br><span class="muted">${nodeSharingScopeText(node.sharing_scope)}</span>`,
           `<span class="status ${node.state}">${nodeStateText(node.state)}</span><br><span class="muted">调度 ${node.scheduling_enabled ? "开启" : "关闭"}</span>`,
@@ -3427,16 +3458,16 @@ function renderAdminNodes(nodes) {
         ])) : renderEmpty("暂无节点")}
       </article>
       <article class="panel admin-card node-form-card">
-        <div class="panel-head"><div><h2>${formTitle}</h2><span>GPU 型号请按 nvidia-smi 显示顺序逐行填写，保存时会按该顺序进入数据库。</span></div></div>
+        <div class="panel-head"><div><h2>${formTitle}</h2><span>GPU 数量和型号由节点监控自动扫描，管理员只维护按 nvidia-smi 顺序排列的可调度开关。</span></div></div>
         <form method="post" id="nodeForm" class="form-grid compact-form">
           <label>节点名称<input name="name" value="${escapeAttr(editingNode?.name || "")}" placeholder="node-a" required></label>
           <label>IP 地址<input name="ip" value="${escapeAttr(editingNode?.ip || "")}" placeholder="192.168.1.21" required></label>
           <label>SSH 用户<input name="ssh_user" value="${escapeAttr(editingNode?.ssh_user || "ddltm")}" required></label>
           <label>与主节点最大连接带宽（Mbps）<input name="max_speed_mbps" type="number" min="1" value="${escapeAttr(editingNode?.max_speed_mbps || "")}" placeholder="10000"></label>
-          <label>GPU 数量<input name="gpu_count" type="number" min="0" max="64" value="${(editingNode?.gpus || []).length}" required></label>
           <label>使用权<select name="access_scope">${renderSelectOptions([["public", "公开"], ["private", "私有"]], editingNode?.access_scope || "public")}</select></label>
           <label>共享<select name="sharing_scope">${renderSelectOptions([["none", "不共享"], ["group", "组内共享"], ["public", "公开共享"]], editingNode?.sharing_scope || "public")}</select></label>
-          <label class="full-row">GPU 型号列表<textarea name="gpu_models" placeholder="必须按照nvidia-smi中的显卡顺序填写，一行一个，例如&#10;RTX 4090&#10;Tesla V100&#10;NVIDIA A100">${escapeHtml(gpuModels)}</textarea></label>
+          <label class="full-row">GPU 可用性列表<textarea name="gpu_schedulable_flags" placeholder="按 nvidia-smi 顺序填写，一行一个：1 可调度，0 不调度&#10;1&#10;1&#10;0">${escapeHtml(gpuFlags)}</textarea></label>
+          ${editingNode ? `<div class="full-row">${renderNodeGpuInventory(editingNode)}</div>` : ""}
           <div class="full-row">${renderNodeOwnerSelector(selectedOwners)}</div>
           <div class="form-actions full-row">
             <button type="submit">${editingNode ? "提交修改" : "提交新增"}</button>
@@ -3508,8 +3539,35 @@ function nodeOwnerNames(node) {
 }
 
 function nodeGpuModelsText(node) {
-  const models = (node.gpus || []).map((gpu) => gpu.model).filter(Boolean);
+  const models = (node.gpus || []).map((gpu) => {
+    const label = gpu.model || "Unknown";
+    return gpu.schedulable ? label : `${label}(禁用)`;
+  });
   return models.length ? models.join("，") : "-";
+}
+
+function nodeGpuSchedulableFlagsText(node) {
+  if (!node) return "";
+  const flags = node.gpu_schedulable_flags || [];
+  const gpuCount = (node.gpus || []).length;
+  const length = Math.max(flags.length, gpuCount);
+  return Array.from({ length }, (_, index) => Number(flags[index] || 0) ? "1" : "0").join("\n");
+}
+
+function renderNodeGpuInventory(node) {
+  const gpus = node.gpus || [];
+  return `
+    <div class="node-gpu-inventory">
+      <span>扫描到的 GPU</span>
+      ${gpus.length ? gpus.map((gpu) => `
+        <div>
+          <code>GPU ${escapeHtml(gpu.gpu_index)}</code>
+          <span>${escapeHtml(gpu.model || "Unknown")}</span>
+          <strong>${gpu.schedulable ? "可调度" : "不调度"}</strong>
+        </div>
+      `).join("") : `<small class="muted">等待节点监控扫描</small>`}
+    </div>
+  `;
 }
 
 function nodeAccessScopeText(value) {

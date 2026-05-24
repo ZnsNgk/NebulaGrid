@@ -6,7 +6,7 @@ from app.core.errors import not_found, validation_error
 from app.core.rbac import Role
 from app.core.rbac import require_permission
 from app.db.models import EnvInstallJob, Gpu, Node, TaskAllocation, TaskRequirement, TaskRuntimeGuard, User, UserSupervisor
-from app.schemas.nodes import GpuInfo, NodeCreateRequest, NodeInfo, NodeSaveRequest, NodeUpdateRequest
+from app.schemas.nodes import GpuInfo, NodeCreateRequest, NodeInfo, NodeUpdateRequest
 from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
 from app.services.metrics_service import LatestMetrics, get_latest_metrics
@@ -29,7 +29,7 @@ def list_nodes(user: UserRecord, db: Session, visible_only: bool = True) -> list
 
 
 def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> NodeInfo:
-    """登记计算节点；GPU 可先手填，后续监控会按 nvidia-smi 结果自动校正。"""
+    """登记计算节点；GPU 数量和型号由 monitor 扫描入库，管理员只保存可调度开关。"""
     require_permission(user.role, "nodes:write")
     if is_control_plane_identity(payload.name, payload.ip):
         raise validation_error("master/control-plane node should not be registered as compute node")
@@ -45,10 +45,10 @@ def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> No
         sharing_scope=payload.sharing_scope,
         is_public=payload.access_scope == "public",
         max_speed_mbps=payload.max_speed_mbps,
+        gpu_schedulable_flags=payload.gpu_schedulable_flags,
         state="offline",
         scheduling_enabled=False,
     )
-    sync_node_gpus(node, payload)
     db.add(node)
     try:
         db.commit()
@@ -62,7 +62,7 @@ def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> No
 
 
 def update_node(user: UserRecord, node_id: int, payload: NodeUpdateRequest, db: Session) -> NodeInfo:
-    """修改节点基础信息和 GPU 顺序清单，保留相同 index 的历史监控关联。"""
+    """修改节点基础信息和 GPU 可调度开关，实际 GPU 清单继续由 monitor 维护。"""
     require_permission(user.role, "nodes:write")
     node = require_node_model(node_id, db)
     if is_control_plane_identity(payload.name, payload.ip):
@@ -78,7 +78,8 @@ def update_node(user: UserRecord, node_id: int, payload: NodeUpdateRequest, db: 
     node.sharing_scope = payload.sharing_scope
     node.is_public = payload.access_scope == "public"
     node.max_speed_mbps = payload.max_speed_mbps
-    sync_node_gpus(node, payload)
+    node.gpu_schedulable_flags = payload.gpu_schedulable_flags
+    apply_node_gpu_schedulable_flags(node)
     try:
         db.commit()
     except IntegrityError as exc:
@@ -171,6 +172,7 @@ def build_node_info(
         sharing_scope=getattr(node, "sharing_scope", None) or ("public" if node.is_public else "none"),
         is_public=node.is_public,
         max_speed_mbps=node.max_speed_mbps,
+        gpu_schedulable_flags=list(getattr(node, "gpu_schedulable_flags", None) or []),
         state=node.state,
         scheduling_enabled=node.scheduling_enabled,
         gpus=[
@@ -186,19 +188,17 @@ def build_node_info(
     )
 
 
-def sync_node_gpus(node: Node, payload: NodeSaveRequest) -> None:
-    """按 nvidia-smi 顺序同步 GPU 列表，同 index 更新可保留已有监控与调度引用。"""
-    existing_by_index = {gpu.gpu_index: gpu for gpu in node.gpus}
-    desired_indices = set(range(payload.gpu_count or 0))
-    for index, model in enumerate(payload.gpu_models):
-        gpu = existing_by_index.get(index)
-        if gpu is None:
-            node.gpus.append(Gpu(gpu_index=index, model=model, total_vram_mb=0))
-        else:
-            gpu.model = model
-    for gpu in list(node.gpus):
-        if gpu.gpu_index not in desired_indices:
-            node.gpus.remove(gpu)
+def apply_node_gpu_schedulable_flags(node: Node) -> None:
+    """把节点级 0/1 可用性列表应用到已扫描 GPU；未配置的 index 保守视为不可调度。"""
+    node.gpu_schedulable_flags = [1 if int(flag) else 0 for flag in (getattr(node, "gpu_schedulable_flags", None) or [])]
+    for gpu in node.gpus or []:
+        gpu.schedulable = gpu_index_schedulable(node, gpu.gpu_index)
+
+
+def gpu_index_schedulable(node: Node, gpu_index: int) -> bool:
+    """按 nvidia-smi index 判断 GPU 是否允许调度，缺失配置时不把任务放到未知卡上。"""
+    flags = list(getattr(node, "gpu_schedulable_flags", None) or [])
+    return 0 <= gpu_index < len(flags) and bool(flags[gpu_index])
 
 
 def validate_owner_ids(owner_ids: list[int], db: Session) -> list[int]:

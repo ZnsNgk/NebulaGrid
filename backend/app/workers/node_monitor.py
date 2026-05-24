@@ -10,7 +10,7 @@ from app.core.config import get_settings
 from app.db.models import Gpu, Node
 from app.db.session import SessionLocal
 from app.services.metrics_service import write_monitor_snapshot
-from app.services.node_service import is_control_plane_node
+from app.services.node_service import gpu_index_schedulable, is_control_plane_node
 from app.workers.common import run_forever
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ def monitor_node(db: Session, node: Node, remote_code_root: str, miniconda_pytho
         return
     node.state = "online"
     node.scheduling_enabled = True
-    gpu_rows = sync_gpu_inventory(db, node, payload.get("gpus", []))
+    gpu_rows = sync_gpu_inventory(db, node, payload.get("gpus", []), bool(payload.get("gpu_probe_ok", True)))
     try:
         write_monitor_snapshot(node, payload, gpu_rows)
     except Exception as exc:  # noqa: BLE001 - metrics storage failure must not break node heartbeat.
@@ -69,9 +69,9 @@ def fetch_remote_metrics(node: Node, remote_code_root: str, miniconda_python: st
     return data
 
 
-def sync_gpu_inventory(db: Session, node: Node, gpus: Any) -> list[tuple[Gpu, dict[str, Any]]]:
-    """用 nvidia-smi 结果校正 GPU 清单，并返回需要写入 InfluxDB 的 GPU 指标。"""
-    if not isinstance(gpus, list):
+def sync_gpu_inventory(db: Session, node: Node, gpus: Any, probe_ok: bool = True) -> list[tuple[Gpu, dict[str, Any]]]:
+    """用 nvidia-smi 结果校正 GPU 清单，并按管理员 0/1 列表决定是否可调度。"""
+    if not isinstance(gpus, list) or not probe_ok:
         return []
     existing = {gpu.gpu_index: gpu for gpu in node.gpus}
     seen: set[int] = set()
@@ -83,19 +83,21 @@ def sync_gpu_inventory(db: Session, node: Node, gpus: Any) -> list[tuple[Gpu, di
         seen.add(index)
         gpu = existing.get(index)
         if gpu is None:
-            gpu = Gpu(node_id=node.id, gpu_index=index, model=str(item.get("name") or "Unknown"))
-            db.add(gpu)
+            gpu = Gpu(gpu_index=index, model=str(item.get("name") or "Unknown"))
+            node.gpus.append(gpu)
             db.flush()
             existing[index] = gpu
-            node.gpus.append(gpu)
         gpu.gpu_uuid = str(item.get("uuid") or gpu.gpu_uuid or "")
         gpu.model = str(item.get("name") or gpu.model or "Unknown")
         gpu.total_vram_mb = coerce_int(item.get("memory_total_mb"))
-        gpu.schedulable = True
+        gpu.schedulable = gpu_index_schedulable(node, index)
         metric_rows.append((gpu, item))
-    for index, gpu in existing.items():
+    for index, gpu in list(existing.items()):
         if index not in seen:
-            gpu.schedulable = False
+            # 硬件数量变化时让数据库清单跟随 nvidia-smi，避免旧卡继续参与统计或调度。
+            if gpu in node.gpus:
+                node.gpus.remove(gpu)
+            db.delete(gpu)
     return metric_rows
 
 
