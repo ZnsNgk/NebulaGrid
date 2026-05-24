@@ -7,6 +7,7 @@ from sqlalchemy import select
 from app.core.config import get_settings
 from app.core.time_utils import local_datetime
 from app.services.auth_service import hash_session_token
+from app.services.metrics_service import parse_flux_csv
 from app.db.models import LoginSession
 from app.db.session import SessionLocal
 from app.main import create_app
@@ -49,6 +50,26 @@ def test_runtime_guard_matches_gpu_usage_from_pid_tree() -> None:
 
     assert task_pids == {100, 101, 102}
     assert observed == {"GPU-task"}
+
+
+def test_parse_flux_csv_resets_headers_between_metric_tables() -> None:
+    """验证 InfluxDB 多表头 CSV 会逐段解析，避免 GPU 表头把节点监控字段错位。"""
+    content = """#group,false,false,true,true,true,true,true,true,true,true,true,true
+,result,table,_start,_stop,_time,_value,_field,_measurement,gpu_id,gpu_index,gpu_uuid,model,node_id,node_name
+,,0,2026-05-24T00:00:00Z,2026-05-24T01:00:00Z,2026-05-24T00:59:00Z,0,gpu_usage,gpu_metrics,12,0,GPU-1,RTX 4080,7,node-a
+#group,false,false,true,true,true,true,true,true,true,true,true
+,result,table,_start,_stop,_time,_value,_field,_measurement,gpu_id,ip,node_id,node_name
+,,1,2026-05-24T00:00:00Z,2026-05-24T01:00:00Z,2026-05-24T00:59:00Z,62807,avail_ram_mb,node_metrics,none,10.0.0.7,7,node-a
+"""
+    rows = parse_flux_csv(content)
+
+    assert rows[0]["_measurement"] == "gpu_metrics"
+    assert rows[0]["gpu_id"] == "12"
+    assert rows[0]["node_id"] == "7"
+    assert rows[1]["_measurement"] == "node_metrics"
+    assert rows[1]["gpu_id"] == "none"
+    assert rows[1]["ip"] == "10.0.0.7"
+    assert rows[1]["node_id"] == "7"
 
 
 def test_auth_login_and_me() -> None:

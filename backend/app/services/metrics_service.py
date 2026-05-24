@@ -259,9 +259,25 @@ def query_flux(settings: Settings, flux: str) -> list[dict[str, str]]:
     )
     with urllib.request.urlopen(request, timeout=5) as response:
         content = response.read().decode("utf-8")
+    return parse_flux_csv(content)
+
+
+def parse_flux_csv(content: str) -> list[dict[str, str]]:
+    """解析 InfluxDB CSV；同次查询可能包含多段不同表头，必须逐段重置字段映射。"""
     rows = []
-    for row in csv.DictReader(line for line in content.splitlines() if line and not line.startswith("#")):
-        rows.append(row)
+    headers: list[str] = []
+    for raw_row in csv.reader(line for line in content.splitlines() if line):
+        if not raw_row or raw_row[0].startswith("#"):
+            continue
+        if "_measurement" in raw_row and "_field" in raw_row and "_value" in raw_row:
+            headers = raw_row
+            continue
+        if not headers:
+            continue
+        padded_row = raw_row + [""] * max(0, len(headers) - len(raw_row))
+        row = dict(zip(headers, padded_row))
+        if row.get("_measurement") and row.get("_field"):
+            rows.append(row)
     return rows
 
 
