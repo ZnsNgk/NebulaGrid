@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.errors import AppError, unauthorized
 from app.core.rbac import Role, list_permissions, require_permission
 from app.core.security import create_session_token, hash_password, verify_password, verify_session_token
@@ -13,7 +15,7 @@ from app.core.time_utils import ensure_local_datetime, local_datetime, local_now
 from app.db.models import LoginSession, User, UserSupervisor
 from app.db.session import SessionLocal
 from app.schemas.auth import AdminOnlineUserInfo, AdminUserLoginSessions, LoginResult, LoginSessionInfo, PublicUser
-from app.services.linux_account_service import home_path_for_user, linux_account_for_role, set_child_account_password
+from app.services.linux_account_service import ensure_child_account, home_path_for_user, linux_account_for_role, set_child_account_password
 from app.services.samba_service import (
     disable_samba_account,
     enable_samba_account,
@@ -222,23 +224,27 @@ def change_current_user_password(user: UserRecord, current_password: str, new_pa
         except AppError as exc:
             update_user_record(updated, samba_status="failed", samba_last_error=exc.message)
             raise
-            update_user_record(
-                updated,
-                samba_status=plan.status,
-                samba_last_error=plan.message if plan.status == "failed" else None,
-            )
+        update_user_record(
+            updated,
+            samba_status=plan.status,
+            samba_last_error=plan.message if plan.status == "failed" else None,
+        )
     revoke_user_sessions(user.id)
 
 
 def update_current_user_samba(user: UserRecord, enabled: bool, current_password: str | None = None) -> UserRecord:
     """按当前用户的选择启用或禁用 Samba；开启时用当前密码初始化同名 Samba 账号。"""
-    account_name = user.linux_account_name or linux_account_for_role(user.username, user.role.value)
+    account_name, unavailable_reason = resolve_personal_samba_account(user)
     if account_name is None:
-        raise unauthorized("samba account is unavailable")
+        if enabled:
+            raise unauthorized("samba account is unavailable")
+        return update_user_record(user, samba_enabled=False, samba_status="disabled", samba_last_error=unavailable_reason)
     if enabled:
         if not current_password or not verify_password(current_password, user.password_hash):
             raise unauthorized("current password is invalid")
         try:
+            # Samba 的 tdbsam 后端要求同名 Unix 账号已经存在；开启前补齐子账户，避免账号缺失导致开启失败。
+            ensure_child_account(user.username, user.role.value, password=current_password)
             plan = enable_samba_account(account_name, current_password)
         except AppError as exc:
             update_user_record(user, samba_enabled=True, samba_status="failed", samba_last_error=exc.message)
@@ -260,15 +266,29 @@ def update_current_user_samba(user: UserRecord, enabled: bool, current_password:
 
 def refresh_current_user_samba_status(user: UserRecord) -> UserRecord:
     """刷新当前用户 Samba 实际状态；真实管理未开启时仅回读数据库最近记录。"""
-    account_name = user.linux_account_name or linux_account_for_role(user.username, user.role.value)
+    account_name, unavailable_reason = resolve_personal_samba_account(user)
     if account_name is None:
-        return update_user_record(user, samba_enabled=False, samba_status="disabled", samba_last_error=None)
+        return update_user_record(user, samba_enabled=False, samba_status="disabled", samba_last_error=unavailable_reason)
     plan = inspect_samba_account(account_name, user.samba_enabled, user.samba_status)
     return update_user_record(
         user,
         samba_status=plan.status,
         samba_last_error=plan.message if plan.status == "failed" else None,
     )
+
+
+def resolve_personal_samba_account(user: UserRecord) -> tuple[str | None, str | None]:
+    """只允许映射到个人数据根目录的子账户开启 Samba，避免主账户暴露 /home/ddltm。"""
+    settings = get_settings()
+    account_name = user.linux_account_name or linux_account_for_role(user.username, user.role.value, settings)
+    if account_name is None or account_name == settings.main_linux_user:
+        return None, "Samba 仅支持个人 Linux 子账户，不能使用平台主账户。"
+    home_path = user.home_path or home_path_for_user(user.username, user.role.value, settings)
+    user_home_root = Path(settings.user_home_root).expanduser().resolve(strict=False)
+    resolved_home = Path(home_path).expanduser().resolve(strict=False)
+    if resolved_home == user_home_root or user_home_root not in resolved_home.parents:
+        return None, "Samba 只允许暴露个人数据目录。"
+    return account_name, None
 
 
 def record_login_session(user: UserRecord, token: str, login_ip: str, user_agent: str, device_id: str = "") -> LoginSessionRecord:

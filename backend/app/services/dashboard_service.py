@@ -48,7 +48,7 @@ def build_dashboard_summary(user: UserRecord, db: Session) -> DashboardSummary:
     )
 
 
-def build_presenter_dashboard(user: UserRecord, db: Session) -> PresenterDashboard:
+def build_presenter_dashboard(user: UserRecord, db: Session, history_hours: int = 1) -> PresenterDashboard:
     """构造展示者大屏数据；只读聚合接口不复用普通任务/节点列表权限。"""
     require_permission(user.role, "presenter:read")
     nodes = db.scalars(
@@ -59,7 +59,7 @@ def build_presenter_dashboard(user: UserRecord, db: Session) -> PresenterDashboa
     compute_nodes = [node for node in nodes if not is_control_plane_node(node)]
     latest_metrics = load_latest_metrics(compute_nodes)
     occupied_gpu_ids = load_occupied_gpu_ids(compute_nodes, db)
-    historical_metrics = load_presenter_history(compute_nodes)
+    historical_metrics = load_presenter_history(compute_nodes, history_hours=history_hours)
     node_infos = [build_node_info(node, latest_metrics, occupied_gpu_ids) for node in compute_nodes]
     return PresenterDashboard(
         summary=PresenterSummary(
@@ -74,7 +74,6 @@ def build_presenter_dashboard(user: UserRecord, db: Session) -> PresenterDashboa
             PresenterNodeInfo(
                 id=node.id,
                 name=node.name,
-                ip=node.ip,
                 state=node.state,
                 scheduling_enabled=node.scheduling_enabled,
                 max_speed_mbps=node.max_speed_mbps,
@@ -108,12 +107,12 @@ def build_presenter_dashboard(user: UserRecord, db: Session) -> PresenterDashboa
     )
 
 
-def load_presenter_history(nodes: list[Node]) -> HistoricalMetrics:
+def load_presenter_history(nodes: list[Node], history_hours: int = 1) -> HistoricalMetrics:
     """展示大屏依赖 InfluxDB 历史数据；查询失败时降级为空曲线，避免阻断登录页面。"""
     node_ids = [node.id for node in nodes]
     gpu_ids = [gpu.id for node in nodes for gpu in node.gpus]
     try:
-        return get_historical_metrics(node_ids, gpu_ids)
+        return get_historical_metrics(node_ids, gpu_ids, hours=history_hours)
     except Exception:
         return HistoricalMetrics()
 

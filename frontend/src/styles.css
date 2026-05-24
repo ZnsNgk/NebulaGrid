@@ -936,28 +936,28 @@ nav {
 .presenter-workspace {
   width: 100%;
   margin: 0 auto;
-  padding: 24px 28px 34px;
+  padding: 14px 18px 28px;
 }
 
 .presenter-topbar {
   display: flex;
   justify-content: space-between;
   align-items: flex-end;
-  gap: 18px;
-  margin-bottom: 16px;
+  gap: 14px;
+  margin-bottom: 10px;
 }
 
 .presenter-topbar p {
   margin: 0;
   color: var(--brand-strong);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 800;
 }
 
 .presenter-topbar h1 {
-  margin: 4px 0 0;
+  margin: 2px 0 0;
   color: #f8fbff;
-  font-size: 34px;
+  font-size: 28px;
   letter-spacing: 0;
 }
 
@@ -966,9 +966,33 @@ nav {
   align-items: center;
   justify-content: flex-end;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 8px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.presenter-range {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px;
+  border: 1px solid rgba(177, 204, 255, 0.14);
+  border-radius: 8px;
+  background: rgba(7, 16, 33, 0.72);
+}
+
+.presenter-range button {
+  min-height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.presenter-range button.active {
+  color: #ecfeff;
+  border-color: rgba(103, 232, 249, 0.58);
+  background: rgba(8, 145, 178, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(103, 232, 249, 0.18);
 }
 
 .presenter-refresh {
@@ -978,8 +1002,8 @@ nav {
 .presenter-metrics {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 12px;
-  margin-bottom: 14px;
+  gap: 8px;
+  margin-bottom: 10px;
 }
 
 .presenter-metrics article,
@@ -993,8 +1017,8 @@ nav {
 }
 
 .presenter-metrics article {
-  min-height: 106px;
-  padding: 18px;
+  min-height: 72px;
+  padding: 12px 14px;
 }
 
 .presenter-metrics span,
@@ -1006,234 +1030,288 @@ nav {
 
 .presenter-metrics strong {
   display: block;
-  margin-top: 10px;
+  margin-top: 6px;
   color: #f8fbff;
-  font-size: 34px;
+  font-size: 28px;
 }
 
 .presenter-node-wall {
   display: grid;
-  gap: 14px;
+  gap: 10px;
   overflow: visible;
-  padding-bottom: 40px;
+  padding-bottom: 28px;
 }
 
 .presenter-node {
-  padding: 16px;
+  padding: 0 0 10px;
+  overflow: hidden;
 }
 
-.presenter-node-head {
+.presenter-node-title {
+  min-height: 44px;
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: 14px;
+  padding: 8px 16px 6px;
+  border-bottom: 1px solid rgba(177, 204, 255, 0.12);
 }
 
-.presenter-node-head h2 {
-  margin: 0;
-  color: #f8fbff;
-  font-size: 21px;
-}
-
-.presenter-node-head span {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.presenter-node-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 10px;
-  align-items: stretch;
-}
-
-.presenter-node-grid.no-gpu {
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-}
-
-.presenter-metric-card {
-  min-height: 146px;
-  padding: 12px;
-  display: grid;
-  align-content: space-between;
-  gap: 8px;
-  background: rgba(9, 19, 36, 0.82);
-}
-
-.presenter-metric-card strong {
-  color: #f8fbff;
-  font-size: 26px;
-  line-height: 1.1;
-}
-
-.presenter-sparkline {
-  height: 42px;
-  display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(2px, 1fr);
-  align-items: end;
-  gap: 2px;
-  padding-top: 8px;
-  border-top: 1px solid rgba(177, 204, 255, 0.12);
-}
-
-.presenter-sparkline i {
-  height: var(--h);
-  min-height: 3px;
-  border-radius: 2px 2px 0 0;
-  background: linear-gradient(180deg, var(--brand-strong), #4ade80);
-  opacity: 0.9;
-}
-
-.presenter-sparkline.hot i {
-  background: linear-gradient(180deg, #fb7185, #ef4444);
-}
-
-.presenter-sparkline.busy i {
-  background: linear-gradient(180deg, #fb923c, #f97316);
-}
-
-.presenter-sparkline.calm i {
-  background: linear-gradient(180deg, #7dd3fc, #06b6d4);
-}
-
-.presenter-sparkline.empty {
-  border-top: 1px solid rgba(177, 204, 255, 0.12);
-  background: repeating-linear-gradient(90deg, rgba(177, 204, 255, 0.1) 0 1px, transparent 1px 9px);
-  opacity: 0.6;
-}
-
-.presenter-gpu-panel {
-  grid-column: span 2;
+.presenter-node-title > div {
   min-width: 0;
-  min-height: 146px;
-  padding: 12px;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 10px;
-}
-
-.presenter-gpu-panel > span {
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 800;
-}
-
-.presenter-gpu-usage-grid {
-  min-height: 0;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
-  gap: 8px;
-}
-
-.presenter-gpu-usage {
-  min-width: 0;
-  display: grid;
-  grid-template-rows: auto minmax(34px, 1fr) auto;
-  gap: 5px;
-  padding: 8px;
-  border-radius: 6px;
-  background: rgba(7, 16, 33, 0.82);
-  border: 1px solid rgba(177, 204, 255, 0.12);
-}
-
-.presenter-gpu-usage.occupied {
-  border-color: rgba(251, 146, 60, 0.36);
-  background: rgba(69, 29, 13, 0.32);
-}
-
-.presenter-gpu-usage.hot {
-  border-color: rgba(251, 113, 133, 0.36);
-  background: rgba(76, 5, 25, 0.28);
-}
-
-.presenter-gpu-usage.calm {
-  border-color: rgba(125, 211, 252, 0.24);
-}
-
-.presenter-gpu-lane-head {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
-  gap: 6px;
-  min-width: 0;
+  gap: 12px;
 }
 
-.presenter-gpu-lane-head b {
-  color: #cbd7ef;
-  font-size: 11px;
-}
-
-.presenter-gpu-lane-head strong {
+.presenter-node-title h2 {
+  margin: 0;
   color: #f8fbff;
-  font-size: 18px;
-}
-
-.presenter-gpu-usage small {
-  color: var(--muted);
-  font-size: 11px;
+  font-size: 20px;
+  line-height: 1.1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.presenter-vram-bars {
+.presenter-node-title span:not(.status) {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.presenter-node-row {
+  display: grid;
+  grid-template-columns:
+    minmax(120px, 0.7fr)
+    minmax(138px, 0.8fr)
+    minmax(150px, 0.78fr)
+    minmax(300px, 2.65fr)
+    minmax(300px, 2.65fr);
+  gap: 8px;
+  align-items: stretch;
+  padding: 10px 16px 0;
+}
+
+.presenter-metric-card {
+  min-height: 190px;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  background: rgba(9, 19, 36, 0.82);
+}
+
+.presenter-metric-head {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.presenter-metric-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.presenter-metric-card strong {
+  color: #f8fbff;
+  font-size: 22px;
+  line-height: 1.1;
+  flex: 0 0 auto;
+  max-width: 54%;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.presenter-network-stack {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.presenter-network-stack .presenter-metric-card {
+  min-height: 0;
+  padding: 9px 12px;
+  gap: 6px;
+}
+
+.presenter-network-stack .presenter-metric-card strong {
+  font-size: 16px;
+}
+
+.presenter-network-stack .presenter-sparkline {
+  height: 34px;
+}
+
+.presenter-sparkline {
+  position: relative;
+  height: 48px;
+  overflow: hidden;
+  border: 1px solid rgba(177, 204, 255, 0.16);
+  border-radius: 4px;
+  background:
+    linear-gradient(rgba(177, 204, 255, 0.09) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(177, 204, 255, 0.09) 1px, transparent 1px),
+    rgba(5, 14, 27, 0.66);
+  background-size: 100% 25%, 12.5% 100%, auto;
+}
+
+.presenter-sparkline svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.presenter-sparkline polygon {
+  fill: rgba(103, 232, 249, 0.2);
+}
+
+.presenter-sparkline polyline {
+  fill: none;
+  stroke: #67e8f9;
+  stroke-width: 1.8;
+  vector-effect: non-scaling-stroke;
+}
+
+.presenter-sparkline.hot polygon {
+  fill: rgba(251, 113, 133, 0.2);
+}
+
+.presenter-sparkline.hot polyline {
+  stroke: #fb7185;
+}
+
+.presenter-sparkline.busy polygon {
+  fill: rgba(251, 146, 60, 0.2);
+}
+
+.presenter-sparkline.busy polyline {
+  stroke: #fb923c;
+}
+
+.presenter-sparkline.calm polygon {
+  fill: rgba(125, 211, 252, 0.2);
+}
+
+.presenter-sparkline.calm polyline {
+  stroke: #7dd3fc;
+}
+
+.presenter-sparkline.empty {
+  opacity: 0.6;
+}
+
+.presenter-gpu-panel {
+  min-width: 0;
+  min-height: 190px;
+  padding: 10px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  overflow: hidden;
+}
+
+.presenter-gpu-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.presenter-gpu-panel-head span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.presenter-gpu-panel-head small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.presenter-gpu-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(58px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 8px;
-  align-items: end;
 }
 
-.presenter-vram-bar {
+.presenter-gpu-card {
   min-width: 0;
-  height: 108px;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
-  gap: 4px;
-  align-items: end;
-  text-align: center;
-  color: #dbeafe;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: 6px;
+  background: rgba(7, 16, 33, 0.82);
+  border: 1px solid rgba(177, 204, 255, 0.12);
 }
 
-.presenter-vram-bar strong {
-  min-height: 17px;
-  color: #67e8f9;
-  font-size: 12px;
-  font-weight: 900;
+.presenter-gpu-card.occupied {
+  border-color: rgba(251, 146, 60, 0.36);
+  background: rgba(69, 29, 13, 0.32);
 }
 
-.presenter-vram-bar i {
-  width: 100%;
-  height: var(--h);
-  min-height: 8px;
-  align-self: end;
-  border-radius: 2px 2px 0 0;
-  border: 1px solid rgba(103, 232, 249, 0.48);
-  background: linear-gradient(180deg, rgba(103, 232, 249, 0.34), rgba(103, 232, 249, 0.18));
+.presenter-gpu-card.hot {
+  border-color: rgba(251, 113, 133, 0.36);
+  background: rgba(76, 5, 25, 0.28);
 }
 
-.presenter-vram-bar.occupied i {
-  border-color: rgba(134, 239, 172, 0.42);
-  background: linear-gradient(180deg, rgba(134, 239, 172, 0.34), rgba(34, 197, 94, 0.18));
+.presenter-gpu-card.calm {
+  border-color: rgba(125, 211, 252, 0.24);
 }
 
-.presenter-vram-bar.hot i {
-  border-color: rgba(251, 113, 133, 0.5);
-  background: linear-gradient(180deg, rgba(251, 113, 133, 0.34), rgba(239, 68, 68, 0.18));
-}
-
-.presenter-vram-bar.calm i {
-  border-color: rgba(125, 211, 252, 0.5);
-  background: linear-gradient(180deg, rgba(125, 211, 252, 0.34), rgba(6, 182, 212, 0.18));
-}
-
-.presenter-vram-bar b,
-.presenter-vram-bar small {
+.presenter-gpu-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px;
   min-width: 0;
+}
+
+.presenter-gpu-card-head b {
+  display: block;
+  color: #cbd7ef;
+  font-size: 12px;
+}
+
+.presenter-gpu-card-head span {
+  display: block;
+  max-width: 18em;
+  margin-top: 2px;
   color: var(--muted);
   font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.presenter-gpu-card-head strong {
+  color: #f8fbff;
+  font-size: 24px;
+  line-height: 1;
+}
+
+.presenter-gpu-card.memory .presenter-gpu-card-head strong {
+  color: #67e8f9;
+  font-size: 19px;
+}
+
+.presenter-gpu-card .presenter-sparkline {
+  height: 54px;
+}
+
+.presenter-gpu-card small {
+  color: var(--muted);
+  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2628,7 +2706,7 @@ td {
   .admin-grid,
   .manual-layout,
   .presenter-metrics,
-  .presenter-node-grid,
+  .presenter-node-row,
   .node-management-grid,
   .compile-picker-grid,
   .task-zone-tabs,

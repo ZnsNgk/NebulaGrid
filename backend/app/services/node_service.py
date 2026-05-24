@@ -285,7 +285,7 @@ def build_gpu_info(gpu: Gpu, latest_metrics: LatestMetrics, occupied_gpu_ids: se
 
 
 def load_occupied_gpu_ids(nodes: list[Node], db: Session) -> set[int]:
-    """Return GPU IDs currently held by unreleased scheduler allocations."""
+    """返回仍被未释放调度记录占用的 GPU ID 集合。"""
     node_ids = [node.id for node in nodes]
     if not node_ids:
         return set()
@@ -298,6 +298,14 @@ def load_occupied_gpu_ids(nodes: list[Node], db: Session) -> set[int]:
     for allocation in allocations:
         occupied.update(coerce_int(gpu_id) for gpu_id in allocation.gpu_ids)
     return occupied
+
+
+def coerce_int(value) -> int:
+    """把历史 JSON 中可能混入的字符串 GPU ID 转成整数，避免大屏接口因脏数据中断。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def load_latest_metrics(nodes: list[Node]) -> LatestMetrics:

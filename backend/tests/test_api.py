@@ -282,6 +282,10 @@ def test_current_user_can_toggle_samba_with_current_password(monkeypatch) -> Non
     """验证新用户默认关闭 Samba，开启时必须校验当前密码并返回服务状态。"""
     calls: list[tuple[str, str, str | None]] = []
 
+    def fake_ensure(username: str, role: str, password: str | None = None):
+        """记录开启 Samba 前的 Linux 子账户补齐动作，避免 smbpasswd 因系统账号不存在失败。"""
+        calls.append(("ensure", username, password))
+
     def fake_enable(account_name: str, password: str):
         """模拟生产环境成功创建并启用 Samba 账号，避免测试改动本机系统账户。"""
         from app.services.samba_service import SambaAccountPlan
@@ -289,6 +293,7 @@ def test_current_user_can_toggle_samba_with_current_password(monkeypatch) -> Non
         calls.append(("enable", account_name, password))
         return SambaAccountPlan(account_name, True, "enabled", "已启用", True, [], updated_at="now")
 
+    monkeypatch.setattr("app.services.auth_service.ensure_child_account", fake_ensure)
     monkeypatch.setattr("app.services.auth_service.enable_samba_account", fake_enable)
 
     client = make_client()
@@ -324,7 +329,29 @@ def test_current_user_can_toggle_samba_with_current_password(monkeypatch) -> Non
     assert enable_response.status_code == 200
     assert enable_response.json()["data"]["samba_enabled"] is True
     assert enable_response.json()["data"]["samba_status"] == "enabled"
-    assert calls == [("enable", "samba-student", "student123")]
+    assert calls == [
+        ("ensure", "samba-student", "student123"),
+        ("enable", "samba-student", "student123"),
+    ]
+
+
+def test_main_linux_account_cannot_enable_samba() -> None:
+    """验证映射到平台主账户的账号不能开启 Samba，避免 Windows 文件共享暴露 /home/ddltm。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.post(
+        "/api/auth/samba/update",
+        headers=headers,
+        json={"enabled": True, "current_password": "admin123"},
+    )
+    status_response = client.post("/api/auth/samba/status", headers=headers)
+
+    assert response.status_code == 401
+    assert status_response.status_code == 200
+    assert status_response.json()["data"]["samba_enabled"] is False
+    assert status_response.json()["data"]["samba_status"] == "disabled"
 
 
 def test_samba_password_syncs_when_enabled_user_password_changes(monkeypatch) -> None:

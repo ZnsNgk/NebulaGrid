@@ -149,12 +149,12 @@ def get_latest_metrics(node_ids: list[int], gpu_ids: list[int]) -> LatestMetrics
     )
 
 
-def get_historical_metrics(node_ids: list[int], gpu_ids: list[int]) -> HistoricalMetrics:
+def get_historical_metrics(node_ids: list[int], gpu_ids: list[int], hours: int | None = None) -> HistoricalMetrics:
     """读取展示大屏需要的历史监控曲线；InfluxDB 未配置时返回空序列，不影响页面展示。"""
     settings = get_settings()
     if not influx_enabled(settings) or (not node_ids and not gpu_ids):
         return HistoricalMetrics()
-    flux = build_history_query(settings, node_ids, gpu_ids)
+    flux = build_history_query(settings, node_ids, gpu_ids, hours=hours)
     rows = query_flux(settings, flux)
     node_values: dict[int, dict[str, list[MetricPoint]]] = {}
     gpu_values: dict[int, dict[str, list[MetricPoint]]] = {}
@@ -197,10 +197,15 @@ from(bucket: "{escape_flux_string(settings.influxdb_bucket)}")
 '''
 
 
-def build_history_query(settings: Settings, node_ids: list[int], gpu_ids: list[int]) -> str:
+def build_history_query(settings: Settings, node_ids: list[int], gpu_ids: list[int], hours: int | None = None) -> str:
     """构造展示大屏历史曲线 Flux 查询，按配置窗口聚合以限制响应体大小。"""
     node_filter = " or ".join(f'r.node_id == "{node_id}"' for node_id in node_ids) or "false"
     gpu_filter = " or ".join(f'r.gpu_id == "{gpu_id}"' for gpu_id in gpu_ids) or "false"
+    range_value = settings.influxdb_presenter_range
+    window_value = settings.influxdb_presenter_window
+    if hours is not None:
+        range_value = f"{normalize_presenter_history_hours(hours)}h"
+        window_value = presenter_history_window(normalize_presenter_history_hours(hours))
     node_fields = (
         'r._field == "cpu_usage" or r._field == "avail_ram_mb" or '
         'r._field == "upload_mbps" or r._field == "download_mbps"'
@@ -211,15 +216,31 @@ def build_history_query(settings: Settings, node_ids: list[int], gpu_ids: list[i
     )
     return f'''
 from(bucket: "{escape_flux_string(settings.influxdb_bucket)}")
-  |> range(start: -{settings.influxdb_presenter_range})
+  |> range(start: -{range_value})
   |> filter(fn: (r) =>
     (r._measurement == "node_metrics" and ({node_filter}) and ({node_fields})) or
     (r._measurement == "gpu_metrics" and ({gpu_filter}) and ({gpu_fields}))
   )
-  |> aggregateWindow(every: {settings.influxdb_presenter_window}, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: {window_value}, fn: mean, createEmpty: false)
   |> group(columns: ["_measurement", "node_id", "gpu_id", "_field"])
   |> sort(columns: ["_time"])
 '''
+
+
+def normalize_presenter_history_hours(hours: int) -> int:
+    """限制展示者可选时间范围，避免任意查询拖慢 InfluxDB。"""
+    return hours if hours in {1, 3, 6, 12, 24} else 1
+
+
+def presenter_history_window(hours: int) -> str:
+    """按时间跨度增大聚合窗口，保证 24 小时视图仍保持可控点数。"""
+    if hours <= 3:
+        return "30s"
+    if hours <= 6:
+        return "1m"
+    if hours <= 12:
+        return "2m"
+    return "5m"
 
 
 def query_flux(settings: Settings, flux: str) -> list[dict[str, str]]:

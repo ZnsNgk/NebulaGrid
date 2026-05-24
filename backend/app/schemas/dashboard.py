@@ -54,7 +54,6 @@ class PresenterNodeInfo(BaseModel):
 
     id: int
     name: str
-    ip: str
     state: str
     scheduling_enabled: bool
     max_speed_mbps: int | None = None

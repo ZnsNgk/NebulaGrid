@@ -24,6 +24,18 @@
 - `replace-with-random-secret`：后端 session secret。
 - `<your-repo-url>`：你的代码仓库地址。如果没有 git 仓库，可以用 `rsync/scp` 拷贝代码目录。
 
+### 0.1 权限边界速览
+
+本文采用主账户目录部署模式，代码固定放在 `/home/ddltm/master`，便于后续由 `ddltm` 账户完成代码更新、Python 包安装、数据库初始化和远端脚本同步。管理员仍需要负责系统级操作：
+
+- 安装系统包：`nginx`、`postgresql`、`influxdb2`、`redis-server`、`nfs-kernel-server`、`nfs-common`、`samba`。
+- 创建 Linux 主账户 `ddltm`，并保证主节点和计算节点 UID/GID 一致。
+- 创建和授权 `/home/ddltm/data`、`/home/ddltm/envs`、`/home/ddltm/shared`。
+- 配置 NFS、PostgreSQL、InfluxDB、systemd、Nginx 和 `/etc/nebulagrid/backend.env`。
+- 生产环境启用 Linux/Samba 子账户同步时，配置受限 `NOPASSWD` sudoers，不能给 `NOPASSWD: ALL`。
+
+完成系统级准备后，`ddltm` 可以自己执行 `/home/ddltm/master` 内的日常代码更新、后端依赖安装、`scripts/init_db.py`、`scripts/sync_remote_scripts.py` 和部署自检。
+
 ## 1. 所有机器的基础要求
 
 主节点和计算节点都建议使用 Ubuntu Server 22.04 LTS。
@@ -447,6 +459,41 @@ sudo chmod 640 /etc/nebulagrid/backend.env
 sudo grep -v SECRET /etc/nebulagrid/backend.env
 ```
 
+参数说明：
+
+| 参数 | 含义 |
+|---|---|
+| `NEBULAGRID_APP_NAME` | 后端应用名称，主要用于接口元信息、日志和后续页面展示；通常保持 `NebulaGrid`。 |
+| `NEBULAGRID_ENV` | 运行环境标识，例如 `production` 或 `development`；用于区分生产和开发配置。 |
+| `NEBULAGRID_MANAGE_LINUX_ACCOUNTS` | 是否由 NebulaGrid 自动维护 master 上的平台 Linux 子账户；生产环境需要用户 SSH 到 master 时设为 `true`，并按第 21 节配置受限 sudoers。 |
+| `NEBULAGRID_MANAGE_SAMBA_ACCOUNTS` | 是否同步维护 Samba 账号；只有主节点部署 Samba 且希望用户通过 SMB 访问个人目录时设为 `true`。 |
+| `NEBULAGRID_DATABASE_URL` | PostgreSQL 连接串，包含数据库用户名、密码、地址、端口和库名；密码要替换为第 8 节创建的真实强密码。 |
+| `NEBULAGRID_REDIS_URL` | Redis 连接串；本机默认是 `redis://127.0.0.1:6379/0`。 |
+| `NEBULAGRID_INFLUXDB_URL` | InfluxDB HTTP 地址；默认本机部署时为 `http://127.0.0.1:8086`。 |
+| `NEBULAGRID_INFLUXDB_ORG` | InfluxDB 组织名，必须与 `influx setup --org` 中的值一致。 |
+| `NEBULAGRID_INFLUXDB_BUCKET` | InfluxDB bucket 名，保存节点和 GPU 历史监控指标，必须与初始化 bucket 一致。 |
+| `NEBULAGRID_INFLUXDB_TOKEN` | InfluxDB 访问 token，用于写入和查询监控指标；属于敏感值，不要提交到 Git。 |
+| `NEBULAGRID_INFLUXDB_LATEST_RANGE` | 普通节点监控读取最近数据的时间范围，例如 `30m` 表示最近 30 分钟。 |
+| `NEBULAGRID_INFLUXDB_PRESENTER_RANGE` | 展示者大屏历史曲线读取的时间范围；范围越大，查询数据越多。 |
+| `NEBULAGRID_INFLUXDB_PRESENTER_WINDOW` | 展示者大屏历史曲线的聚合窗口，例如 `30s` 表示按 30 秒聚合一个点。 |
+| `NEBULAGRID_DATA_ROOT` | 平台数据根目录，通过 NFS 共享到计算节点；包含用户 home、日志、运行时文件和备份目录。 |
+| `NEBULAGRID_USER_HOME_ROOT` | 平台用户 home 根目录，用户 `alice` 的目录会落在 `<该路径>/alice`。 |
+| `NEBULAGRID_SHARED_FOLDER_ROOT` | 文件管理中“共享文件夹”视图对应的真实目录，所有登录用户可查看并与个人目录互相复制文件。 |
+| `NEBULAGRID_VISIBLE_ROOTS` | 后端允许展示或解析的额外真实路径列表，多个路径用英文逗号分隔；至少应包含用户 home 根目录和 miniconda 根目录。 |
+| `NEBULAGRID_CONDA_ENV_ROOT` | 用户环境目录，环境列表同步、导入、复制和删除都会以这个目录下的一级子目录为边界。 |
+| `NEBULAGRID_TASK_LOG_ROOT` | 任务 stdout/stderr 日志根目录；远端 runner 会把任务日志写到这里。 |
+| `NEBULAGRID_ENV_PACKAGE_ROOT` | 环境包、whl、源码包等上传或登记包的存放根目录。 |
+| `NEBULAGRID_ENV_INSTALL_LOG_ROOT` | 环境导入、复制、检测、安装包和删除包的日志目录。 |
+| `NEBULAGRID_RUNTIME_ROOT` | 运行时状态目录，用于保存任务 PID、PGID、远端状态文件等临时运行信息。 |
+| `NEBULAGRID_REMOTE_CODE_ROOT` | 下发到共享环境目录的远端脚本目录，计算节点会从这里执行 `runner.py`、`monitor.py`、`env_probe.py` 和 `env_installer.py`。 |
+| `NEBULAGRID_MINICONDA_PYTHON` | 统一 Miniconda 的 Python 解释器路径；后端脚本和环境检测会按该路径寻找 conda 安装。 |
+| `NEBULAGRID_MAIN_LINUX_USER` | 平台主账户，例如 `ddltm`；master 和所有计算节点必须保持同名、同 UID、同 GID，远端 SSH 控制和任务 runner 默认使用该账户。 |
+| `NEBULAGRID_SESSION_SECRET` | 后端会话或令牌签名密钥；生产环境必须换成长随机字符串，泄露后需要立即轮换并让用户重新登录。 |
+| `NEBULAGRID_CORS_ORIGINS` | 允许跨域访问 API 的前端来源列表，多个来源用英文逗号分隔；前端和 API 同域部署时通常保留 `http://127.0.0.1`、`http://localhost`，开发调试可保留 `5173`。 |
+| `NEBULAGRID_SCHEDULER_INTERVAL_SECONDS` | 调度器轮询待运行任务和资源分配的间隔秒数；值越小响应越快，但数据库和节点状态检查压力越高。 |
+| `NEBULAGRID_MONITOR_INTERVAL_SECONDS` | 节点监控 worker 采集节点 CPU、内存、GPU 和网络指标的间隔秒数。 |
+| `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` | 文件管理专用线程池大小，用于列表、预览、上传、复制、移动、删除、打包和解压；共享盘吞吐不足时不要调太大。 |
+
 ## 12. 初始化数据库表和默认账号
 
 以下命令在主节点以 `ddltm` 身份执行。
@@ -849,8 +896,27 @@ TOKEN='<access_token>'
 curl -s http://127.0.0.1:8000/api/admin/nodes \
   -H "Authorization: Bearer ${TOKEN}" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"node-a","ip":"192.168.1.21","ssh_user":"ddltm","gpu_models":["A100","A100"]}'
+  -d '{
+    "name":"node-a",
+    "ip":"192.168.1.21",
+    "ssh_user":"ddltm",
+    "max_speed_mbps":10000,
+    "gpu_count":2,
+    "gpu_models":["NVIDIA A100","NVIDIA A100"],
+    "owner_user_ids":[310001],
+    "access_scope":"private",
+    "sharing_scope":"group"
+  }'
 ```
+
+字段说明：
+
+- `gpu_count` 必须等于 `gpu_models` 的条数。
+- `gpu_models` 必须严格按照该节点 `nvidia-smi` 显示顺序填写，调度器会按这个顺序维护 GPU index。
+- `owner_user_ids` 是节点所有人 ID 列表，可填写多个用户；管理员后台也提供搜索按钮和复选下拉框选择所有人。
+- `access_scope=public` 表示公开使用，`private` 表示私有使用。
+- `sharing_scope=none` 表示不共享，仅所有人和管理员可见；`group` 表示组内共享；`public` 表示所有用户可见可用。
+- 共享范围只影响普通用户总览页中可用 GPU 和节点卡片的可见性，不影响节点总数、在线节点、GPU 总数和运行任务等全局统计。
 
 ### 17.4 查看节点
 
@@ -896,6 +962,29 @@ curl -s 'http://127.0.0.1:8000/api/admin/audit-logs?page_size=20&category=archiv
 ```
 
 如果从旧版本升级，`init_db.py` 会补齐 `audit_logs` 缺失字段并创建常用索引。该表建议纳入长期备份，用于追溯谁在何时对什么对象执行了什么操作。
+
+### 17.8 创建展示者大屏账号
+
+展示者账号角色为 `viewer`，只拥有 `presenter:read` 权限。该账号登录后前端会进入 `#/presenter` 全屏视图，不显示普通控制台左侧栏目，也不会开放任务、文件、环境、节点管理或用户管理入口。页面左下角保留退出登录按钮，便于公共屏幕维护时手动结束会话。
+
+展示者大屏通过 `GET /api/dashboard/presenter` 读取聚合数据。接口会返回节点数量、在线节点、GPU 总数、等待任务当前数、运行任务当前数、历史任务总数，以及所有计算节点的 CPU、可用内存、网络、GPU、可用显存和历史曲线。GPU 使用率和可用显存按每张 GPU 独立展示，便于公共屏幕定位单卡满载、空闲或显存不足的节点。历史曲线来自 InfluxDB 的 `node_metrics` 和 `gpu_metrics`，默认读取最近 `30m` 并按 `30s` 聚合，可通过 `NEBULAGRID_INFLUXDB_PRESENTER_RANGE` 和 `NEBULAGRID_INFLUXDB_PRESENTER_WINDOW` 调整。
+
+创建展示者账号示例：
+
+```bash
+curl -s http://127.0.0.1:8000/api/users \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "username":"viewer",
+    "real_name":"展示大屏",
+    "role":"viewer",
+    "state":"enabled",
+    "password":"replace-with-strong-password"
+  }'
+```
+
+展示者会话不受普通 30 分钟静默在线窗口限制，适合无人值守屏幕长期展示。安全边界仍然保留：主动退出、管理员下线、账号停用或密码变更都会使会话失效。
 
 ## 18. 防火墙
 
@@ -1111,7 +1200,9 @@ ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userd
 
 这样平台创建用户时会创建同名 Linux 账户，用户可用平台用户名和密码 SSH 到 master，并默认进入 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。用户在 Web 修改密码或管理员重置密码时，会同步执行 `chpasswd`；删除平台用户时会同步执行 `userdel --remove`。所有用户目录按实验室共享策略设置为 `755`，便于互相读取和拷贝文件。
 
-主节点还需要配置 Samba 的 `homes` 动态共享；计算节点不需要安装 Samba。用户在账号管理页当前账号卡片中手动勾选 Samba 服务后，系统才会创建或启用同名 Samba 账号，新建用户默认关闭。开启时用户需要输入当前密码，后端用它初始化 Samba 密码；后续用户改密或管理员重置密码时，已开启 Samba 的账号会同步更新 `smbpasswd`。
+主节点还需要配置 Samba 的 `homes` 动态共享；计算节点不需要安装 Samba。用户在账号管理页当前账号卡片中手动勾选 Samba 服务后，系统才会创建或启用同名 Samba 账号，新建用户默认关闭。开启时用户需要输入当前密码，后端会先确保同名 Linux 子账户存在，再用它初始化 Samba 密码；后续用户改密或管理员重置密码时，已开启 Samba 的账号会同步更新 `smbpasswd`。
+
+`[homes]` 必须显式绑定到 `/home/ddltm/data/user/%S`。不要把主账户 `ddltm` 的 home `/home/ddltm` 作为 Samba 共享根，否则任何拿到旧公共账号的人都可能通过 Windows 文件共享看到主目录。
 
 ```bash
 sudo cp /etc/samba/smb.conf /etc/samba/smb.conf.bak.$(date +%Y%m%d%H%M%S)
@@ -1119,15 +1210,32 @@ sudo tee -a /etc/samba/smb.conf >/dev/null <<'EOF'
 
 [homes]
    comment = NebulaGrid user home
+   path = /home/ddltm/data/user/%S
    browseable = no
    read only = no
    valid users = %S
+   force user = %S
    create mask = 0644
    directory mask = 0755
+   follow symlinks = no
+   wide links = no
 EOF
 sudo testparm
+sudo systemctl enable --now smbd
 sudo systemctl restart smbd
 ```
+
+如果此前为了测试创建过 `ddltm` 或其他公共 Samba 账号，先禁用或删除对应 Samba 凭据，不要删除 Linux 主账户本身：
+
+```bash
+sudo smbpasswd -d ddltm || true
+# 如果确认不再需要这个 Samba 凭据，可删除 Samba 账号记录：
+# sudo smbpasswd -x ddltm || true
+```
+
+同时检查 `/etc/samba/smb.conf` 中不要保留 `[ddltm]`、`[data]`、`[shared]` 或其他 `path = /home/ddltm`、`path = /home/ddltm/data` 这类宽范围共享段落。NebulaGrid 只需要 `[homes]` 暴露个人目录；共享文件夹仍建议走 Web 文件管理的“共享文件夹”视图。
+
+如果 `command -v smbpasswd` 或 `command -v pdbedit` 返回的不是 `/usr/bin/...`，需要把 sudoers 中的路径改成现场真实路径。验证授权时不要使用真实用户密码，可创建临时探针账号。
 
 保存后，用 API 运行用户验证 `sudo -n` 是否能无交互执行。下面以 `ddltm` 为例：
 
@@ -1145,7 +1253,38 @@ sudo systemctl reload nginx
 
 上面的 `nebulagrid_sudo_probe` 只用于验证 sudoers 是否真的允许 API 需要的账户命令。因为 sudoers 会严格匹配命令绝对路径，所以如果这里出现 `interactive authentication is required`、`a password is required` 或 `not allowed to execute`，先修正 `/etc/sudoers.d/nebulagrid-ddltm`，不要只测试 `sudo useradd` 这种相对命令。
 
+如果 Samba 状态在页面显示“失败”，优先检查 `journalctl -u nebulagrid-api`、`journalctl -u smbd`、`testparm` 和 sudoers 路径。Samba 协议只暴露主节点上的用户目录，不替代 NFS；NFS 仍然负责 master 与计算节点之间的训练数据和日志共享。
+
+文件管理页面提供“共享文件夹”视图，所有登录用户都可以查看 `NEBULAGRID_SHARED_FOLDER_ROOT` 指向的共享 SSD 目录。默认部署路径为 `/home/ddltm/shared`；如果现场用 `~/ddltm/shared` 这类写法，请在写入 `backend.env` 前先展开成 API 运行用户实际看到的绝对路径，避免 systemd 环境中 `~` 指向不同 home。用户可把个人目录中的文件或文件夹复制到共享文件夹，也可在共享文件夹中把文件或文件夹复制回自己的目录；新建、删除、重命名、上传、打包和解压仍限定在个人文件视图内，避免共享根被误操作。
+
 不要给 `ddltm` 配置宽泛的 `NOPASSWD: ALL`，这样会扩大系统风险。
+
+### 21.1 数据库状态与共享路径说明
+
+普通训练任务已经以 PostgreSQL 为单一状态源，不再依赖 API 进程内存。任务提交、批量提交、修改、挂起、删除、后继任务确认、中止、重新提交、日志路径、执行时间、结束时间、实际节点和实际 GPU 分配都会写入 `tasks`、`task_requirements`、`task_dependencies`、`task_allocations`、`task_events` 和 `task_runtime_guards`。
+
+调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号和 GPU 复用策略选择资源。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
+
+任务日志默认位于 `/home/ddltm/data/logs/task_logs/<task_id>.log`；历史区默认加载最近 100 条可见任务，用户点击“查看所有历史任务”后才会加载全部可见历史任务，避免长时间运行后一次性拉取过多记录。
+
+Runtime Guard 已经以 `task_runtime_guards` 为入口追踪运行任务。执行器启动远端 runner 后会记录 root PID 和进程组，守护进程通过 SSH 展开 PID 树，再读取 `nvidia-smi --query-compute-apps` 返回的 GPU UUID。GPU UUID 是越权判断依据，GPU index 只用于页面展示和 `CUDA_VISIBLE_DEVICES`。连续两轮发现任务使用未分配 GPU 后，系统会终止远端进程组、标记 `alloc_error`、释放 allocation，并把原因写入任务日志和 `task_events`。
+
+环境包安装已经进入 `env_install_jobs` 队列。本机 conda/pip 离线安装、上传包安装和 compile 安装都会持久化安装命令、工作目录、日志路径、目标节点、主节点标记、GPU 可见模式和可见 GPU index。API 创建作业后会启动后台线程领取执行，生产部署仍建议同时运行 `nebulagrid-env-install-worker` 作为独立环境安装 worker；数据库作业状态会避免同一作业重复执行。安装作业日志继续复用 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，因此该路径同样必须在主节点和计算节点保持一致。
+
+用户点击安装包页面的“在指定节点”时，后端会实时探测主节点和用户可见计算节点的 `gcc`、`g++`、`clang`、`nvcc` 与 GPU 清单。默认 GPU 模式不设置 `CUDA_VISIBLE_DEVICES`；CPU 模式设置为目标节点 GPU 总数加一；指定 GPU 模式设置为用户勾选的 GPU index 列表。同一环境安装包或删除包期间会加锁，页面状态显示为“安装中”，再次提交会提示稍后再试。
+
+环境管理功能依赖 `/home/ddltm/envs/miniconda3/envs` 和 `/home/ddltm/data/logs/env_install_logs` 在主节点和计算节点路径一致。导入环境、创建环境副本、修复路径、检测环境和删除环境都会围绕这两个目录工作：
+
+- 环境目录：`/home/ddltm/envs/miniconda3/envs/<env_name>`
+- 环境日志：`/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，并同步写入数据库 `env_operation_logs`
+
+用户导入 zip 环境包或创建副本后，系统会把环境复制到 `miniconda3/envs` 下，修复所有文本文件中的旧环境前缀，并整理权限。目录应为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。如果出现 `bad interpreter`、`错误的解释器` 或 `pip` 指向旧路径，优先检查环境日志和环境目录中的残留旧路径：
+
+```bash
+grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2>/dev/null | head
+```
+
+管理员可以查看全部环境日志；普通用户只能查看自己导入或复制的环境日志。日志文件采用 JSON Lines 格式，页面查看时会自动解析 JSON 字段和 `\n` 换行。
 
 ## 22. 环境管理验收补充
 

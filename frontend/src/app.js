@@ -36,6 +36,7 @@ const state = {
   loginFilters: { user_id: "", keyword: "" },
   autoRefreshSeconds: Number(localStorage.getItem("ng_dashboard_refresh_seconds") || 5),
   presenterRefreshSeconds: Number(localStorage.getItem("ng_presenter_refresh_seconds") || 5),
+  presenterHistoryHours: Number(localStorage.getItem("ng_presenter_history_hours") || 1),
   autoRefreshTimer: null,
   autoRefreshBusy: false,
   sessionRefreshTimer: null,
@@ -82,6 +83,7 @@ const AUTH_WATCH_MS = 3000;
 const FILE_JOB_REFRESH_MS = 2000;
 const TASK_LOG_TAIL_BYTES = "200KB";
 const TASK_LOG_TAIL_LINES = 200;
+const PRESENTER_HISTORY_OPTIONS = [1, 3, 6, 12, 24];
 
 const authExpiredMessages = new Set([
   "invalid token",
@@ -505,7 +507,8 @@ async function refreshPage() {
 }
 
 async function loadPresenterDashboard() {
-  state.data.presenter = (await api("/dashboard/presenter")).data;
+  const hours = PRESENTER_HISTORY_OPTIONS.includes(state.presenterHistoryHours) ? state.presenterHistoryHours : 1;
+  state.data.presenter = (await api(`/dashboard/presenter?hours=${hours}`)).data;
   state.lastPresenterRefreshAt = new Date();
 }
 
@@ -556,6 +559,13 @@ function setPresenterRefreshSeconds(value) {
   localStorage.setItem("ng_presenter_refresh_seconds", String(seconds));
   updateRealtimeTimers();
   render();
+}
+
+function setPresenterHistoryHours(value) {
+  const hours = Number(value);
+  state.presenterHistoryHours = PRESENTER_HISTORY_OPTIONS.includes(hours) ? hours : 1;
+  localStorage.setItem("ng_presenter_history_hours", String(state.presenterHistoryHours));
+  run(loadPresenterDashboard);
 }
 
 function updateRealtimeTimers() {
@@ -1716,12 +1726,8 @@ async function changePassword(event) {
   form.reset();
 }
 
-async function toggleCurrentSamba(input) {
-  const enabled = Boolean(input.checked);
-  const passwordInput = document.querySelector("[name='samba_current_password']");
-  const currentPassword = passwordInput ? passwordInput.value.trim() : "";
+async function toggleCurrentSamba(enabled, currentPassword = "") {
   if (enabled && !currentPassword) {
-    input.checked = false;
     throw new Error("开启 Samba 需要当前密码");
   }
   const payload = await api("/auth/samba/update", {
@@ -1732,7 +1738,6 @@ async function toggleCurrentSamba(input) {
     }),
   });
   state.user = payload.data;
-  if (passwordInput) passwordInput.value = "";
   render();
 }
 
@@ -2180,6 +2185,11 @@ function renderPresenter() {
           </div>
           <div class="presenter-controls">
             <span>${state.lastPresenterRefreshAt ? `更新 ${formatTime(state.lastPresenterRefreshAt)}` : "等待刷新"}</span>
+            <div class="presenter-range" aria-label="历史数据范围">
+              ${PRESENTER_HISTORY_OPTIONS.map((hours) => `
+                <button class="secondary ${state.presenterHistoryHours === hours ? "active" : ""}" type="button" data-presenter-hours="${hours}">${hours}h</button>
+              `).join("")}
+            </div>
             <label class="refresh-control presenter-refresh">刷新
               <input name="presenter_refresh_seconds" type="number" min="0" max="3600" step="1" value="${state.presenterRefreshSeconds}">
               <span>秒</span>
@@ -2210,66 +2220,59 @@ function renderPresenterNode(node) {
   const gpus = node.gpus || [];
   return `
     <article class="presenter-node">
-      <div class="presenter-node-head">
+      <div class="presenter-node-title">
         <div>
           <h2>${escapeHtml(node.name)}</h2>
-          <span>${escapeHtml(node.ip || "-")} · ${escapeHtml(gpus.length)} GPU · ${node.scheduling_enabled ? "调度开启" : "调度关闭"}</span>
+          <span>${escapeHtml(gpus.length)} GPU · ${node.scheduling_enabled ? "调度开启" : "调度关闭"}</span>
         </div>
         <span class="status ${node.state}">${nodeStateText(node.state)}</span>
       </div>
-      <div class="presenter-node-grid ${gpus.length ? "has-gpu" : "no-gpu"}">
-        ${presenterMetricCard("CPU 使用率", percent(node.cpu_usage), node.history?.cpu_usage || [], "percent", "cpu")}
-        ${presenterMetricCard("可用内存", formatMb(node.avail_ram_mb), node.history?.avail_ram_mb || [], "memory", "memory")}
-        ${presenterMetricCard("网络接收", speed(node.download_mbps), node.history?.download_mbps || [], "dynamic", "network")}
-        ${presenterMetricCard("网络发送", speed(node.upload_mbps), node.history?.upload_mbps || [], "dynamic", "network")}
-        ${gpus.length ? `${renderPresenterGpuUsagePanel(gpus)}${renderPresenterGpuRamPanel(gpus)}` : ""}
+      <div class="presenter-node-row ${gpus.length ? "has-gpu" : "no-gpu"}">
+        ${presenterMetricCard("CPU 使用率", percent(node.cpu_usage), node.history?.cpu_usage || [], "percent", "cpu", node.cpu_usage)}
+        ${presenterMetricCard("可用内存", formatMb(node.avail_ram_mb), node.history?.avail_ram_mb || [], "memory", "memory", node.avail_ram_mb)}
+        <div class="presenter-network-stack">
+          ${presenterMetricCard("网络接收", speed(node.download_mbps), node.history?.download_mbps || [], "dynamic", "network", node.download_mbps)}
+          ${presenterMetricCard("网络发送", speed(node.upload_mbps), node.history?.upload_mbps || [], "dynamic", "network", node.upload_mbps)}
+        </div>
+        ${gpus.length ? `
+          ${renderPresenterGpuMetricPanel("GPU 使用率", gpus, "usage")}
+          ${renderPresenterGpuMetricPanel("可用 GPU 显存", gpus, "memory")}
+        ` : `<section class="presenter-gpu-panel">${renderEmpty("暂无 GPU")}</section>`}
       </div>
     </article>
   `;
 }
 
-function renderPresenterGpuUsagePanel(gpus = []) {
+function renderPresenterGpuMetricPanel(label, gpus = [], kind = "usage") {
   return `
-    <section class="presenter-gpu-panel presenter-gpu-usage-panel">
-      <span>GPU 使用率</span>
+    <section class="presenter-gpu-panel ${kind}">
+      <div class="presenter-gpu-panel-head">
+        <span>${escapeHtml(label)}</span>
+        <small>${kind === "usage" ? "当前使用率" : "当前可用显存"}</small>
+      </div>
       ${gpus.length ? `
-        <div class="presenter-gpu-usage-grid">
+        <div class="presenter-gpu-grid">
           ${gpus.map((gpu, index) => {
             const tone = presenterGpuTone(index, gpu);
-            return `
-              <div class="presenter-gpu-usage ${tone} ${gpu.scheduled_occupied ? "occupied" : ""}" title="${escapeAttr(gpu.model || "Unknown")}">
-                <div class="presenter-gpu-lane-head">
-                  <b>GPU ${escapeHtml(gpu.gpu_index)}</b>
-                  <strong>${percent(gpu.gpu_usage)}</strong>
-                </div>
-                ${renderSparkline(gpu.history?.gpu_usage || [], "percent", tone)}
-                <small>${escapeHtml(gpu.process_count ?? 0)} 进程 · ${gpu.scheduled_occupied ? "调度占用" : "空闲"}</small>
-              </div>
-            `;
-          }).join("")}
-        </div>
-      ` : `<div class="presenter-panel-empty">暂无 GPU</div>`}
-    </section>
-  `;
-}
-
-function renderPresenterGpuRamPanel(gpus = []) {
-  return `
-    <section class="presenter-gpu-panel presenter-gpu-ram-panel">
-      <span>可用 GPU 显存</span>
-      ${gpus.length ? `
-        <div class="presenter-vram-bars">
-          ${gpus.map((gpu, index) => {
             const free = Number(gpu.free_vram_mb || 0);
             const total = Number(gpu.total_vram_mb || 0);
-            const height = total > 0 ? Math.max(6, Math.min(100, Math.round((free / total) * 100))) : 8;
-            const tone = presenterGpuTone(index, gpu);
+            const value = kind === "usage" ? percent(gpu.gpu_usage) : formatMb(free);
+            const detail = kind === "usage"
+              ? `${escapeHtml(gpu.process_count ?? 0)} 进程 · ${gpu.scheduled_occupied ? "调度占用" : "空闲"}`
+              : `${formatMb(free)} / ${formatMb(total)} · ${gpu.scheduled_occupied ? "调度占用" : "空闲"}`;
+            const points = kind === "usage" ? gpu.history?.gpu_usage || [] : gpu.history?.free_vram_mb || [];
+            const mode = kind === "usage" ? "percent" : "memory";
             return `
-              <div class="presenter-vram-bar ${tone} ${gpu.scheduled_occupied ? "occupied" : ""}" style="--h:${height}%" title="${escapeAttr(gpu.model || "Unknown")}">
-                <strong>${formatMb(free)}</strong>
-                <i></i>
-                <b>GPU ${escapeHtml(gpu.gpu_index)}</b>
-                <small>${formatMb(total)}</small>
+              <div class="presenter-gpu-card ${kind} ${tone} ${gpu.scheduled_occupied ? "occupied" : ""}" title="${escapeAttr(gpu.model || "Unknown")}">
+                <div class="presenter-gpu-card-head">
+                  <div>
+                    <b>GPU ${escapeHtml(gpu.gpu_index)}</b>
+                    <span>${escapeHtml(gpu.model || "Unknown")}</span>
+                  </div>
+                  <strong>${value}</strong>
+                </div>
+                ${renderSparkline(points, mode, tone, kind === "usage" ? gpu.gpu_usage : free)}
+                <small>${detail}</small>
               </div>
             `;
           }).join("")}
@@ -2279,28 +2282,59 @@ function renderPresenterGpuRamPanel(gpus = []) {
   `;
 }
 
-function presenterMetricCard(label, value, points, mode, tone = "default") {
+function presenterMetricCard(label, value, points, mode, tone = "default", currentValue = null) {
   return `
     <section class="presenter-metric-card ${tone}">
-      <span>${escapeHtml(label)}</span>
-      <strong>${escapeHtml(value)}</strong>
-      ${renderSparkline(points, mode)}
+      <div class="presenter-metric-head">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(value)}</strong>
+      </div>
+      ${renderSparkline(points, mode, tone, currentValue)}
     </section>
   `;
 }
 
-function renderSparkline(points = [], mode = "dynamic", tone = "") {
-  const values = (points || []).slice(-48).map((point) => Number(point.value || 0));
-  if (!values.length) return `<div class="presenter-sparkline empty"></div>`;
+function renderSparkline(points = [], mode = "dynamic", tone = "", currentValue = null) {
+  const endMs = state.lastPresenterRefreshAt?.getTime?.() || Date.now();
+  const hours = PRESENTER_HISTORY_OPTIONS.includes(state.presenterHistoryHours) ? state.presenterHistoryHours : 1;
+  const startMs = endMs - hours * 60 * 60 * 1000;
+  const samples = normalizeTimelinePoints(points, startMs, endMs, currentValue);
+  if (!samples.length) return `<div class="presenter-sparkline ${tone} empty"></div>`;
+  const values = samples.map((point) => point.value);
   const maxValue = mode === "percent" ? 100 : Math.max(1, ...values);
+  const chartPoints = samples.map((point) => {
+    const x = Math.max(0, Math.min(100, ((point.time - startMs) / (endMs - startMs)) * 100));
+    const y = 40 - Math.max(0, Math.min(1, point.value / maxValue)) * 36;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  });
+  const areaPoints = `0,42 ${chartPoints.join(" ")} 100,42`;
   return `
     <div class="presenter-sparkline ${tone}">
-      ${values.map((value) => {
-        const height = Math.max(4, Math.min(100, Math.round((value / maxValue) * 100)));
-        return `<i style="--h:${height}%"></i>`;
-      }).join("")}
+      <svg viewBox="0 0 100 42" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+        <polygon points="${areaPoints}"></polygon>
+        <polyline points="${chartPoints.join(" ")}"></polyline>
+      </svg>
     </div>
   `;
+}
+
+function normalizeTimelinePoints(points = [], startMs, endMs, currentValue = null) {
+  const samples = (points || [])
+    .map((point) => {
+      const time = Date.parse(point.time || "");
+      const value = Number(point.value);
+      return Number.isFinite(time) && Number.isFinite(value) ? { time, value } : null;
+    })
+    .filter((point) => point && point.time >= startMs && point.time <= endMs)
+    .sort((left, right) => left.time - right.time);
+  const latestValue = Number(currentValue);
+  if (Number.isFinite(latestValue)) {
+    const last = samples[samples.length - 1];
+    if (last && Math.abs(last.time - endMs) > 1000) {
+      samples.push({ time: endMs, value: latestValue });
+    }
+  }
+  return samples;
 }
 
 function presenterGpuTone(index, gpu = {}) {
@@ -4344,6 +4378,9 @@ function bindEvents() {
   document.querySelectorAll("[data-action='refresh']").forEach((button) => button.addEventListener("click", () => run(refreshPage, "已刷新")));
   document.querySelector("[name='dashboard_refresh_seconds']")?.addEventListener("change", (event) => setDashboardRefreshSeconds(event.currentTarget.value));
   document.querySelector("[name='presenter_refresh_seconds']")?.addEventListener("change", (event) => setPresenterRefreshSeconds(event.currentTarget.value));
+  document.querySelectorAll("[data-presenter-hours]").forEach((button) => {
+    button.addEventListener("click", () => setPresenterHistoryHours(button.dataset.presenterHours));
+  });
   document.querySelector("[data-action='close-drawer']")?.addEventListener("click", () => {
     if (isEnvPackageInstalling() && !window.confirm("安装正在执行，关闭页面可能导致你无法看到实时结果。确认关闭吗？")) return;
     stopTaskLogRefreshTimer();
@@ -4425,7 +4462,12 @@ function bindEvents() {
   document.querySelectorAll("[data-reset-user]").forEach((button) => button.addEventListener("click", () => fillPasswordResetForm(button.dataset.resetUser)));
   document.querySelectorAll("[data-delete-user]").forEach((button) => button.addEventListener("click", () => run(() => deleteUser(button.dataset.deleteUser), "账号已删除")));
   document.querySelectorAll("[data-toggle-user]").forEach((button) => button.addEventListener("click", () => run(() => toggleUserState(button.dataset.toggleUser, button.dataset.nextState), button.dataset.nextState === "enabled" ? "账号已启用" : "账号已停用")));
-  document.querySelector("[data-toggle-samba]")?.addEventListener("change", (event) => run(() => toggleCurrentSamba(event.currentTarget), event.currentTarget.checked ? "Samba 服务已启用" : "Samba 服务已禁用"));
+  document.querySelector("[data-toggle-samba]")?.addEventListener("change", (event) => {
+    const enabled = Boolean(event.currentTarget.checked);
+    const passwordInput = document.querySelector("[name='samba_current_password']");
+    const currentPassword = passwordInput ? passwordInput.value.trim() : "";
+    run(() => toggleCurrentSamba(enabled, currentPassword), enabled ? "Samba 服务已启用" : "Samba 服务已禁用");
+  });
   document.querySelectorAll("select[name='supervisor_ids']").forEach((select) => select.addEventListener("change", () => enforceSupervisorLimit(select)));
   bindSessionEvents();
   document.querySelectorAll("[data-reconnect-node]").forEach((button) => button.addEventListener("click", () => run(() => reconnectNode(button.dataset.reconnectNode), "已提交重连")));
