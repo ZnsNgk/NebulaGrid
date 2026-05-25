@@ -62,7 +62,7 @@ sudo apt update
 sudo apt install -y \
   build-essential curl git rsync nginx \
   nfs-kernel-server postgresql postgresql-contrib redis-server \
-  influxdb2 openssh-client samba
+  influxdb2 openssh-client samba acl
 ```
 
 启动基础服务：
@@ -1197,7 +1197,7 @@ sudo visudo -f /etc/sudoers.d/nebulagrid-ddltm
 ddltm ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userdel, /usr/sbin/chpasswd, /usr/bin/mkdir, /usr/bin/chown, /usr/bin/chmod, /usr/bin/find, /usr/bin/setfacl, /usr/bin/smbpasswd, /usr/bin/pdbedit, /usr/bin/systemctl restart smbd, /bin/systemctl restart smbd, /bin/systemctl restart nebulagrid-api, /bin/systemctl restart nebulagrid-scheduler, /bin/systemctl restart nebulagrid-node-monitor, /bin/systemctl restart nebulagrid-task-executor, /bin/systemctl restart nebulagrid-runtime-guard, /bin/systemctl restart nebulagrid-env-install-worker, /bin/systemctl reload nginx
 ```
 
-这样平台创建用户时会创建同名 Linux 账户，用户可用平台用户名和密码 SSH 到 master，并默认进入 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。用户在 Web 修改密码或管理员重置密码时，会同步执行 `chpasswd`；删除平台用户时会同步执行 `userdel --remove`。所有用户目录按实验室共享策略设置为 `755`，便于互相读取和拷贝文件。
+这样平台创建用户时会创建同名 Linux 账户，用户可用平台用户名和密码 SSH 到 master，并默认进入 `/home/ddltm/data/user/<user_name>`。`NEBULAGRID_MAIN_LINUX_USER` 对应的主账户会被保护，不会被平台删改系统密码。用户在 Web 修改密码或管理员重置密码时，会同步执行 `chpasswd`；删除平台用户时会同步执行 `userdel --remove`。用户目录按隔离策略设置为“目录用户可读写、主账户 `ddltm` 可维护、其他子账户不可直接进入”。这个策略依赖 POSIX ACL：文件仍归上传用户所有，但 `ddltm` 通过 ACL 获得写权限，用于任务日志更新、环境导入和后台清理。
 
 主节点还需要配置 Samba 的 `homes` 动态共享；计算节点不需要安装 Samba。用户在账号管理页当前账号卡片中手动勾选 Samba 服务后，系统才会创建或启用同名 Samba 账号，新建用户默认关闭。开启时用户需要输入当前密码，后端会先确保同名 Linux 子账户存在，再用它初始化 Samba 密码；后续用户改密或管理员重置密码时，已开启 Samba 的账号会同步更新 `smbpasswd`。每次真实执行 Samba 账号变更后，后端会自动执行 `systemctl restart smbd`，让 Windows 共享尽快读取最新账号状态。
 
@@ -1214,14 +1214,37 @@ sudo tee -a /etc/samba/smb.conf >/dev/null <<'EOF'
    read only = no
    valid users = %S
    force user = %S
-   create mask = 0644
-   directory mask = 0755
+   create mask = 0664
+   directory mask = 2775
+   force directory mode = 2000
+   inherit acls = yes
+   map acl inherit = yes
    follow symlinks = no
    wide links = no
 EOF
 sudo testparm
 sudo systemctl enable --now smbd
 sudo systemctl restart smbd
+```
+
+这里必须保留 `force user = %S`，让 Samba 上传文件继续归真实平台用户所有；不要改成 `force user = ddltm`，否则文件审计和用户隔离都会失真。`inherit acls = yes` 和 `map acl inherit = yes` 用来让 Samba 新建文件继承用户目录上的 ACL，避免用户上传 `*.log` 后 `ddltm` 不能追加或改写。
+
+如果是新部署，平台创建或补齐 Linux 子账户时会自动给每个用户目录写入 ACL。若现场已经有历史用户目录，或此前用 `0644/0755` 配置上传过文件，需要按用户目录补一次 ACL。下面以用户 `test1` 为例，命令只作用于该用户目录，避免扩大到整个 `/home/ddltm`：
+
+```bash
+sudo chown -R test1:test1 /home/ddltm/data/user/test1
+sudo chmod -R u+rwX,go-rwx /home/ddltm/data/user/test1
+sudo setfacl -R -m u:test1:rwX,u:ddltm:rwX,m::rwx,o::--- /home/ddltm/data/user/test1
+sudo find /home/ddltm/data/user/test1 -type d -exec setfacl -d -m u:test1:rwx,u:ddltm:rwx,g::---,m::rwx,o::--- {} +
+```
+
+如果要批量修复所有已有用户目录，先从数据库或 `/home/ddltm/data/user` 核对真实用户名，再逐个替换上面命令里的 `test1` 执行；不要直接对 `/home/ddltm/data/user` 做无差别 `chown -R ddltm`，否则会把用户目录属主改成主账户，破坏 `force user = %S` 的隔离模型。
+
+验证某个用户通过 Samba 上传后的文件是否允许主账户维护：
+
+```bash
+getfacl /home/ddltm/data/user/test1/some.log
+sudo -u ddltm test -w /home/ddltm/data/user/test1/some.log && echo writable
 ```
 
 如果此前为了测试创建过 `ddltm` 或其他公共 Samba 账号，先禁用或删除对应 Samba 凭据，不要删除 Linux 主账户本身：
@@ -1293,7 +1316,7 @@ sudo smbclient //127.0.0.1/test1 -U test1
 
 排查结论按输出判断：`id test1` 失败说明 Linux 子账户未创建；`pdbedit -L` 没有 `test1` 说明 Samba 账号未创建；`ss` 没有 `:445` 说明 `smbd` 未监听；本机 `smbclient //127.0.0.1/test1 -U test1` 失败说明 Samba 配置、账号或目录权限仍有问题；本机 `smbclient` 成功而 Windows 不成功时，优先检查 Windows 凭据缓存、防火墙和 445 端口。
 
-如果 Samba 状态在页面显示“失败”，优先检查 `journalctl -u nebulagrid-api`、`journalctl -u smbd`、`testparm`、`sudo smbclient //127.0.0.1/<user_name> -U <user_name>` 和 sudoers 路径。Samba 协议只暴露主节点上的用户目录，不替代 NFS；NFS 仍然负责 master 与计算节点之间的训练数据和日志共享。
+如果 Samba 状态在页面显示“失败”，优先检查 `journalctl -u nebulagrid-api`、`journalctl -u smbd`、`testparm`、`sudo smbclient //127.0.0.1/<user_name> -U <user_name>` 和 sudoers 路径。如果 Samba 上传成功但 `ddltm` 不能更新用户目录内的文件，优先用 `getfacl` 检查该文件和父目录是否继承了 `u:ddltm:rwX`，不要先改成宽范围 `chown -R ddltm`。Samba 协议只暴露主节点上的用户目录，不替代 NFS；NFS 仍然负责 master 与计算节点之间的训练数据和日志共享。
 
 文件管理页面提供“共享文件夹”视图，所有登录用户都可以查看 `NEBULAGRID_SHARED_FOLDER_ROOT` 指向的共享 SSD 目录。默认部署路径为 `/home/ddltm/shared`；如果现场用 `~/ddltm/shared` 这类写法，请在写入 `backend.env` 前先展开成 API 运行用户实际看到的绝对路径，避免 systemd 环境中 `~` 指向不同 home。用户可把个人目录中的文件或文件夹复制到共享文件夹，也可在共享文件夹中把文件或文件夹复制回自己的目录；新建、删除、重命名、上传、打包和解压仍限定在个人文件视图内，避免共享根被误操作。
 
@@ -1400,6 +1423,7 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 - PostgreSQL 中能看到 `envs` 表；环境导入、复制、检测和删除后状态与真实目录一致。
 - PostgreSQL 中能看到 `tasks`、`task_allocations`、`task_events`、`task_runtime_guards` 和 `env_install_jobs` 表；任务提交、调度、日志读取和环境安装作业状态都能落库。
 - `/home/ddltm/data/logs/env_install_logs/` 中能看到单环境 JSON Lines 日志文件，数据库 `env_operation_logs` 中能看到同源结构化日志。
+- 用户通过 Samba 上传到 `/home/ddltm/data/user/<user_name>` 的文件仍归该用户所有，同时 `sudo -u ddltm test -w <uploaded-file>` 返回可写，说明主账户维护 ACL 已生效。
 - InfluxDB 中能查询到 `node_metrics` / `gpu_metrics` 监控点。
 - systemd 中 API 和 worker 服务为 running。
 
