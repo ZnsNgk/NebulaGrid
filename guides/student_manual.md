@@ -224,13 +224,46 @@ scp test1@192.168.0.1:~/outputs/result.csv .\result.csv
 常用操作：
 
 - `刷新环境列表`：重新读取环境列表。
-- `导入环境`：登记系统扫描到的可用环境。
+- `导入环境`：从自己的文件目录选择打包好的 conda 环境 zip，导入为可用环境。
 - `检测`：检查 Python、PyTorch、TensorFlow、CUDA 和包信息。
 - `查看日志`：查看检测、复制、导入或安装包过程。
 - `创建副本`：从一个可用环境复制出自己的环境。
 - `安装包`：向可修改的环境安装 conda 包、wheel、本地包或源码包。
 - `删除包`：从环境中删除你选择的包，基础包会被保护。
 - `删除环境`：删除自己有权限删除的环境。
+
+### 从其他 Ubuntu 电脑导入环境
+
+如果你已经在另一台 Ubuntu 电脑上配好了 conda 环境，可以把那个环境打包后导入 NebulaGrid。推荐流程如下：
+
+1. 在那台 Ubuntu 电脑上找到环境目录。环境必须位于 Linux 版 Anaconda3 或 Miniconda3 的 `envs` 目录下，例如 `~/miniconda3/envs/<env_name>` 或 `~/anaconda3/envs/<env_name>`。
+2. 进入 `envs` 目录，把整个环境目录打成 zip。不要只压缩 `bin`、`lib` 或 `conda-meta` 子目录，也不要把多个环境打进同一个 zip：
+
+   ```bash
+   sudo apt install -y zip
+   cd ~/miniconda3/envs
+   zip -r <env_name>.zip <env_name>
+   ```
+
+   如果你使用的是 Anaconda3，把 `cd` 那一行换成：
+
+   ```bash
+   cd ~/anaconda3/envs
+   zip -r <env_name>.zip <env_name>
+   ```
+
+3. 用自己的平台账号把 zip 传到主节点个人目录。把 `<user_name>` 换成你的平台用户名，把 `<master-ip>` 换成管理员给你的主节点地址：
+
+   ```bash
+   scp <env_name>.zip <user_name>@<master-ip>:~/<env_name>.zip
+   ```
+
+   上传完成后，在 Web `文件管理` 的个人根目录 `/` 下应能看到 `/<env_name>.zip`。
+
+4. 进入 Web `环境管理`，点击 `导入环境`，从个人目录中选择刚上传的 `/<env_name>.zip`，填写目标环境名并确认。
+5. 页面会显示 `导入中 -> 修复中 -> 测试中 -> 可用`。系统会自动解包、复制到集群的 conda 环境目录、修复旧路径，再运行检测。检测通过后，这个环境才会显示为可用。
+
+环境包只能来自 Linux x86_64/amd64 系统中的 Anaconda3/Miniconda3。Linux ARM、MIPS 等其他架构不能使用；Windows 和 macOS 的 conda 环境禁止上传。系统会自动检测环境包的可用操作系统和执行情况，非 Linux 或无法在当前集群激活的环境会被拒绝或标记为导入失败。
 
 ### 在指定节点编译安装环境包
 

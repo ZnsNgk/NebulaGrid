@@ -1321,6 +1321,37 @@ Runtime Guard 已经以 `task_runtime_guards` 为入口追踪运行任务。执�
 - 环境目录：`/home/ddltm/envs/miniconda3/envs/<env_name>`
 - 环境日志：`/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，并同步写入数据库 `env_operation_logs`
 
+从其他 Ubuntu 电脑导入已有 conda 环境时，推荐用户按下面流程操作：
+
+1. 在另一台 Ubuntu x86_64/amd64 电脑上找到环境目录。环境必须来自 Linux 版 Anaconda3 或 Miniconda3 的 `envs` 一级目录，例如 `~/miniconda3/envs/<env_name>` 或 `~/anaconda3/envs/<env_name>`。
+2. 在源机器上进入 `envs` 目录，把需要上传的环境目录整体打成 zip。不要只打包 `bin`、`lib` 或 `conda-meta` 子目录，也不要把多个环境混进同一个 zip：
+
+   ```bash
+   sudo apt install -y zip
+   cd ~/miniconda3/envs
+   zip -r <env_name>.zip <env_name>
+   ```
+
+   如果源机器用的是 Anaconda3，把 `cd` 那一行换成：
+
+   ```bash
+   cd ~/anaconda3/envs
+   zip -r <env_name>.zip <env_name>
+   ```
+
+3. 用自己的 NebulaGrid 平台账号通过 `scp` 把 zip 传到 master 上自己的用户目录。这里的 `<user_name>` 是平台用户名，`master` 可以换成主节点 IP：
+
+   ```bash
+   scp <env_name>.zip <user_name>@master:/home/ddltm/data/user/<user_name>/
+   ```
+
+   传完后，用户在文件管理页的个人根目录 `/` 下应能看到 `/<env_name>.zip`。如果系统没有启用 Linux 子账户登录，也可以先让管理员把 zip 放到 `/home/ddltm/data/user/<user_name>/`，再由用户在页面导入。
+
+4. 登录 Web 控制台，进入“环境管理”，选择“导入环境”，在自己的文件根目录中点选刚上传的 `/<env_name>.zip`，填写目标环境名并确认。后端会先把 zip 解压到临时目录，再复制到 `/home/ddltm/envs/miniconda3/envs/<target_env_name>`。
+5. 导入过程中页面会依次显示 `导入中 -> 修复中 -> 测试中 -> 可用`。系统会自动修复环境中的旧路径前缀，例如原机器上的 `~/miniconda3/envs/<env_name>` 会被替换成当前集群上的 `/home/ddltm/envs/miniconda3/envs/<target_env_name>`；随后会激活环境并运行检测脚本。测试通过后，环境状态才会显示为“可用”。
+
+环境包有明确的平台限制：只支持来自 Linux x86_64/amd64 系统的 Anaconda3/Miniconda3 环境。Linux ARM、MIPS 等其他架构的环境不能在本集群运行；Windows 和 macOS 的 conda 环境禁止上传使用。系统会在导入和检测阶段自动检查环境包的可用操作系统和可执行性；检测结果不是 Linux 环境，或环境无法在当前 Linux conda 体系中被识别和激活时，会被拒绝或标记为导入失败，不会变成可用环境。
+
 用户导入 zip 环境包或创建副本后，系统会把环境复制到 `miniconda3/envs` 下，修复所有文本文件中的旧环境前缀，并整理权限。目录应为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。如果出现 `bad interpreter`、`错误的解释器` 或 `pip` 指向旧路径，优先检查环境日志和环境目录中的残留旧路径：
 
 ```bash
@@ -1336,13 +1367,15 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 1. 登录管理员账号，进入环境管理页面，确认页面会自动刷新环境列表，且 `base` 环境不展示。
 2. 点击“刷新环境列表”，确认 `conda env list --json` 中的非 base 环境被同步到数据库。
 3. 对一个已有环境点击“检测”，确认返回 Python 版本、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
-4. 用普通用户从自己的文件根目录选择打包好的环境 zip，点击导入并确认。页面应显示 `导入中 -> 修复中 -> 测试中 -> 可用`。
-5. 导入后的环境目录应位于 `/home/ddltm/envs/miniconda3/envs/<env_name>`，目录权限为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。
-6. 检查 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，确认导入、修复、检测记录已经落盘；同时可在 PostgreSQL `env_operation_logs` 表中看到对应结构化记录。
-7. 点击“创建副本”，输入新环境名，确认系统复制 `/home/ddltm/envs/miniconda3/envs/<old_env_name>` 到 `/home/ddltm/envs/miniconda3/envs/<new_env_name>`，并显示 `复制中 -> 修复中 -> 测试中 -> 可用`。
-8. 在副本里运行 `pip --version` 或 `python -m pip --version`，确认 `pip` shebang 不再指向旧路径。路径修复应覆盖所有文本文件里的旧环境前缀，而不只是 conda metadata。
-9. 普通用户只能删除自己导入或复制的环境；管理员可以删除所有环境。删除后数据库记录和 `miniconda3/envs/<env_name>` 目录应同时消失。
-10. 普通用户只能查看自己的环境日志；管理员可以查看所有环境日志。
+4. 在另一台 Ubuntu x86_64/amd64 机器的 `~/miniconda3/envs` 或 `~/anaconda3/envs` 中，把测试环境打成 zip，再用普通用户账号 `scp` 到 `/home/ddltm/data/user/<user_name>/`。用户登录后应能在文件管理个人根目录看到该 zip。
+5. 用普通用户从自己的文件根目录选择打包好的环境 zip，点击导入并确认。页面应显示 `导入中 -> 修复中 -> 测试中 -> 可用`。
+6. 导入后的环境目录应位于 `/home/ddltm/envs/miniconda3/envs/<env_name>`，目录权限为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。
+7. 检查 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，确认导入、修复、检测记录已经落盘；同时可在 PostgreSQL `env_operation_logs` 表中看到对应结构化记录。
+8. 尝试导入一个明显不兼容的环境包，例如 Windows、macOS 或非 amd64 Linux 环境包，确认系统会拒绝导入或把状态标记为错误，不会显示为“可用”。
+9. 点击“创建副本”，输入新环境名，确认系统复制 `/home/ddltm/envs/miniconda3/envs/<old_env_name>` 到 `/home/ddltm/envs/miniconda3/envs/<new_env_name>`，并显示 `复制中 -> 修复中 -> 测试中 -> 可用`。
+10. 在副本里运行 `pip --version` 或 `python -m pip --version`，确认 `pip` shebang 不再指向旧路径。路径修复应覆盖所有文本文件里的旧环境前缀，而不只是 conda metadata。
+11. 普通用户只能删除自己导入或复制的环境；管理员可以删除所有环境。删除后数据库记录和 `miniconda3/envs/<env_name>` 目录应同时消失。
+12. 普通用户只能查看自己的环境日志；管理员可以查看所有环境日志。
 
 如果出现 `bad interpreter` 或 “错误的解释器”，优先检查环境日志中的修复阶段记录，并在环境目录中搜索旧路径：
 

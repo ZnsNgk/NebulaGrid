@@ -240,13 +240,26 @@ scp test1@192.168.0.1:~/outputs/result.csv ./result.csv
 常用操作：
 
 - `刷新环境列表`：重新加载环境。
-- `导入环境`：扫描并登记已有 conda 环境。
+- `导入环境`：从用户个人目录中的 conda 环境 zip 导入环境，或扫描并登记已有 conda 环境。
 - `检测`：检查 Python、PyTorch、TensorFlow、CUDA 和包列表。
 - `查看日志`：查看环境操作日志。
 - `创建副本`：为用户准备独立环境。
 - `安装包`：安装 conda 包、pip wheel、本地包、源码包。
 - `删除包`：先预览后删除，基础包受保护。
 - `删除环境`：删除不再使用的环境。
+
+### 用户导入 zip 环境包
+
+用户从其他电脑导入已有 conda 环境时，管理员应按下面链路排查：
+
+1. 用户在另一台 Ubuntu x86_64/amd64 电脑的 `~/miniconda3/envs` 或 `~/anaconda3/envs` 下，把目标环境目录整体打成 zip。
+2. 用户通过自己的 Linux 子账户把 zip 上传到主节点个人目录，例如 `/home/ddltm/data/user/<user_name>/<env_name>.zip`。如果生产环境没有启用 Linux 子账户登录，可由管理员代放到该用户个人目录。
+3. 用户在 Web `环境管理` 中点击 `导入环境`，选择个人目录里的 zip。
+4. 后端先解压到临时目录，拒绝危险路径和链接，再复制到 `/home/ddltm/envs/miniconda3/envs/<target_env_name>`。
+5. 后端修复文本文件中的旧环境前缀，整理权限，然后激活环境运行检测脚本。
+6. 检测通过后状态变为 `available`；失败时状态变为错误，用户和管理员应查看环境日志。
+
+平台限制需要提前说明清楚：只支持 Linux x86_64/amd64 的 Anaconda3/Miniconda3 环境包。Linux ARM、MIPS 等其他架构不能使用；Windows 和 macOS 环境包禁止上传。系统会自动检测环境包的可用操作系统和执行情况，非 Linux 或无法在当前 conda 体系中激活的环境会被拒绝或标记为失败，不应手工改库把它设为可用。
 
 ### 指定节点编译安装
 

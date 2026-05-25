@@ -236,12 +236,35 @@ scp mentor1@192.168.0.1:~/outputs/report.csv ./report.csv
 常用操作：
 
 - `刷新环境列表`：重新加载环境。
-- `导入环境`：登记系统扫描到的环境。
+- `导入环境`：从自己的文件目录选择 conda 环境 zip 并导入。
 - `检测`：检查 Python、PyTorch、TensorFlow、CUDA 和包列表。
 - `查看日志`：查看导入、检测、复制或安装包过程。
 - `创建副本`：为课程、项目或学生实验准备独立环境。
 - `安装包`：向可修改环境安装包。
 - `删除包`：删除不需要的包，基础包会被保护。
+
+### 指导学生从其他 Ubuntu 电脑导入环境
+
+学生要从别的电脑带入已有环境时，建议按这个口径说明：
+
+1. 环境来源必须是 Linux x86_64/amd64 电脑上的 Anaconda3 或 Miniconda3，目录通常是 `~/miniconda3/envs/<env_name>` 或 `~/anaconda3/envs/<env_name>`。
+2. 在源电脑的 `envs` 目录下把整个环境目录打包，不要只打包子目录：
+
+   ```bash
+   cd ~/miniconda3/envs
+   zip -r <env_name>.zip <env_name>
+   ```
+
+3. 用学生自己的平台账号把 zip 上传到主节点个人目录：
+
+   ```bash
+   scp <env_name>.zip <user_name>@<master-ip>:~/<env_name>.zip
+   ```
+
+4. 学生登录 Web 后进入 `环境管理`，点击 `导入环境`，选择个人目录里的 `/<env_name>.zip` 并确认。
+5. 页面状态应从 `导入中` 到 `修复中`、`测试中`，最后变成 `可用`。如果失败，先看环境日志，再把环境名、zip 路径和日志最后几十行发给管理员。
+
+需要特别提醒学生：Windows、macOS 环境包不能导入；Linux ARM、MIPS 等非 amd64 环境包也不能使用。系统会自动检测环境包是否适合当前 Linux 集群，检测不通过时不会显示为可用环境。
 
 ### 在指定节点编译安装环境包
 
