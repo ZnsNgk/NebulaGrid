@@ -1,5 +1,6 @@
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,7 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.time_utils import local_datetime
+from app.services.dashboard_service import count_available_gpus
 from app.services.auth_service import hash_session_token
 from app.services.metrics_service import parse_flux_csv
 from app.db.models import LoginSession, Node, Setting, Task, TaskAllocation, TaskRuntimeGuard
@@ -73,6 +75,22 @@ def test_parse_flux_csv_resets_headers_between_metric_tables() -> None:
     assert rows[1]["gpu_id"] == "none"
     assert rows[1]["ip"] == "10.0.0.7"
     assert rows[1]["node_id"] == "7"
+
+
+def test_dashboard_available_gpu_counts_only_schedulable_free_low_load_cards() -> None:
+    """验证首页可用 GPU 是当前可调度资源，不把总数、已调度占用或外部高负载 GPU 计入。"""
+    node = SimpleNamespace(
+        state="online",
+        scheduling_enabled=True,
+        gpus=[
+            SimpleNamespace(schedulable=True, scheduled_occupied=False, gpu_usage=5, free_vram_mb=23000, total_vram_mb=24576),
+            SimpleNamespace(schedulable=True, scheduled_occupied=True, gpu_usage=0, free_vram_mb=24576, total_vram_mb=24576),
+            SimpleNamespace(schedulable=True, scheduled_occupied=False, gpu_usage=90, free_vram_mb=24000, total_vram_mb=24576),
+            SimpleNamespace(schedulable=False, scheduled_occupied=False, gpu_usage=0, free_vram_mb=24576, total_vram_mb=24576),
+        ],
+    )
+
+    assert count_available_gpus([node]) == 1
 
 
 def test_auth_login_and_me() -> None:

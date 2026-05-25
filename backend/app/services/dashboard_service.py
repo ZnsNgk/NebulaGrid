@@ -21,6 +21,9 @@ from app.services.node_service import (
 )
 from app.services.task_service import RUNNING_STATES, TERMINAL_STATES, WAIT_STATES, list_tasks
 
+AVAILABLE_GPU_MAX_USAGE = 20
+AVAILABLE_GPU_MIN_FREE_VRAM_RATIO = 0.80
+
 
 def build_dashboard_summary(user: UserRecord, db: Session) -> DashboardSummary:
     """构造首页统计摘要，节点资源来自数据库中的计算节点快照。"""
@@ -34,18 +37,36 @@ def build_dashboard_summary(user: UserRecord, db: Session) -> DashboardSummary:
         nodes_total=len(nodes),
         nodes_online=sum(1 for node in nodes if node.state == "online"),
         gpus_total=gpus_total,
-        gpus_available=sum(
-            1
-            for node in visible_nodes
-            if node.state == "online" and node.scheduling_enabled
-            for gpu in node.gpus
-            if gpu.schedulable
-        ),
+        gpus_available=count_available_gpus(visible_nodes),
         tasks_waiting=sum(1 for task in tasks if task.state in {"wait", "on_hold"}),
         tasks_running=sum(1 for task in tasks if task.state == "running"),
         tasks_finished_today=sum(1 for task in tasks if task.state in {"succeeded", "failed", "cancelled"}),
         viewer_role=user.role.value,
     )
+
+
+def count_available_gpus(nodes: list) -> int:
+    """统计当前可被调度拿走的 GPU，不把已占用或监控显示高负载的卡计入首页可用量。"""
+    return sum(
+        1
+        for node in nodes
+        if node.state == "online" and node.scheduling_enabled
+        for gpu in node.gpus
+        if gpu_is_summary_available(gpu)
+    )
+
+
+def gpu_is_summary_available(gpu) -> bool:
+    """首页可用量面向独占调度口径：先排除调度占用，再用实时负载避免把外部高占用卡算作空闲。"""
+    if not gpu.schedulable or gpu.scheduled_occupied:
+        return False
+    if gpu.gpu_usage is not None and gpu.gpu_usage > AVAILABLE_GPU_MAX_USAGE:
+        return False
+    if gpu.free_vram_mb is not None and gpu.total_vram_mb > 0:
+        free_ratio = gpu.free_vram_mb / gpu.total_vram_mb
+        if free_ratio < AVAILABLE_GPU_MIN_FREE_VRAM_RATIO:
+            return False
+    return True
 
 
 def build_presenter_dashboard(user: UserRecord, db: Session, history_hours: int = 1) -> PresenterDashboard:
