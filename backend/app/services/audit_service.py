@@ -15,7 +15,7 @@ from app.services.auth_service import UserRecord
 SETTING_DESCRIPTIONS: dict[str, str] = {
     "scheduler.enabled": "控制任务调度器是否从等待队列领取新任务；关闭后不影响已运行任务。",
     "scheduler.instance_lock": "调度器实例锁占位行，用于防止多个调度器同时分配同一批任务。",
-    "scheduler.interval_seconds": "调度器扫描等待任务的时间间隔，单位为秒。",
+    "scheduler.interval_seconds": "调度器扫描等待任务的时间间隔，单位为秒；支持 0.5 这类小数值。",
     "monitor.enabled": "控制节点监控轮询是否启用；关闭后节点状态和指标不会自动刷新。",
     "uploads.max_size_mb": "Web 上传文件的建议最大体积，单位为 MB。",
     "app.name": "前端和健康检查中展示的系统名称。",
@@ -51,7 +51,7 @@ SETTING_VALUE_TYPES: dict[str, str] = {
     "monitor.enabled": "boolean",
     "manage.linux_accounts": "boolean",
     "manage.samba_accounts": "boolean",
-    "scheduler.interval_seconds": "integer",
+    "scheduler.interval_seconds": "number",
     "monitor.interval_seconds": "integer",
     "uploads.max_size_mb": "integer",
 }
@@ -114,7 +114,7 @@ ENV_ONLY_SETTING_KEYS = {
 DEFAULT_SETTINGS: dict[str, str] = {
     "scheduler.enabled": "true",
     "scheduler.instance_lock": "locked-by-row-transaction",
-    "scheduler.interval_seconds": "5",
+    "scheduler.interval_seconds": "1",
     "monitor.enabled": "true",
     "uploads.max_size_mb": "20480",
 }
@@ -362,6 +362,11 @@ def normalize_setting_value(key: str, value: Any) -> str:
     if value_type == "integer":
         try:
             return str(int(text))
+        except (TypeError, ValueError):
+            return text
+    if value_type == "number":
+        try:
+            return str(float(text))
         except (TypeError, ValueError):
             return text
     return text

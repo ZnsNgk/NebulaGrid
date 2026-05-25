@@ -853,7 +853,7 @@ COMMIT;
 def scheduler_loop():
     while True:
         with db.transaction() as tx:
-            task = task_repo.pick_next_waiting_task_for_update(tx)
+            task = task_repo.pick_next_waiting_task(tx)
             if task is None:
                 sleep(config.scheduler_interval_seconds)
                 continue
@@ -1483,8 +1483,8 @@ accounts:
 
 scheduler:
   enabled: true
-  interval_seconds: 5
-  max_dispatch_per_round: 4
+  interval_seconds: 1
+  max_dispatch_per_round: 1
   default_gpu_free_mem_ratio_for_reuse: 0.4
   max_tasks_per_reuse_gpu: 5
   exclusive_gpu_max_mem_util: 0.2
@@ -1745,7 +1745,7 @@ while True:
 
 - 任务主表新增 `generated_command`、`urgent`、`last_block_reason`、`log_path` 和 `return_code`，GPU 表新增 `gpu_uuid`，初始化脚本会对旧库补列和索引。
 - API 支持单任务、批量任务、等待/执行/历史分区、任务变化 SSE、日志 tail、日志增量 SSE、删除后继预览、递归删除、重新提交和运行时守护摘要。
-- scheduler 以 PostgreSQL 为单一状态源，按紧急任务、优先级、提交时间、前驱依赖、节点可见性、节点归属优先级、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略写入 allocation；每轮最多成功分配一个任务，并同步创建 `task_events` 与 `task_runtime_guards`。只指定 GPU 型号时在用户可见候选节点中匹配该型号；只指定节点时只在该节点中匹配任意可调度 GPU；两者同时指定时只在该节点内匹配指定型号。
+- scheduler 以 PostgreSQL 为单一状态源，按紧急任务、优先级、提交时间、前驱依赖、节点可见性、节点归属优先级、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略写入 allocation；每轮最多成功分配一个任务，并同步创建 `task_events` 与 `task_runtime_guards`。只指定 GPU 型号时在用户可见候选节点中匹配该型号；只指定节点时只在该节点中匹配任意可调度 GPU；两者同时指定时只在该节点内匹配指定型号。调度器只使用单实例哨兵行互斥，不批量锁住等待任务行，避免任务编辑和列表刷新被调度扫描阻塞。
 - executor 通过 SSH 调用远端 `runner.py`，生成环境激活、CUDA 绑定和用户命令组合后的执行命令；远端 wrapper 写入 PID/PGID 元数据和状态文件，executor 回收返回码、结束时间并释放 allocation。
 - Runtime Guard 通过远端 PID 树和 `nvidia-smi --query-compute-apps` 采集实际 GPU UUID，连续两轮发现越权后终止远端进程组、标记 `alloc_error`、释放 allocation，并写入任务日志与事件。
 - 部署自检脚本 `backend/scripts/deployment_self_check.py` 用于上线前只读检查本机共享目录、远端脚本、数据库节点、SSH、NFS 路径和 `nvidia-smi` 可用性。

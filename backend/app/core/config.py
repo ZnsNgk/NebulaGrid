@@ -37,7 +37,7 @@ class Settings:
     manage_linux_accounts: bool = False
     manage_samba_accounts: bool = False
     session_secret: str = "change-this-session-secret"
-    scheduler_interval_seconds: int = 5
+    scheduler_interval_seconds: float = 1.0
     monitor_interval_seconds: int = 5
     file_operation_worker_threads: int = 2
     cors_origins: tuple[str, ...] = (
@@ -87,7 +87,7 @@ def get_settings() -> Settings:
         manage_linux_accounts=os.getenv("NEBULAGRID_MANAGE_LINUX_ACCOUNTS", "false").lower() == "true",
         manage_samba_accounts=os.getenv("NEBULAGRID_MANAGE_SAMBA_ACCOUNTS", "false").lower() == "true",
         session_secret=os.getenv("NEBULAGRID_SESSION_SECRET", "change-this-session-secret"),
-        scheduler_interval_seconds=int(os.getenv("NEBULAGRID_SCHEDULER_INTERVAL_SECONDS", "5")),
+        scheduler_interval_seconds=float(os.getenv("NEBULAGRID_SCHEDULER_INTERVAL_SECONDS", "1")),
         monitor_interval_seconds=int(os.getenv("NEBULAGRID_MONITOR_INTERVAL_SECONDS", "5")),
         file_operation_worker_threads=int(os.getenv("NEBULAGRID_FILE_OPERATION_WORKER_THREADS", "2")),
         cors_origins=tuple(

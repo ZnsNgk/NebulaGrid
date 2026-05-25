@@ -8,6 +8,9 @@ const state = {
   selectedTaskId: "",
   taskHistoryAllLoaded: false,
   taskPredecessorOptions: [],
+  taskPredecessorLoading: false,
+  taskPredecessorRequestKey: "",
+  taskListLoading: false,
   taskFormDraft: null,
   taskEventsSource: null,
   taskRealtimeBusy: false,
@@ -432,8 +435,10 @@ function parseGpuSchedulableFlags(value) {
   });
 }
 
-function checkedValues(containerId) {
-  return Array.from(document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)).map((input) => input.value);
+function checkedValues(containerId, root = document) {
+  const container = root.querySelector?.(`#${containerId}`);
+  if (!container) return [];
+  return Array.from(container.querySelectorAll("input[type='checkbox']:checked")).map((input) => input.value);
 }
 
 function uniqueNumbers(values) {
@@ -895,6 +900,8 @@ async function submitTask(event) {
   });
   state.drawer = null;
   state.taskFormDraft = null;
+  state.taskPredecessorLoading = false;
+  state.taskPredecessorRequestKey = "";
   await refreshPage();
 }
 
@@ -1025,13 +1032,32 @@ async function copyTaskLogCommand() {
 async function openTaskForm(mode) {
   const selected = selectedTask();
   if (mode === "edit" && !selected) throw new Error("请选择任务");
-  await loadTaskPredecessorOptions(selected?.task_id || "");
+  const requestKey = `${mode}:${selected?.task_id || ""}:${Date.now()}`;
   state.taskFormDraft = taskToDraft(mode, selected);
+  state.taskPredecessorLoading = true;
+  state.taskPredecessorRequestKey = requestKey;
   state.drawer = {
+    type: "task-form",
     title: mode === "batch" ? "批量添加任务" : (mode === "edit" ? `修改任务 ${selected.task_id}` : "添加任务"),
     body: renderTaskForm(mode, selected),
   };
   render();
+  loadTaskPredecessorOptions(selected?.task_id || "")
+    .then(() => {
+      if (state.taskPredecessorRequestKey !== requestKey) return;
+      if (state.drawer?.type !== "task-form") return;
+      const draft = syncTaskFormDraftFromDom() || state.taskFormDraft || taskToDraft(mode, selected);
+      state.taskPredecessorLoading = false;
+      state.taskFormDraft = draft;
+      state.drawer.body = renderTaskForm(draft.mode, selectedTask());
+      render();
+    })
+    .catch((error) => {
+      if (state.taskPredecessorRequestKey !== requestKey) return;
+      state.taskPredecessorLoading = false;
+      if (state.drawer?.type === "task-form") render();
+      showToast(error.message || "加载前驱任务失败", "error");
+    });
 }
 
 async function loadTaskPredecessorOptions(excludedTaskId = "") {
@@ -1062,7 +1088,7 @@ function taskPayloadFromForm(form, mode) {
     requirement: {
       need_gpus: Number(formValue(form, "need_gpus") || 1),
       node_id: nodeId ? Number(nodeId) : null,
-      gpu_types: checkedValues("taskGpuTypeOptions"),
+      gpu_types: checkedValues("taskGpuTypeOptions", form),
       allow_gpu_reuse: form.elements.allow_gpu_reuse.checked,
     },
   };
@@ -1855,8 +1881,11 @@ function enforceSupervisorLimit(select) {
 }
 
 async function switchTaskZone(zone) {
+  if (state.taskZone === zone && !state.taskListLoading) return;
   state.taskZone = zone;
   state.selectedTaskId = "";
+  state.taskListLoading = true;
+  state.data.tasks = { items: [], total: 0, page: 1, page_size: 100 };
   if (zone !== "history") state.taskHistoryAllLoaded = false;
   localStorage.setItem("ng_task_zone", zone);
   render();
@@ -1864,6 +1893,8 @@ async function switchTaskZone(zone) {
     await loadTasksPageData();
   } catch (error) {
     showToast(error.message || "切换任务区失败", "error");
+  } finally {
+    state.taskListLoading = false;
   }
   render();
 }
@@ -1900,7 +1931,7 @@ function updateTaskGpuTypeOptions() {
   const form = document.querySelector("#taskForm");
   const container = document.querySelector("#taskGpuTypeOptions");
   if (!form || !container) return;
-  container.innerHTML = renderTaskGpuTypeOptions(formValue(form, "node_id"), checkedValues("taskGpuTypeOptions"));
+  container.innerHTML = renderTaskGpuTypeOptions(formValue(form, "node_id"), checkedValues("taskGpuTypeOptions", form));
 }
 
 function switchAdminMenu(menu) {
@@ -2422,9 +2453,9 @@ function renderTasks() {
         <div class="task-zone-content">
           <div class="task-list-summary">
             <strong>${zones.find(([id]) => id === state.taskZone)?.[1] || "当前分区"}</strong>
-            <span>共 ${state.data.tasks.total || tasks.length} 条</span>
+            <span>${state.taskListLoading ? "加载中..." : `共 ${state.data.tasks.total || tasks.length} 条`}</span>
           </div>
-          ${tasks.length ? renderTaskZoneTable(tasks) : renderEmpty(`${zones.find(([id]) => id === state.taskZone)?.[1] || "当前分区"}暂无任务`)}
+          ${state.taskListLoading ? renderEmpty("正在加载任务...") : (tasks.length ? renderTaskZoneTable(tasks) : renderEmpty(`${zones.find(([id]) => id === state.taskZone)?.[1] || "当前分区"}暂无任务`))}
         </div>
       </div>
     </section>
@@ -2528,7 +2559,7 @@ function captureTaskFormDraft(form) {
     commands: form.elements.commands?.value || "",
     node_id: formValue(form, "node_id"),
     need_gpus: formValue(form, "need_gpus") || 1,
-    gpu_types: checkedValues("taskGpuTypeOptions"),
+    gpu_types: checkedValues("taskGpuTypeOptions", form),
     predecessor_task_id: formValue(form, "predecessor_task_id"),
     urgent: form.elements.urgent?.checked || false,
     allow_gpu_reuse: form.elements.allow_gpu_reuse?.checked || false,
@@ -2623,6 +2654,9 @@ function renderTaskGpuTypeOptions(nodeId = "", selectedTypes = []) {
 }
 
 function renderTaskPredecessorOptions(selectedId = "") {
+  if (state.taskPredecessorLoading) {
+    return `<option value="${escapeAttr(selectedId || "")}" ${selectedId ? "selected" : ""}>加载中...</option>`;
+  }
   return (state.taskPredecessorOptions || [])
     .map((task) => `<option value="${escapeAttr(task.task_id)}" ${String(selectedId || "") === String(task.task_id) ? "selected" : ""}>${escapeHtml(task.task_id)} · ${escapeHtml(task.description || taskStateText(task.state))}</option>`)
     .join("");
@@ -3754,8 +3788,9 @@ function renderSettingValueControl(item) {
     }
     return `<select name="value">${renderSelectOptions(optionPairs, item.value)}</select>`;
   }
-  const type = item.value_type === "integer" ? "number" : "text";
-  return `<input name="value" type="${type}" value="${escapeAttr(item.value || "")}" required>`;
+  const type = ["integer", "number"].includes(item.value_type) ? "number" : "text";
+  const stepAttr = type === "number" ? ` step="${item.value_type === "number" ? "0.1" : "1"}"` : "";
+  return `<input name="value" type="${type}"${stepAttr} value="${escapeAttr(item.value || "")}" required>`;
 }
 
 function renderAdminSettings(settings) {
@@ -4482,6 +4517,8 @@ function bindEvents() {
     stopTaskLogRefreshTimer();
     state.drawer = null;
     state.taskFormDraft = null;
+    state.taskPredecessorLoading = false;
+    state.taskPredecessorRequestKey = "";
     render();
   });
   document.querySelector("[data-task-log-toggle]")?.addEventListener("click", toggleTaskLogRefresh);

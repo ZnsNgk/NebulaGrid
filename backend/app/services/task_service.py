@@ -516,7 +516,9 @@ def build_task_info(task: Task, db: Session) -> TaskInfo:
     owner = db.get(User, task.user_id)
     env = db.get(Env, task.env_id) if task.env_id is not None else None
     predecessor = load_predecessor(task.id, db)
-    allocation = load_latest_allocation(task.id, db)
+    # 等待/挂起任务展示的是用户当前提交的资源需求；历史 allocation 只用于运行中和历史任务，
+    # 否则修改等待任务后列表会继续显示旧节点/旧 GPU，造成“保存失败”的错觉。
+    allocation = load_latest_allocation(task.id, db) if task.state in RUNNING_STATES or task.state in TERMINAL_STATES else None
     node = None
     gpu_indices: list[int] = []
     gpu_models: list[str] = []

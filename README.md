@@ -309,8 +309,8 @@ accounts:
 
 scheduler:
   enabled: true
-  interval_seconds: 2
-  max_dispatch_per_round: 4
+  interval_seconds: 1
+  max_dispatch_per_round: 1
   default_gpu_free_mem_ratio_for_reuse: 0.4
   max_tasks_per_reuse_gpu: 5
   exclusive_gpu_max_mem_util: 0.2

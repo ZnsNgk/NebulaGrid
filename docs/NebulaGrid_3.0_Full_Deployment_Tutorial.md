@@ -440,7 +440,7 @@ NEBULAGRID_MINICONDA_PYTHON=/home/ddltm/envs/miniconda3/bin/python
 NEBULAGRID_MAIN_LINUX_USER=ddltm
 NEBULAGRID_SESSION_SECRET=replace-with-random-secret
 NEBULAGRID_CORS_ORIGINS=http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1,http://localhost,null
-NEBULAGRID_SCHEDULER_INTERVAL_SECONDS=5
+NEBULAGRID_SCHEDULER_INTERVAL_SECONDS=1
 NEBULAGRID_MONITOR_INTERVAL_SECONDS=5
 NEBULAGRID_FILE_OPERATION_WORKER_THREADS=2
 EOF
@@ -490,7 +490,7 @@ sudo grep -v SECRET /etc/nebulagrid/backend.env
 | `NEBULAGRID_MAIN_LINUX_USER` | 平台主账户，例如 `ddltm`；master 和所有计算节点必须保持同名、同 UID、同 GID，远端 SSH 控制和任务 runner 默认使用该账户。 |
 | `NEBULAGRID_SESSION_SECRET` | 后端会话或令牌签名密钥；生产环境必须换成长随机字符串，泄露后需要立即轮换并让用户重新登录。 |
 | `NEBULAGRID_CORS_ORIGINS` | 允许跨域访问 API 的前端来源列表，多个来源用英文逗号分隔；前端和 API 同域部署时通常保留 `http://127.0.0.1`、`http://localhost`，开发调试可保留 `5173`。 |
-| `NEBULAGRID_SCHEDULER_INTERVAL_SECONDS` | 调度器轮询待运行任务和资源分配的间隔秒数；值越小响应越快，但数据库和节点状态检查压力越高。 |
+| `NEBULAGRID_SCHEDULER_INTERVAL_SECONDS` | 调度器轮询待运行任务和资源分配的间隔秒数，支持 `0.5` 这类小数；推荐试运行先用 `0.5-1`，低于 `0.2` 会被后端限制，避免数据库空转。 |
 | `NEBULAGRID_MONITOR_INTERVAL_SECONDS` | 节点监控 worker 采集节点 CPU、内存、GPU 和网络指标的间隔秒数。 |
 | `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` | 文件管理专用线程池大小，用于列表、预览、上传、复制、移动、删除、打包和解压；共享盘吞吐不足时不要调太大。 |
 
@@ -1303,7 +1303,7 @@ sudo smbclient //127.0.0.1/test1 -U test1
 
 普通训练任务已经以 PostgreSQL 为单一状态源，不再依赖 API 进程内存。任务提交、批量提交、修改、挂起、删除、后继任务确认、中止、重新提交、日志路径、执行时间、结束时间、实际节点和实际 GPU 分配都会写入 `tasks`、`task_requirements`、`task_dependencies`、`task_allocations`、`task_events` 和 `task_runtime_guards`。
 
-调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略选择资源。任务未指定节点时，候选节点按“用户自有节点 → 组内共享节点 → 组内他人公开共享的私有节点 → 其他公开节点”的顺序尝试；同一档内部按节点 ID 保持稳定顺序。只指定 GPU 型号时，系统只往所有可见候选节点中满足该型号的 GPU 上分配；只指定节点时，系统只在该节点内选择任意可调度 GPU；两者同时指定时，系统只在指定节点内选择指定型号的 GPU。每轮调度最多成功分配一个任务，并在下一轮开始时清理终态任务的未释放 allocation，避免同一张独占 GPU 在同一轮内被重复占用。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
+调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略选择资源。任务未指定节点时，候选节点按“用户自有节点 → 组内共享节点 → 组内他人公开共享的私有节点 → 其他公开节点”的顺序尝试；同一档内部按节点 ID 保持稳定顺序。只指定 GPU 型号时，系统只往所有可见候选节点中满足该型号的 GPU 上分配；只指定节点时，系统只在该节点内选择任意可调度 GPU；两者同时指定时，系统只在指定节点内选择指定型号的 GPU。每轮调度最多成功分配一个任务，并在下一轮开始时清理终态任务的未释放 allocation，避免同一张独占 GPU 在同一轮内被重复占用。调度器只持有单实例哨兵行锁，不再批量锁住等待任务行，因此用户修改等待任务和前端刷新任务列表不会被一次调度扫描长时间阻塞。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
 
 管理员后台的“强制下线”会立即把目标节点标记为 `offline` 并关闭调度。对于该节点上仍持有未释放 allocation 的运行任务，后端会按远端进程组执行 TERM/KILL、把任务置为 `cancelled`，并释放该节点所有未释放 GPU 调度占用；审计日志会记录受影响任务和释放数量。
 强制下线后的节点不会继续被节点监控 worker 自动 SSH 探测，也不会自动恢复为 `online`；维护完成后需要在节点管理里点击“重连”，下一轮监控成功才会重新上线。

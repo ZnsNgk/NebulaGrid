@@ -14,7 +14,7 @@ from app.db.session import SessionLocal
 from app.main import create_app
 from app.workers.node_monitor import monitor_node, node_monitor_paused, sync_gpu_inventory
 from app.workers.runtime_guard import expand_pid_tree, parse_gpu_apps, parse_process_table
-from app.workers.scheduler import scheduler_tick
+from app.workers.scheduler import scheduler_interval_seconds, scheduler_tick
 
 
 def make_client() -> TestClient:
@@ -490,6 +490,64 @@ def test_scheduler_combines_gpu_model_and_node_constraints() -> None:
     assert second_task.state == "wait"
     assert second_allocation is None
     assert second_task.last_block_reason
+
+
+def test_waiting_task_info_prefers_requirement_over_old_allocation() -> None:
+    """验证等待任务列表展示当前需求节点，而不是历史 allocation 的旧节点。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    suffix = uuid4().hex[:8]
+    old_node_id = client.post(
+        "/api/admin/nodes",
+        headers=headers,
+        json={"name": f"node-old-allocation-{suffix}", "ip": "10.0.0.36", "gpu_schedulable_flags": [1]},
+    ).json()["data"]["id"]
+    requested_node_id = client.post(
+        "/api/admin/nodes",
+        headers=headers,
+        json={"name": f"node-current-request-{suffix}", "ip": "10.0.0.37", "gpu_schedulable_flags": [1]},
+    ).json()["data"]["id"]
+    task_response = client.post(
+        "/api/tasks",
+        headers=headers,
+        json={
+            "description": "display-current-requirement",
+            "workdir": "/",
+            "command": "python train.py",
+            "requirement": {"need_gpus": 1, "node_id": requested_node_id, "gpu_types": ["RTX 4090"]},
+        },
+    )
+    task_id = task_response.json()["data"]["task_id"]
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        db.add(
+            TaskAllocation(
+                task_id=task.id,
+                node_id=old_node_id,
+                gpu_ids=[],
+                allocation_mode="cpu",
+                released_at=local_datetime(),
+            )
+        )
+        db.commit()
+
+    wait_tasks = client.get("/api/tasks?state=wait&page_size=20", headers=headers).json()["data"]["items"]
+    item = next(task for task in wait_tasks if task["task_id"] == task_id)
+    assert item["node_id"] == requested_node_id
+    assert item["requirement"]["node_id"] == requested_node_id
+    assert item["requirement"]["gpu_types"] == ["RTX 4090"]
+
+
+def test_scheduler_interval_allows_subsecond_setting() -> None:
+    """验证调度间隔支持 0.5 秒这类小数，便于单实例调度器提高响应频率。"""
+    with SessionLocal() as db:
+        db.merge(Setting(key="scheduler.interval_seconds", value="0.5"))
+        db.commit()
+    with SessionLocal() as db:
+        assert scheduler_interval_seconds(db) == 0.5
 
 
 def test_scheduler_prefers_user_owned_then_group_then_public_nodes() -> None:

@@ -1078,7 +1078,7 @@ accounts:
   child_home_template: /home/ddltm/data/user/{user_name}
 
 scheduler:
-  interval_seconds: 2
+  interval_seconds: 1
   watchdog_timeout_seconds: 600
   gpu_reuse_free_vram_ratio: 0.40
   gpu_reuse_max_tasks: 5

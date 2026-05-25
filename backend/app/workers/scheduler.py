@@ -35,12 +35,13 @@ def scheduler_tick() -> None:
             logger.info("scheduler tick skipped because another instance holds the DB lock")
             return
         released = release_terminal_allocations(db)
+        # 调度器已经通过单实例哨兵行互斥，这里只读候选任务，不再锁住一批 wait 行；
+        # 否则管理员修改等待任务或前端刷新列表会被调度循环放大延迟。
         waiting_tasks = db.scalars(
             select(Task)
             .options(selectinload(Task.requirement))
             .where(Task.state == "wait")
             .order_by(Task.urgent.desc(), Task.priority.desc(), Task.created_at.asc())
-            .with_for_update(skip_locked=True)
             .limit(50)
         ).all()
         scheduled = 0
@@ -311,14 +312,15 @@ def scheduler_enabled(db: Session) -> bool:
     return setting is None or setting.value.lower() == "true"
 
 
-def scheduler_interval_seconds(db: Session) -> int:
+def scheduler_interval_seconds(db: Session) -> float:
     """读取调度间隔；优先使用数据库设置，便于管理员后台在线调整。"""
     setting = db.get(Setting, "scheduler.interval_seconds")
     raw_value = setting.value if setting is not None else str(get_settings().scheduler_interval_seconds)
     try:
-        return max(1, min(3600, int(raw_value)))
+        # 单实例调度器允许亚秒级轮询；下限保留 0.2s，避免配置误填造成数据库空转。
+        return max(0.2, min(3600.0, float(raw_value)))
     except (TypeError, ValueError):
-        return get_settings().scheduler_interval_seconds
+        return float(get_settings().scheduler_interval_seconds)
 
 
 def main() -> None:
