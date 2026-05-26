@@ -1647,7 +1647,7 @@ nav {
   min-height: 620px;
   padding: 22px 18px;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   gap: 14px;
 }
 
@@ -1724,6 +1724,56 @@ nav {
 .file-binary-preview span {
   color: var(--muted);
   font-size: 13px;
+}
+
+.file-permission-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px 14px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(7, 16, 33, 0.66);
+}
+
+.file-permission-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.file-permission-head strong {
+  color: #f8fbff;
+  font-size: 13px;
+}
+
+.file-permission-head code {
+  color: #bae6fd;
+  font-size: 12px;
+}
+
+.file-permission-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, auto));
+  gap: 6px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.file-permission-grid strong {
+  color: #dbeafe;
+  font-weight: 800;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-permission-panel button {
+  grid-row: 1 / span 2;
+  grid-column: 2;
 }
 
 .file-job-progress {
@@ -2750,6 +2800,16 @@ td {
 
   .file-actions-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .file-permission-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .file-permission-panel button {
+    grid-row: auto;
+    grid-column: auto;
+    width: 100%;
   }
 
   .env-package-list {

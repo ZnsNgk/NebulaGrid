@@ -392,6 +392,7 @@ nebulagrid/
 | FILE-005     | 大文件上传应支持大小限制、进度显示和失败重试；管理员可配置 max_upload_size。      | P1         |
 | FILE-006     | 危险操作删除/覆盖/解压需二次确认，并写入审计日志。                                | P0         |
 | FILE-007     | 支持全员共享文件夹视图，默认根目录为 `/home/ddltm/shared`；用户可查看共享文件夹，并在个人目录与共享目录之间复制文件或文件夹。 | P0         |
+| FILE-008     | 文件预览区显示文件权限，并允许用户为个人目录内普通文件授予执行权限，确保主账户可运行上传脚本。 | P0         |
 
 ## 5.6 日志管理
 
@@ -587,6 +588,7 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | Files     | POST /api/files/copy                                  | 复制文件或目录；请求体支持 `scope` 和 `target_scope`，用于个人目录与共享文件夹互拷。 | 路径可见者和目标可写者           |
 | Files     | POST /api/files/archive                               | 压缩文件或目录。                                                          | 路径可写者                       |
 | Files     | POST /api/files/extract                               | 解压 zip/tar/tar.gz/tgz/tar.bz2/tar.xz/txz。                              | 路径可写者                       |
+| Files     | POST /api/files/permissions/execute                   | 给个人目录内普通文件授予执行权限，用于 `.sh` 等任务脚本。                 | 路径可写者                       |
 | Envs      | GET /api/envs                                         | 环境列表。                                                                | 按角色过滤                       |
 | Envs      | POST /api/envs/upload-pack                            | 上传并导入 conda-pack 环境。                                              | 用户本人/管理员                  |
 | Envs      | POST /api/envs/{id}/test                              | 测试环境。                                                                | 环境可见者                       |

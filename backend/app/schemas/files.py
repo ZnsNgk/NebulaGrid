@@ -28,6 +28,24 @@ class FilePreviewData(BaseModel):
     encoding: str = "text"
     truncated: bool
     size_bytes: int
+    mode_octal: str
+    owner_executable: bool
+    group_executable: bool
+    other_executable: bool
+    main_user: str
+    main_user_can_execute: bool
+
+
+class FilePermissionData(BaseModel):
+    """文件权限面板使用的精简元数据，避免前端为了刷新权限重新读取大文件内容。"""
+
+    path: str
+    mode_octal: str
+    owner_executable: bool
+    group_executable: bool
+    other_executable: bool
+    main_user: str
+    main_user_can_execute: bool
 
 
 class FileOperationRequest(BaseModel):

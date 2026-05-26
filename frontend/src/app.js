@@ -4,13 +4,18 @@ const state = {
   deviceId: getOrCreateDeviceId(),
   user: null,
   page: location.hash.replace("#/", "") || "dashboard",
-  taskZone: localStorage.getItem("ng_task_zone") || "wait",
+  taskZone: normalizeTaskZone(localStorage.getItem("ng_task_zone") || "wait"),
   selectedTaskId: "",
   taskHistoryAllLoaded: false,
   taskPredecessorOptions: [],
   taskPredecessorLoading: false,
   taskPredecessorRequestKey: "",
   taskListLoading: false,
+  taskRequestSeq: 0,
+  taskRealtimeTimer: null,
+  taskRealtimeZone: "",
+  taskRealtimePendingZone: "",
+  taskZoneCursors: {},
   taskFormDraft: null,
   taskEventsSource: null,
   taskRealtimeBusy: false,
@@ -62,7 +67,12 @@ const state = {
     dashboard: null,
     presenter: null,
     nodes: [],
-    tasks: { items: [], total: 0, page: 1, page_size: 20 },
+    tasks: { items: [], total: 0, page: 1, page_size: 100 },
+    taskZones: {
+      wait: { items: [], total: 0, page: 1, page_size: 100 },
+      running: { items: [], total: 0, page: 1, page_size: 100 },
+      history: { items: [], total: 0, page: 1, page_size: 100 },
+    },
     envs: [],
     files: { path: "/", items: [] },
     preview: null,
@@ -563,12 +573,30 @@ async function loadPresenterDashboard() {
   state.lastPresenterRefreshAt = new Date();
 }
 
+function emptyTaskList() {
+  return { items: [], total: 0, page: 1, page_size: 100 };
+}
+
+function normalizeTaskZone(zone) {
+  if (["running", "exec"].includes(zone)) return "running";
+  if (["history", "hist", "finished"].includes(zone)) return "history";
+  return "wait";
+}
+
+function cachedTaskList(zone) {
+  return state.data.taskZones[normalizeTaskZone(zone)] || emptyTaskList();
+}
+
 async function loadTasksPageData({ includeLookups = false } = {}) {
+  const zone = normalizeTaskZone(state.taskZone);
+  const page = state.page;
+  const allHistory = zone === "history" && state.taskHistoryAllLoaded;
+  const requestSeq = ++state.taskRequestSeq;
   const params = new URLSearchParams({
-    state: state.taskZone,
+    state: zone,
     page_size: "100",
   });
-  if (state.taskZone === "history" && state.taskHistoryAllLoaded) params.set("all_history", "true");
+  if (allHistory) params.set("all_history", "true");
   const tasksRequest = api(`/tasks?${params.toString()}`);
   const lookupRequests = [];
   if (includeLookups && can("envs:read")) {
@@ -578,8 +606,18 @@ async function loadTasksPageData({ includeLookups = false } = {}) {
     lookupRequests.push(api("/nodes").then((payload) => { state.data.nodes = payload.data; }));
   }
   const [tasksPayload] = await Promise.all([tasksRequest, ...lookupRequests]);
+  if (
+    requestSeq !== state.taskRequestSeq ||
+    page !== state.page ||
+    zone !== normalizeTaskZone(state.taskZone) ||
+    allHistory !== (zone === "history" && state.taskHistoryAllLoaded)
+  ) {
+    return false;
+  }
   state.data.tasks = tasksPayload.data;
+  state.data.taskZones[zone] = tasksPayload.data;
   if (!state.data.tasks.items.some((task) => task.task_id === state.selectedTaskId)) state.selectedTaskId = "";
+  return true;
 }
 
 function navigate(page) {
@@ -637,9 +675,10 @@ function updateTaskEventStream() {
   if (!state.user || !state.token || isPresenterUser() || typeof EventSource === "undefined") return;
   const base = state.apiBase.replace(/\/$/, "");
   const source = new EventSource(`${base}/tasks/events?token=${encodeURIComponent(state.token)}`);
-  source.addEventListener("tasks", () => {
+  source.addEventListener("tasks", (event) => {
+    const cursor = parseTaskEventCursor(event.data);
     if (state.page === "tasks") {
-      refreshTasksFromEvent();
+      refreshTasksFromEvent(cursor);
     } else if (state.page === "dashboard") {
       autoRefreshDashboard();
     }
@@ -650,8 +689,55 @@ function updateTaskEventStream() {
   state.taskEventsSource = source;
 }
 
-async function refreshTasksFromEvent() {
-  if (!state.user || state.page !== "tasks" || state.taskRealtimeBusy) return;
+function parseTaskEventCursor(data) {
+  try {
+    return JSON.parse(data || "{}");
+  } catch (error) {
+    return {};
+  }
+}
+
+function taskCursorKey(cursor) {
+  if (!cursor) return "";
+  return [cursor.count ?? cursor.total ?? 0, cursor.max_task_id ?? 0, cursor.max_event_id ?? 0].join(":");
+}
+
+function changedTaskZones(cursor) {
+  const zones = cursor?.zones || {};
+  const result = [];
+  ["wait", "running", "history"].forEach((zone) => {
+    const next = zones[zone] || cursor;
+    const nextKey = taskCursorKey(next);
+    const previousKey = state.taskZoneCursors[zone];
+    state.taskZoneCursors[zone] = nextKey;
+    if (previousKey && previousKey !== nextKey) result.push(zone);
+  });
+  return result;
+}
+
+function refreshTasksFromEvent(cursor) {
+  if (!state.user || state.page !== "tasks") return;
+  const zone = normalizeTaskZone(state.taskZone);
+  changedTaskZones(cursor);
+  scheduleTaskRealtimeRefresh(zone);
+}
+
+function scheduleTaskRealtimeRefresh(zone) {
+  if (state.taskRealtimeTimer && state.taskRealtimeZone === zone) return;
+  if (state.taskRealtimeTimer) window.clearTimeout(state.taskRealtimeTimer);
+  state.taskRealtimeZone = zone;
+  state.taskRealtimeTimer = window.setTimeout(() => {
+    state.taskRealtimeTimer = null;
+    runTaskRealtimeRefresh(zone);
+  }, 300);
+}
+
+async function runTaskRealtimeRefresh(zone) {
+  if (!state.user || state.page !== "tasks" || normalizeTaskZone(state.taskZone) !== zone) return;
+  if (state.taskRealtimeBusy) {
+    state.taskRealtimePendingZone = zone;
+    return;
+  }
   state.taskRealtimeBusy = true;
   try {
     await loadTasksPageData();
@@ -660,6 +746,9 @@ async function refreshTasksFromEvent() {
     if (!isAuthExpiredMessage(error.message)) console.warn("task realtime refresh failed", error);
   } finally {
     state.taskRealtimeBusy = false;
+    const pendingZone = state.taskRealtimePendingZone;
+    state.taskRealtimePendingZone = "";
+    if (pendingZone && normalizeTaskZone(state.taskZone) === pendingZone) scheduleTaskRealtimeRefresh(pendingZone);
   }
 }
 
@@ -1120,9 +1209,18 @@ async function deleteSelectedTask() {
 
 async function loadAllHistoryTasks() {
   state.taskZone = "history";
+  state.selectedTaskId = "";
   state.taskHistoryAllLoaded = true;
+  state.taskListLoading = true;
+  state.data.tasks = cachedTaskList("history");
   localStorage.setItem("ng_task_zone", "history");
-  await refreshPage();
+  render();
+  try {
+    await loadTasksPageData();
+  } finally {
+    if (normalizeTaskZone(state.taskZone) === "history") state.taskListLoading = false;
+  }
+  render();
 }
 
 async function openTaskWorkdirPicker() {
@@ -1662,6 +1760,15 @@ async function saveCurrentFile(content) {
   await previewFile(preview.path);
 }
 
+async function grantCurrentFileExecutePermission() {
+  requireOwnFileViewForWrite();
+  const preview = state.data.preview;
+  if (!preview?.path) throw new Error("请先打开需要授权的文件");
+  const payload = await api("/files/permissions/execute", { method: "POST", body: JSON.stringify({ path: preview.path }) });
+  state.data.preview = { ...preview, ...payload.data };
+  render();
+}
+
 async function downloadSelectedPath() {
   const source = requireSelectedPath();
   const selectedItem = currentSelectedFileItem();
@@ -1881,20 +1988,21 @@ function enforceSupervisorLimit(select) {
 }
 
 async function switchTaskZone(zone) {
-  if (state.taskZone === zone && !state.taskListLoading) return;
-  state.taskZone = zone;
+  const nextZone = normalizeTaskZone(zone);
+  if (normalizeTaskZone(state.taskZone) === nextZone && !state.taskListLoading) return;
+  state.taskZone = nextZone;
   state.selectedTaskId = "";
   state.taskListLoading = true;
-  state.data.tasks = { items: [], total: 0, page: 1, page_size: 100 };
-  if (zone !== "history") state.taskHistoryAllLoaded = false;
-  localStorage.setItem("ng_task_zone", zone);
+  state.data.tasks = cachedTaskList(nextZone);
+  if (nextZone !== "history") state.taskHistoryAllLoaded = false;
+  localStorage.setItem("ng_task_zone", nextZone);
   render();
   try {
     await loadTasksPageData();
   } catch (error) {
     showToast(error.message || "切换任务区失败", "error");
   } finally {
-    state.taskListLoading = false;
+    if (normalizeTaskZone(state.taskZone) === nextZone) state.taskListLoading = false;
   }
   render();
 }
@@ -2734,6 +2842,7 @@ function renderFiles() {
           <button data-file-save ${preview?.encoding === "text" && !readOnlyView ? "" : "disabled"}>保存</button>
         </div>
         ${renderFilePreview(preview, readOnlyView)}
+        ${renderFilePermissionPanel(preview, readOnlyView)}
         ${renderFileJobProgress(state.data.fileJob)}
       </section>
     </section>
@@ -2758,6 +2867,31 @@ function renderFilePreview(preview, readOnly = false) {
     return `<div class="file-media-preview compact"><audio controls src="${escapeAttr(source)}"></audio></div>`;
   }
   return `<div class="file-binary-preview"><strong>${escapeHtml(baseName(preview.path))}</strong><span>${escapeHtml(preview.content_type)} · ${formatBytes(preview.size_bytes)}</span></div>`;
+}
+
+function renderFilePermissionPanel(preview, readOnly = false) {
+  const disabled = !preview?.path || readOnly || preview.main_user_can_execute;
+  const mode = preview?.mode_octal || "----";
+  const mainUser = preview?.main_user || "主账户";
+  const mainStatus = preview?.main_user_can_execute ? "可执行" : "未授权";
+  const bitText = preview?.path
+    ? `属主 ${preview.owner_executable ? "x" : "-"} · 用户组 ${preview.group_executable ? "x" : "-"} · 其他 ${preview.other_executable ? "x" : "-"}`
+    : "未打开文件";
+  return `
+    <div class="file-permission-panel">
+      <div class="file-permission-head">
+        <strong>文件权限</strong>
+        <code>${escapeHtml(mode)}</code>
+      </div>
+      <div class="file-permission-grid">
+        <span>执行位</span>
+        <strong>${escapeHtml(bitText)}</strong>
+        <span>${escapeHtml(mainUser)}</span>
+        <strong>${escapeHtml(mainStatus)}</strong>
+      </div>
+      <button class="secondary" data-file-grant-exec ${disabled ? "disabled" : ""}>授予执行权限</button>
+    </div>
+  `;
 }
 
 function renderFileJobProgress(job) {
@@ -4225,6 +4359,7 @@ const taskStateLabels = {
   on_hold: "挂起",
   preparing: "准备中",
   dispatching: "派发中",
+  starting: "启动中",
   running: "运行中",
   succeeded: "完成",
   failed: "失败",
@@ -4471,6 +4606,7 @@ function bindEvents() {
     const content = document.querySelector("#fileEditor")?.value ?? "";
     run(() => saveCurrentFile(content), "文件已保存");
   });
+  document.querySelector("[data-file-grant-exec]")?.addEventListener("click", () => run(grantCurrentFileExecutePermission, "执行权限已更新"));
   document.querySelectorAll("[data-select-file]").forEach((button) => {
     button.addEventListener("click", () => {
       const path = button.dataset.selectFile;

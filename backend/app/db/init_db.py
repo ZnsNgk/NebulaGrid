@@ -127,6 +127,12 @@ def migrate_existing_schema() -> None:
                 },
             )
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_urgent ON tasks (urgent)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_wait_zone_order ON tasks (state, urgent, priority, created_at)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_running_zone_order ON tasks (state, started_at, created_at)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_history_zone_order ON tasks (state, finished_at, created_at)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_user_state_created ON tasks (user_id, state, created_at)"))
+        if "task_allocations" in tables:
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_task_allocations_latest ON task_allocations (task_id, allocated_at, id)"))
         if "env_install_jobs" in tables:
             ensure_columns(
                 connection,

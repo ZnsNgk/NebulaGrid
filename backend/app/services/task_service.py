@@ -85,23 +85,67 @@ def list_tasks(
     if not (all_history and zone in {"history", "hist", "finished"}):
         ordered = ordered.offset((page - 1) * page_size).limit(page_size)
     tasks = db.scalars(ordered).all()
-    return [build_task_info(task, db) for task in tasks], total
+    return build_task_infos(tasks, db), total
 
 
-def task_change_cursor(user: UserRecord, db: Session) -> dict[str, int]:
+def task_change_cursor(user: UserRecord, db: Session) -> dict[str, int | dict[str, dict[str, int]]]:
     """返回当前用户可见任务的轻量版本号，供 SSE 判断是否需要刷新任务列表。"""
     require_permission(user.role, "tasks:read")
-    visible_tasks = select(Task.id).where(task_visibility_condition(user, db)).subquery()
-    total = db.scalar(select(func.count()).select_from(visible_tasks)) or 0
-    max_task_id = db.scalar(select(func.max(visible_tasks.c.id))) or 0
-    max_event_id = db.scalar(
-        select(func.max(TaskEvent.id)).where(TaskEvent.task_id.in_(select(visible_tasks.c.id)))
-    ) or 0
+    visible_tasks = select(Task.id, Task.state).where(task_visibility_condition(user, db)).subquery()
+    state_rows = db.execute(
+        select(
+            visible_tasks.c.state,
+            func.count(visible_tasks.c.id),
+            func.max(visible_tasks.c.id),
+        )
+        .select_from(visible_tasks)
+        .group_by(visible_tasks.c.state)
+    ).all()
+    event_rows = db.execute(
+        select(visible_tasks.c.state, func.max(TaskEvent.id))
+        .select_from(visible_tasks)
+        .join(TaskEvent, TaskEvent.task_id == visible_tasks.c.id)
+        .group_by(visible_tasks.c.state)
+    ).all()
+    total = sum(int(row[1] or 0) for row in state_rows)
+    max_task_id = max((int(row[2] or 0) for row in state_rows), default=0)
+    max_event_id = max((int(row[1] or 0) for row in event_rows), default=0)
     return {
         "total": int(total),
         "max_task_id": int(max_task_id),
         "max_event_id": int(max_event_id),
+        "zones": build_task_zone_cursors(state_rows, event_rows),
     }
+
+
+def build_task_zone_cursors(state_rows, event_rows) -> dict[str, dict[str, int]]:
+    """把数据库按状态聚合的版本号折叠成前端三个任务分区。"""
+    cursors = {
+        "wait": {"count": 0, "max_task_id": 0, "max_event_id": 0},
+        "running": {"count": 0, "max_task_id": 0, "max_event_id": 0},
+        "history": {"count": 0, "max_task_id": 0, "max_event_id": 0},
+    }
+    event_by_state = {row[0]: int(row[1] or 0) for row in event_rows}
+    for state, count, max_task_id in state_rows:
+        zone = task_zone_name(state)
+        if zone is None:
+            continue
+        cursor = cursors[zone]
+        cursor["count"] += int(count or 0)
+        cursor["max_task_id"] = max(cursor["max_task_id"], int(max_task_id or 0))
+        cursor["max_event_id"] = max(cursor["max_event_id"], event_by_state.get(state, 0))
+    return cursors
+
+
+def task_zone_name(state: str | None) -> str | None:
+    """把数据库任务状态映射到任务管理页分区，未知状态不触发分区刷新。"""
+    if state in WAIT_STATES:
+        return "wait"
+    if state in RUNNING_STATES:
+        return "running"
+    if state in TERMINAL_STATES:
+        return "history"
+    return None
 
 
 def create_task(user: UserRecord, payload: TaskCreateRequest, db: Session) -> TaskInfo:
@@ -511,6 +555,107 @@ def require_user_model(user_id: int, db: Session) -> User:
     return user
 
 
+def build_task_infos(tasks: list[Task], db: Session) -> list[TaskInfo]:
+    """批量构建任务列表响应，避免列表页按每条任务反复查询关联摘要。"""
+    if not tasks:
+        return []
+    task_pks = [task.id for task in tasks]
+    owner_ids = {task.user_id for task in tasks}
+    env_ids = {task.env_id for task in tasks if task.env_id is not None}
+    owners = {
+        owner.id: owner
+        for owner in db.scalars(select(User).where(User.id.in_(owner_ids))).all()
+    } if owner_ids else {}
+    envs = {
+        env.id: env
+        for env in db.scalars(select(Env).where(Env.id.in_(env_ids))).all()
+    } if env_ids else {}
+    dependencies = db.scalars(select(TaskDependency).where(TaskDependency.task_id.in_(task_pks))).all()
+    predecessor_ids = {dependency.prev_task_id for dependency in dependencies}
+    predecessors = {
+        predecessor.id: predecessor
+        for predecessor in db.scalars(select(Task).where(Task.id.in_(predecessor_ids))).all()
+    } if predecessor_ids else {}
+    predecessor_by_task_id = {
+        dependency.task_id: predecessors.get(dependency.prev_task_id)
+        for dependency in dependencies
+    }
+    allocation_task_ids = [
+        task.id
+        for task in tasks
+        if task.state in RUNNING_STATES or task.state in TERMINAL_STATES
+    ]
+    allocations = load_latest_allocations(allocation_task_ids, db)
+    node_ids = {allocation.node_id for allocation in allocations.values()}
+    for task in tasks:
+        if task.id not in allocations and task.requirement and task.requirement.node_id is not None:
+            node_ids.add(task.requirement.node_id)
+    nodes = {
+        node.id: node
+        for node in db.scalars(select(Node).where(Node.id.in_(node_ids))).all()
+    } if node_ids else {}
+    gpu_ids = {
+        coerce_int(gpu_id)
+        for allocation in allocations.values()
+        for gpu_id in (allocation.gpu_ids or [])
+        if coerce_int(gpu_id) > 0
+    }
+    gpus = {
+        gpu.id: gpu
+        for gpu in db.scalars(select(Gpu).where(Gpu.id.in_(gpu_ids))).all()
+    } if gpu_ids else {}
+    result: list[TaskInfo] = []
+    for task in tasks:
+        owner = owners.get(task.user_id)
+        env = envs.get(task.env_id) if task.env_id is not None else None
+        predecessor = predecessor_by_task_id.get(task.id)
+        allocation = allocations.get(task.id)
+        node = nodes.get(allocation.node_id) if allocation is not None else None
+        gpu_indices: list[int] = []
+        gpu_models: list[str] = []
+        if allocation is not None:
+            for gpu_id in allocation.gpu_ids or []:
+                gpu = gpus.get(coerce_int(gpu_id))
+                if gpu is None:
+                    continue
+                gpu_indices.append(gpu.gpu_index)
+                if gpu.model not in gpu_models:
+                    gpu_models.append(gpu.model)
+        elif task.requirement and task.requirement.node_id is not None:
+            node = nodes.get(task.requirement.node_id)
+        result.append(TaskInfo(
+            id=task.id,
+            task_id=task.task_id,
+            user_id=task.user_id,
+            owner_name=owner.real_name if owner else "",
+            owner_username=owner.username if owner else "",
+            description=task.description,
+            env_id=task.env_id,
+            env_name=env.name if env else None,
+            env_path=env.path if env else None,
+            workdir=task.workdir,
+            command=task.command,
+            state=task.state,
+            priority=task.priority,
+            urgent=task.urgent,
+            on_hold=task.on_hold,
+            last_block_reason=task.last_block_reason,
+            log_path=task.log_path,
+            return_code=task.return_code,
+            created_at=datetime_to_iso(task.created_at),
+            started_at=datetime_to_iso(task.started_at) if task.started_at else None,
+            finished_at=datetime_to_iso(task.finished_at) if task.finished_at else None,
+            predecessor_task_id=predecessor.task_id if predecessor else None,
+            predecessor_task_no=predecessor.task_id if predecessor else None,
+            node_id=node.id if node else None,
+            node_name=node.name if node else None,
+            gpu_indices=gpu_indices,
+            gpu_models=gpu_models,
+            requirement=task_requirement_schema(task.requirement),
+        ))
+    return result
+
+
 def build_task_info(task: Task, db: Session) -> TaskInfo:
     """把任务 ORM 记录转换为前端展示模型，并附带 owner/env/allocation 摘要。"""
     owner = db.get(User, task.user_id)
@@ -608,11 +753,31 @@ def load_successor_tasks(task_pk: int, db: Session) -> list[Task]:
 
 def load_latest_allocation(task_pk: int, db: Session) -> TaskAllocation | None:
     """读取任务最近一次分配，历史区也要展示实际执行节点和 GPU。"""
-    return db.scalar(
-        select(TaskAllocation)
-        .where(TaskAllocation.task_id == task_pk)
-        .order_by(TaskAllocation.allocated_at.desc(), TaskAllocation.id.desc())
+    return load_latest_allocations([task_pk], db).get(task_pk)
+
+
+def load_latest_allocations(task_pks: list[int], db: Session) -> dict[int, TaskAllocation]:
+    """一次取回每个任务最近一次 allocation，避免历史区列表逐条排序查询。"""
+    if not task_pks:
+        return {}
+    ranked_allocations = (
+        select(
+            TaskAllocation.id.label("id"),
+            TaskAllocation.task_id.label("task_id"),
+            func.row_number().over(
+                partition_by=TaskAllocation.task_id,
+                order_by=(TaskAllocation.allocated_at.desc(), TaskAllocation.id.desc()),
+            ).label("row_rank"),
+        )
+        .where(TaskAllocation.task_id.in_(task_pks))
+        .subquery()
     )
+    allocations = db.scalars(
+        select(TaskAllocation)
+        .join(ranked_allocations, TaskAllocation.id == ranked_allocations.c.id)
+        .where(ranked_allocations.c.row_rank == 1)
+    ).all()
+    return {allocation.task_id: allocation for allocation in allocations}
 
 
 def release_task_allocations(task_pk: int, db: Session) -> None:

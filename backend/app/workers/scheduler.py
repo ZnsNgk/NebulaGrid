@@ -277,11 +277,34 @@ def release_terminal_allocations(db: Session) -> int:
         .where(Task.state.in_(TERMINAL_STATES))
     ).all()
     now = local_datetime()
+    task_ids = {allocation.task_id for allocation in allocations}
+    tasks_by_id = {
+        task.id: task
+        for task in db.scalars(select(Task).where(Task.id.in_(task_ids))).all()
+    } if task_ids else {}
+    guards_by_task_id = {
+        guard.task_id: guard
+        for guard in db.scalars(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id.in_(task_ids))).all()
+    } if task_ids else {}
+    released = 0
     for allocation in allocations:
+        task = tasks_by_id.get(allocation.task_id)
+        guard = guards_by_task_id.get(allocation.task_id)
+        if task is not None and should_keep_cancel_allocation(task, guard):
+            continue
         allocation.released_at = now
-    if allocations:
+        released += 1
+    if released:
         db.flush()
-    return len(allocations)
+    return released
+
+
+def should_keep_cancel_allocation(task: Task, guard: TaskRuntimeGuard | None) -> bool:
+    """取消任务的远端进程未确认回收前不能释放占用，否则执行器会失去中止入口。"""
+    if task.state != "cancelled" or guard is None:
+        return False
+    has_remote_process = guard.process_group_id is not None or guard.root_pid is not None
+    return has_remote_process and guard.state != "cancelled"
 
 
 def mark_blocked(db: Session, task: Task, reason: str, message: str) -> None:

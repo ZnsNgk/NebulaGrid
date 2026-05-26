@@ -1,5 +1,6 @@
 import base64
 import mimetypes
+import os
 import shutil
 import stat
 import subprocess
@@ -19,7 +20,7 @@ from app.core.rbac import Role, require_permission
 from app.core.time_utils import ensure_local_datetime, local_datetime
 from app.db.models import FileJob as FileJobModel, User, UserSupervisor
 from app.db.session import SessionLocal
-from app.schemas.files import FileEntry, FileJobData, FileListData, FilePreviewData
+from app.schemas.files import FileEntry, FileJobData, FileListData, FilePermissionData, FilePreviewData
 from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
 from app.services.file_executor import submit_file_operation
@@ -93,6 +94,7 @@ def preview_file(user: UserRecord, path: str, scope: str = "") -> FilePreviewDat
             encoding="text",
             truncated=size > TEXT_PREVIEW_LIMIT,
             size_bytes=size,
+            **build_file_permission_data(real_path, normalized).model_dump(exclude={"path"}),
         )
 
     raw = real_path.read_bytes()[:BINARY_PREVIEW_LIMIT]
@@ -103,7 +105,20 @@ def preview_file(user: UserRecord, path: str, scope: str = "") -> FilePreviewDat
         encoding="base64",
         truncated=size > BINARY_PREVIEW_LIMIT,
         size_bytes=size,
+        **build_file_permission_data(real_path, normalized).model_dump(exclude={"path"}),
     )
+
+
+def grant_execute_permission(user: UserRecord, path: str) -> FilePermissionData:
+    """给选中文件补齐执行权限，重点保证任务运行主账户能执行用户上传的脚本。"""
+    normalized = normalize_virtual_path(path)
+    real_path = resolve_writable_existing_path(user, normalized)
+    if not real_path.is_file():
+        raise validation_error("path is not a file")
+    add_owner_execute_bit(real_path)
+    grant_main_user_acl_execute(real_path)
+    record_file_audit(user, "chmod_execute", normalized)
+    return build_file_permission_data(real_path, normalized)
 
 
 def create_directory(user: UserRecord, path: str) -> dict[str, str | bool]:
@@ -549,6 +564,47 @@ def resolve_writable_existing_path(user: UserRecord, path: str) -> Path:
     if not real_path.exists():
         raise not_found("path not found")
     return real_path
+
+
+def build_file_permission_data(path: Path, normalized: str) -> FilePermissionData:
+    """汇总前端权限面板需要展示的文件模式和主账户执行状态。"""
+    mode = stat.S_IMODE(path.stat().st_mode)
+    settings = get_settings()
+    return FilePermissionData(
+        path=normalized,
+        mode_octal=f"{mode:04o}",
+        owner_executable=bool(mode & stat.S_IXUSR),
+        group_executable=bool(mode & stat.S_IXGRP),
+        other_executable=bool(mode & stat.S_IXOTH),
+        main_user=settings.main_linux_user,
+        main_user_can_execute=path.is_file() and os.access(path, os.X_OK),
+    )
+
+
+def add_owner_execute_bit(path: Path) -> None:
+    """先设置属主执行位；Web/Samba 上传文件通常由主账户落盘，这一步即可让任务启动脚本。"""
+    mode = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(mode | stat.S_IXUSR)
+
+
+def grant_main_user_acl_execute(path: Path) -> None:
+    """如果系统支持 POSIX ACL，显式给主账户 rwx，覆盖 SSH 子账户上传文件缺少执行位的场景。"""
+    if os.name == "nt":
+        return
+    main_user = get_settings().main_linux_user.strip()
+    setfacl = shutil.which("setfacl")
+    if not main_user or not setfacl:
+        return
+    try:
+        subprocess.run(
+            [setfacl, "-m", f"u:{main_user}:rwx", str(path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        # ACL 失败不回滚 chmod；某些 NFS 挂载或开发环境没有 ACL 能力，属主执行位仍有价值。
+        return
 
 
 def ensure_parent_directory(path: Path) -> None:

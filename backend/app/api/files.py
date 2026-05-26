@@ -12,6 +12,7 @@ from app.services.file_service import (
     create_text_file,
     delete_path,
     get_latest_file_job,
+    grant_execute_permission,
     list_files,
     move_path,
     preview_file,
@@ -113,6 +114,17 @@ async def post_file_save(
     """保存文本文件内容，供前端编辑器使用。"""
     data = await run_file_operation(save_text_file, current_user, payload.path, payload.content)
     return api_success(data=data, request_id=request.headers.get("x-request-id"))
+
+
+@router.post("/permissions/execute")
+async def post_file_execute_permission(
+    payload: FileOperationRequest,
+    request: Request,
+    current_user: UserRecord = Depends(get_current_user),
+):
+    """为普通文件授予执行权限，供用户上传脚本后提交任务前处理。"""
+    data = await run_file_operation(grant_execute_permission, current_user, payload.path)
+    return api_success(data=data.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
 @router.post("/copy")

@@ -215,6 +215,7 @@ scp test1@192.168.0.1:~/outputs/result.csv ./result.csv
 - 上传、下载、新建文件夹、新建文件。
 - 文本文件预览、编辑和保存。
 - 重命名、复制、移动、打包 zip、解压压缩包、删除。
+- 文件权限面板可为普通文件授予执行权限，用于处理用户上传 `.sh` 后主账户无法直接执行的问题。
 - 在个人目录和共享文件夹之间转移资料。
 
 注意：
@@ -232,6 +233,7 @@ scp test1@192.168.0.1:~/outputs/result.csv ./result.csv
 - `target already exists`：目标文件已存在。
 - `target cannot be inside source directory`：不能把目录复制或移动到自身内部。
 - `unsupported archive type`：压缩包格式不支持。
+- `Permission denied`：若任务命令直接运行脚本路径，先在文件管理中打开脚本并授予执行权限；仍失败时检查用户目录 ACL 和主账户是否为 `NEBULAGRID_MAIN_LINUX_USER`。
 
 ## 7. 环境管理
 

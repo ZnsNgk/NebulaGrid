@@ -758,6 +758,7 @@ API Router
 | POST | /api/files/rename | 重命名文件或目录 |
 | POST | /api/files/archive | 打包文件夹 |
 | POST | /api/files/extract | 解压 zip/tar/tar.gz/tgz/tar.bz2/tbz2/tar.xz/txz |
+| POST | /api/files/permissions/execute | 为个人目录内普通文件授予执行权限，确保主账户可运行上传脚本 |
 | GET | /api/files/jobs/latest | 当前用户最近一次打包/解压任务状态 |
 | GET | /api/files/preview?path=&scope= | 文本/图片/音视频预览 |
 | DELETE | /api/files | 删除 |

@@ -1,5 +1,6 @@
 from datetime import timedelta
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -1041,6 +1042,11 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
             json={"path": "/project/copy.txt", "target_path": "/project/renamed.txt"},
         )
         preview_response = client.get("/api/files/preview?path=/project/renamed.txt", headers=headers)
+        permission_response = client.post(
+            "/api/files/permissions/execute",
+            headers=headers,
+            json={"path": "/project/renamed.txt"},
+        )
         download_response = client.get("/api/files/download?path=/project/renamed.txt", headers=headers)
         delete_response = client.delete("/api/files?path=/project/renamed.txt", headers=headers)
         root_delete_response = client.delete("/api/files?path=/", headers=headers)
@@ -1051,6 +1057,10 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
         assert copy_response.status_code == 200
         assert rename_response.status_code == 200
         assert preview_response.json()["data"]["content"] == "updated"
+        assert preview_response.json()["data"]["mode_octal"]
+        assert permission_response.status_code == 200
+        assert permission_response.json()["data"]["owner_executable"] is True
+        assert (user_root / "project" / "renamed.txt").stat().st_mode & stat.S_IXUSR
         assert download_response.text == "updated"
         assert delete_response.status_code == 200
         assert root_delete_response.status_code == 422

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -123,6 +123,12 @@ class Task(Base, TimestampMixin):
     """任务主表，保存用户命令、状态和调度生命周期时间。"""
 
     __tablename__ = "tasks"
+    __table_args__ = (
+        Index("ix_tasks_wait_zone_order", "state", "urgent", "priority", "created_at"),
+        Index("ix_tasks_running_zone_order", "state", "started_at", "created_at"),
+        Index("ix_tasks_history_zone_order", "state", "finished_at", "created_at"),
+        Index("ix_tasks_user_state_created", "user_id", "state", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     task_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -175,6 +181,9 @@ class TaskAllocation(Base):
     """任务资源分配表，调度器用它记录 GPU 占用和释放时间。"""
 
     __tablename__ = "task_allocations"
+    __table_args__ = (
+        Index("ix_task_allocations_latest", "task_id", "allocated_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
