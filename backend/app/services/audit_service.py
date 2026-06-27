@@ -42,7 +42,9 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "manage.linux_accounts": "是否由 NebulaGrid 自动创建和维护 Linux 子账号。",
     "manage.samba_accounts": "是否由 NebulaGrid 自动执行 smbpasswd/pdbedit 来维护用户 Samba 账号；关闭时只记录用户期望状态，不改动系统 Samba 数据库。",
     "session.secret": "登录会话签名密钥；生产环境应使用外部密钥并定期轮换。",
-    "monitor.interval_seconds": "节点监控 worker 的轮询间隔，单位为秒。",
+    "monitor.interval_seconds": "节点监控远端循环输出间隔，单位为秒；worker 会为每个可监控节点保持 SSH 长连接。",
+    "monitor.reconnect_attempts": "节点监控 SSH 长连接断开后的自动重连次数；达到上限后节点保持离线并停止继续连接。",
+    "monitor.watchdog_timeout_seconds": "节点监控长连接未收到有效状态 JSON 的超时时间，单位为秒；超时后节点先置为离线并触发自动重连。",
     "cors.origins": "允许访问 API 的前端来源列表，多个来源用英文逗号分隔。",
 }
 
@@ -53,6 +55,8 @@ SETTING_VALUE_TYPES: dict[str, str] = {
     "manage.samba_accounts": "boolean",
     "scheduler.interval_seconds": "number",
     "monitor.interval_seconds": "integer",
+    "monitor.reconnect_attempts": "integer",
+    "monitor.watchdog_timeout_seconds": "integer",
     "uploads.max_size_mb": "integer",
 }
 
@@ -94,6 +98,8 @@ SETTING_KEY_ALIASES: dict[str, str] = {
     "session_secret": "session.secret",
     "scheduler_interval_seconds": "scheduler.interval_seconds",
     "monitor_interval_seconds": "monitor.interval_seconds",
+    "monitor_reconnect_attempts": "monitor.reconnect_attempts",
+    "monitor_watchdog_timeout_seconds": "monitor.watchdog_timeout_seconds",
     "cors_origins": "cors.origins",
 }
 
@@ -116,6 +122,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "scheduler.instance_lock": "locked-by-row-transaction",
     "scheduler.interval_seconds": "1",
     "monitor.enabled": "true",
+    "monitor.reconnect_attempts": "3",
+    "monitor.watchdog_timeout_seconds": "600",
     "uploads.max_size_mb": "20480",
 }
 
@@ -128,7 +136,7 @@ def utc_now() -> str:
 
 
 def record_audit(
-    actor_user_id: int,
+    actor_user_id: int | None,
     action: str,
     target_type: str,
     target_id: str,

@@ -39,6 +39,8 @@ class Settings:
     session_secret: str = "change-this-session-secret"
     scheduler_interval_seconds: float = 1.0
     monitor_interval_seconds: int = 5
+    monitor_reconnect_attempts: int = 3
+    monitor_watchdog_timeout_seconds: int = 600
     file_operation_worker_threads: int = 2
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
@@ -89,6 +91,8 @@ def get_settings() -> Settings:
         session_secret=os.getenv("NEBULAGRID_SESSION_SECRET", "change-this-session-secret"),
         scheduler_interval_seconds=float(os.getenv("NEBULAGRID_SCHEDULER_INTERVAL_SECONDS", "1")),
         monitor_interval_seconds=int(os.getenv("NEBULAGRID_MONITOR_INTERVAL_SECONDS", "5")),
+        monitor_reconnect_attempts=int(os.getenv("NEBULAGRID_MONITOR_RECONNECT_ATTEMPTS", "3")),
+        monitor_watchdog_timeout_seconds=int(os.getenv("NEBULAGRID_MONITOR_WATCHDOG_TIMEOUT_SECONDS", "600")),
         file_operation_worker_threads=int(os.getenv("NEBULAGRID_FILE_OPERATION_WORKER_THREADS", "2")),
         cors_origins=tuple(
             origin.strip()

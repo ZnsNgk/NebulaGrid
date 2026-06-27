@@ -1,9 +1,11 @@
 from datetime import timedelta
 from pathlib import Path
 import stat
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -15,7 +17,19 @@ from app.services.metrics_service import parse_flux_csv
 from app.db.models import LoginSession, Node, Setting, Task, TaskAllocation, TaskRuntimeGuard
 from app.db.session import SessionLocal
 from app.main import create_app
-from app.workers.node_monitor import monitor_node, node_monitor_paused, sync_gpu_inventory
+from app.workers.node_monitor import (
+    MonitorWatchdogTimeout,
+    NodeMonitorTarget,
+    NodeMonitorWorker,
+    build_remote_monitor_command,
+    monitor_reconnect_attempts,
+    monitor_watchdog_timeout_seconds,
+    monitor_node,
+    node_monitor_paused,
+    normalize_reconnect_attempts,
+    normalize_watchdog_timeout,
+    sync_gpu_inventory,
+)
 from app.workers.runtime_guard import expand_pid_tree, parse_gpu_apps, parse_process_table
 from app.workers.scheduler import scheduler_interval_seconds, scheduler_tick
 
@@ -33,6 +47,24 @@ def test_health_check_returns_ok() -> None:
     assert response.status_code == 200
     assert payload["ok"] is True
     assert payload["data"]["status"] == "ok"
+
+
+def test_runtime_config_returns_shared_folder_root(monkeypatch, tmp_path: Path) -> None:
+    """验证普通登录用户能读取前端展示所需的真实共享文件夹根目录。"""
+    shared_root = tmp_path / "actual-shared"
+    monkeypatch.setenv("NEBULAGRID_SHARED_FOLDER_ROOT", str(shared_root))
+    get_settings.cache_clear()
+    try:
+        client = make_client()
+        login_response = client.post("/api/auth/login", json={"identity": "admin", "password": "admin123"})
+        token = login_response.json()["data"]["access_token"]
+
+        response = client.get("/api/runtime-config", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200
+        assert response.json()["data"]["shared_folder_root"] == str(shared_root)
+    finally:
+        get_settings.cache_clear()
 
 
 def test_runtime_guard_matches_gpu_usage_from_pid_tree() -> None:
@@ -248,6 +280,67 @@ def test_monitor_skips_admin_offline_node_until_reconnect(monkeypatch) -> None:
     assert node.state == "offline"
     assert node.scheduling_enabled is False
     assert calls == []
+
+
+def test_monitor_long_connection_command_uses_remote_loop() -> None:
+    """验证节点监控长连接通过远端循环脚本输出，而不是每轮重新执行一次 SSH 命令。"""
+    target = NodeMonitorTarget(
+        node_id=7,
+        name="node-loop",
+        ip="10.0.0.37",
+        ssh_user="ddltm",
+        remote_code_root="/home/ddltm/envs/nebulagrid_remote",
+        miniconda_python="/home/ddltm/envs/miniconda3/bin/python",
+        interval_seconds=5,
+        reconnect_attempts=3,
+        watchdog_timeout_seconds=600,
+    )
+
+    command = build_remote_monitor_command(target, loop=True)
+
+    assert command[0] == "ssh"
+    assert "ServerAliveInterval=10" in command
+    assert command[-2] == "ddltm@10.0.0.37"
+    assert command[-1] == (
+        "/home/ddltm/envs/miniconda3/bin/python -u "
+        "/home/ddltm/envs/nebulagrid_remote/monitor.py --loop --interval 5"
+    )
+    assert target.reconnect_attempts == 3
+    assert target.watchdog_timeout_seconds == 600
+
+
+def test_monitor_watchdog_timeout_when_stream_has_no_payload(monkeypatch) -> None:
+    """验证 SSH 连接未退出但长期没有有效 JSON 时，watchdog 会主动触发重连路径。"""
+
+    class SilentStdout:
+        """模拟仍保持打开但迟迟不输出完整监控行的 stdout。"""
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            time.sleep(0.2)
+            raise StopIteration
+
+    target = NodeMonitorTarget(
+        node_id=8,
+        name="node-watchdog",
+        ip="10.0.0.38",
+        ssh_user="ddltm",
+        remote_code_root="/home/ddltm/envs/nebulagrid_remote",
+        miniconda_python="/home/ddltm/envs/miniconda3/bin/python",
+        interval_seconds=5,
+        reconnect_attempts=3,
+        watchdog_timeout_seconds=0.05,
+    )
+    worker = NodeMonitorWorker(target)
+    process = SimpleNamespace(stdout=SilentStdout())
+    monkeypatch.setattr("app.workers.node_monitor.target_monitor_paused", lambda node_id: False)
+
+    with pytest.raises(MonitorWatchdogTimeout) as exc_info:
+        worker.read_monitor_stream(process)
+
+    assert exc_info.value.got_payload is False
 
 
 def test_scheduler_schedules_one_exclusive_task_per_tick() -> None:
@@ -567,6 +660,28 @@ def test_scheduler_interval_allows_subsecond_setting() -> None:
         db.commit()
     with SessionLocal() as db:
         assert scheduler_interval_seconds(db) == 0.5
+
+
+def test_monitor_reconnect_attempts_uses_admin_setting() -> None:
+    """验证节点监控自动重连次数来自管理员系统设置，默认用于限制断线后的重试范围。"""
+    with SessionLocal() as db:
+        db.merge(Setting(key="monitor.reconnect_attempts", value="4"))
+        db.commit()
+    with SessionLocal() as db:
+        assert monitor_reconnect_attempts(db) == 4
+    assert normalize_reconnect_attempts("-1") == 0
+    assert normalize_reconnect_attempts("999") == 100
+
+
+def test_monitor_watchdog_timeout_uses_admin_setting() -> None:
+    """验证管理员后台系统设置可以覆盖节点监控无输出 watchdog 超时。"""
+    with SessionLocal() as db:
+        db.merge(Setting(key="monitor.watchdog_timeout_seconds", value="42"))
+        db.commit()
+        assert monitor_watchdog_timeout_seconds(db) == 42
+    assert normalize_watchdog_timeout("bad") == 600
+    assert normalize_watchdog_timeout("-1") == 1
+    assert normalize_watchdog_timeout("999999") == 86400
 
 
 def test_scheduler_prefers_user_owned_then_group_then_public_nodes() -> None:

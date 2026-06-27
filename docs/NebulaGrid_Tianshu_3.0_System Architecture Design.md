@@ -1229,7 +1229,13 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 ### 14.1 监控方式
 
-MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在每个计算节点长期安装复杂 agent。
+MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在每个计算节点长期安装复杂 agent。`nebulagrid-node-monitor` 启动后先读取数据库中的计算节点清单，再为每个未被管理员隔离的节点启动一个监控线程。每个线程只维护一个节点的 SSH 长连接，并在远端执行：
+
+```bash
+/home/ddltm/envs/miniconda3/bin/python -u /home/ddltm/envs/nebulagrid_remote/monitor.py --loop --interval <interval_seconds>
+```
+
+`monitor.py` 在计算节点本地按 `--interval` 固定节拍采集和输出 JSON Lines，master 侧只持续读取 stdout 并逐帧写入 PostgreSQL/InfluxDB。这样采样节拍主要由计算节点本地时间控制，不会因为 master 每轮重新发起 SSH 命令或短时网络抖动而放大间隔误差。远端脚本默认不带 `--loop` 时仍只输出一帧 JSON，供部署自检和手动排障使用。
 
 监控脚本采集：
 
@@ -1248,11 +1254,16 @@ MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在
 
 | 条件 | 处理 |
 |---|---|
-| 正常收到状态 | node.state = online，更新 last_heartbeat_at |
-| 超过阈值未收到状态 | node.state = offline |
+| 长连接正常收到一行状态 JSON | node.state = online，更新最新监控指标 |
+| SSH 长连接退出、网络断开或 keepalive 判定失败 | node.state = offline，随后按配置进入 reconnecting |
+| SSH 长连接仍存在但超过 `monitor.watchdog_timeout_seconds` 没有收到有效状态 JSON | node.state = offline，关闭当前 SSH 进程，随后按配置进入 reconnecting |
+| 自动重连成功 | node.state = online，恢复调度 |
+| 自动重连次数耗尽 | node.state = offline，关闭调度并停止继续连接 |
 | 节点 offline | CPU/GPU 调度占用释放或按任务恢复策略处理 |
 | 管理员禁用 | node.state = disabled，不参与调度 |
 | 管理员维护 | node.state = maintenance，不参与普通调度 |
+
+SSH 命令需要启用 `ServerAliveInterval` 和 `ServerAliveCountMax`。这样节点断电、网络断开或链路长期无响应时，OpenSSH 会主动结束连接，节点线程可以立即把该节点落为 offline。主节点还维护本地 watchdog：stdout 读取线程长时间没有交付有效状态 JSON 时，即使 SSH 进程仍在，也会终止该连接并把节点落为 offline。随后节点线程按 `monitor.reconnect_attempts` 自动重连，默认 3 次；每次尝试写入审计日志。无输出 watchdog 阈值由管理员后台 `monitor.watchdog_timeout_seconds` 控制，默认 600 秒。
 
 ### 14.3 节点状态与任务状态关系
 
@@ -1266,7 +1277,7 @@ MVP 阶段采用 master 通过 SSH 启动远端监控脚本的方式，避免在
 6. 前端提示用户任务因节点掉线中止。
 
 如果 offline 来源是管理员强制下线，则不等待恢复扫描：服务层立即终止该节点运行任务、释放该节点所有未释放 allocation，并通过 `node.force_offline` 审计动作保存影响范围。这样可以避免已下线节点上的 GPU 继续显示为平台调度占用。
-节点监控器遇到 `offline` 且 `scheduling_enabled=false` 的节点时应直接跳过 SSH 探测，直到管理员点击“重连”把节点改为 `reconnecting`。这样强制下线节点不会被下一轮监控自动写回 `online`，也不会因为不可达 SSH 拖慢整轮节点监控。
+节点监控器遇到 `offline` 且 `scheduling_enabled=false` 的节点时应停止或跳过该节点线程，直到管理员点击“重连”把节点改为 `reconnecting`。这样强制下线节点不会被监控长连接自动写回 `online`，也不会因为不可达 SSH 拖慢其他节点监控。
 
 ---
 
@@ -1498,7 +1509,9 @@ executor:
 
 monitor:
   interval_seconds: 5
-  watchdog_offline_seconds: 600
+  reconnect_attempts: 3
+  ssh_keepalive_count: 2
+  watchdog_timeout_seconds: 600
 
 runtime_guard:
   enabled: true
@@ -1558,7 +1571,7 @@ Nginx 负责：
 6. `nvidia-smi` 可用；
 7. 通过 NFS 挂载 master 共享的 `/home/ddltm/data`，用于访问用户 home、任务日志、环境安装日志、运行时文件、miniconda、用户环境和节点监控/远端执行代码；
 8. `/home/ddltm/data` 在 master 和所有计算节点上的路径必须一致；
-9. `runner.py`、`monitor.py`、`env_probe.py`、`env_installer.py` 由 master 通过 `backend/scripts/sync_remote_scripts.py` 统一同步到 `/home/ddltm/envs/nebulagrid_remote/`；计算节点优先通过 NFS 读取并以主账户执行，未共享 NFS 的部署可使用 `--all-db-nodes` 主动推送到每个已登记节点。
+9. `runner.py`、`monitor.py`、`env_probe.py`、`env_installer.py` 由 master 通过 `backend/scripts/sync_remote_scripts.py` 统一同步到 `/home/ddltm/envs/nebulagrid_remote/`；计算节点优先通过 NFS 读取并以主账户执行，未共享 NFS 的部署可使用 `--all-db-nodes` 主动推送到每个已登记节点。`monitor.py` 必须支持单次 JSON 输出和 `--loop --interval` 长连接输出两种模式。
 
 ---
 

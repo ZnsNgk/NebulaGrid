@@ -335,8 +335,8 @@ nebulagrid/
 | NODE-002     | 节点字段包括名称、IP、主账户 SSH 用户名、主账户 UID/GID、归属类型、所有人、是否开放、连接速度、备注、状态。 | P0         |
 | NODE-003     | GPU 字段应从节点中拆分为 GPU 子表，记录 index、型号、显存总量、是否可调度、备注。          | P0         |
 | NODE-004     | 支持节点上线、手动下线、维护模式、重新连接、强制下线并停止任务。                           | P0         |
-| NODE-005     | 节点监控每隔固定时间采集 CPU、内存、网络、GPU 利用率、显存和运行进程摘要。                 | P0         |
-| NODE-006     | watchdog 超时后节点自动置为 offline，并触发该节点运行任务的异常处理流程。                  | P0         |
+| NODE-005     | 节点监控由 master 为每个可监控计算节点维护一条 SSH 长连接，远端 `monitor.py --loop --interval <秒数>` 按固定间隔输出 CPU、内存、网络、GPU 利用率、显存和运行进程摘要。 | P0         |
+| NODE-006     | SSH 长连接中断、keepalive 判定不可达，或连接仍存在但超过管理员配置的 watchdog 时间未收到有效状态 JSON 后，节点自动置为 offline，再按管理员配置的次数进入 reconnecting 并写入审计；重连成功恢复 online，次数耗尽后保持 offline；管理员强制下线的节点必须等待显式重连。 | P0         |
 | NODE-007     | 普通用户只能看到自己可使用节点，管理员可查看 IP、SSH 用户和完整配置。                      | P0         |
 
 ## 5.3 任务管理
@@ -439,7 +439,7 @@ nebulagrid/
 
 ## 6.2 节点异常流程
 
-1. 监控器无法获取节点状态或 watchdog 超过阈值，将节点置为 offline。
+1. 监控器无法获取节点状态，或 SSH 长连接超过 watchdog 阈值没有收到有效状态 JSON，将节点置为 offline。
 
 2. 系统查询该节点上处于 dispatching/starting/running 的任务。
 
@@ -513,14 +513,14 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | **状态**       | **含义**                   | **是否可调度**         |
 |----------------|----------------------------|------------------------|
 | online         | 监控正常且允许调度。       | 是                     |
-| offline        | 监控断开或 watchdog 超时。 | 否                     |
+| offline        | 监控长连接断开或 keepalive/watchdog 超时。 | 否                     |
 | maintenance    | 管理员维护模式。           | 否，除非管理员手动允许 |
 | disabled       | 节点被管理员禁用。         | 否                     |
 | reconnecting   | 正在重新连接监控。         | 否                     |
 | manual_offline | 管理员手动下线。           | 否                     |
 
 当前实现约定：管理员点击“强制下线”时，节点对外状态统一写为 `offline`；审计日志通过 `node.force_offline` 区分这是人工隔离，而不是普通监控掉线。
-处于 `offline` 且 `scheduling_enabled=false` 的节点视为管理员隔离或等待人工确认状态，节点监控不应继续 SSH 探测并自动改回 `online`；管理员点击“重连”后节点进入 `reconnecting`，下一轮监控成功才恢复 `online`。
+处于 `offline` 且 `scheduling_enabled=false` 的节点视为管理员隔离或等待人工确认状态，节点监控不应继续 SSH 探测并自动改回 `online`；管理员点击“重连”后节点进入 `reconnecting`，新的监控长连接收到状态 JSON 后才恢复 `online`。
 
 # 8. API 与前后端交互设计
 
@@ -976,7 +976,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 | **场景**              | **操作**                                         | **预期结果**                                                                           |
 |-----------------------|--------------------------------------------------|----------------------------------------------------------------------------------------|
-| 节点断电              | 运行任务时断开节点网络/电源                      | watchdog 超时，节点 offline，任务 offline，资源释放，事件和审计记录完整。              |
+| 节点断电              | 运行任务时断开节点网络/电源                      | SSH 长连接退出或 keepalive 判定失败，节点 offline，任务 offline，资源释放，事件和审计记录完整。 |
 | master 重启           | 运行中强制重启主控服务                           | 系统启动后执行恢复扫描，无法确认任务标记 lost/offline，不出现重复派发。                |
 | SSH 启动失败          | 主账户 SSH 配置错误、UID/GID 不一致或节点不可达  | 任务 failed/offline，错误原因可见，资源释放。                                          |
 | 日志文件被删除        | 删除运行任务日志                                 | 日志接口提示日志不存在或重新创建，不影响任务状态。                                     |
@@ -995,7 +995,7 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 - 运行任务日志 tail 接口应能处理 100MB 以上日志文件，不应一次性读入内存。
 
-- 节点监控失败不应阻塞 API 服务，单个节点异常不影响其他节点调度。
+- 节点监控失败不应阻塞 API 服务；单个节点的 SSH 长连接线程异常退出时只影响该节点，其他节点线程和 API 服务继续运行。
 
 - 调度循环异常应被捕获并写入系统日志，不能导致调度器线程悄悄退出。
 
@@ -1085,6 +1085,11 @@ scheduler:
   gpu_reuse_free_vram_ratio: 0.40
   gpu_reuse_max_tasks: 5
   log_refresh_seconds: 2
+
+monitor:
+  interval_seconds: 5
+  reconnect_attempts: 3
+  watchdog_timeout_seconds: 600
 
 ssh:
   auth_mode: key

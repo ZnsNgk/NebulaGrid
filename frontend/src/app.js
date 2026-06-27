@@ -88,6 +88,7 @@ const state = {
     adminOnlineUsers: [],
     adminUserSessions: [],
     nodeOwnerUsers: [],
+    runtimeConfig: { shared_folder_root: "/home/ddltm/shared" },
   },
 };
 
@@ -503,8 +504,12 @@ async function logout() {
 
 async function loadMe() {
   if (!state.token) return;
-  const payload = await api("/auth/me", { method: "POST" });
-  state.user = payload.data;
+  const [userPayload, configPayload] = await Promise.all([
+    api("/auth/me", { method: "POST" }),
+    api("/runtime-config"),
+  ]);
+  state.user = userPayload.data;
+  state.data.runtimeConfig = configPayload.data;
   if (isStudentFileView() && !canViewStudentFiles()) state.fileViewScope = "own";
   ensureVisiblePage();
 }
@@ -2771,12 +2776,13 @@ function renderTaskPredecessorOptions(selectedId = "") {
 }
 
 function taskHomeHint() {
+  if (state.user?.home_path) return state.user.home_path;
   if (state.user?.role === "admin") return "/home/ddltm";
   return `/home/ddltm/data/user/${state.user?.username || "user"}`;
 }
 
 function taskSharedHint() {
-  return "/home/ddltm/shared";
+  return state.data.runtimeConfig?.shared_folder_root || "/home/ddltm/shared";
 }
 
 function schedulableGpus(node) {

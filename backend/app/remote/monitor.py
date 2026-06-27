@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import psutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -182,21 +184,84 @@ def collect_gpu_process_counts() -> dict[str, int]:
     return counts
 
 
-def main() -> None:
-    """Print one JSON node-monitor snapshot for the master-side SSH collector."""
-    network_metrics: dict[str, Any] = collect_network_metrics()
-    gpus, gpu_probe_ok = collect_gpu_summary()
-    print(
-        json.dumps(
-            {
-                "cpu_usage": collect_cpu_usage(),
-                "avail_ram_mb": collect_available_ram_mb(),
-                **network_metrics,
-                "gpus": gpus,
-                "gpu_probe_ok": gpu_probe_ok,
-            }
-        )
+def parse_args() -> argparse.Namespace:
+    """解析远端监控参数；默认单次输出，长连接由 master 通过 --loop 显式启用。"""
+    parser = argparse.ArgumentParser(description="Collect NebulaGrid node monitor metrics")
+    parser.add_argument("--loop", action="store_true", help="keep printing one JSON snapshot per interval")
+    parser.add_argument(
+        "-l",
+        "--interval",
+        type=float,
+        default=5.0,
+        help="monitor output interval in seconds when --loop is enabled",
     )
+    return parser.parse_args()
+
+
+def normalize_interval_seconds(value: float) -> float:
+    """限制远端循环周期下限，避免配置错误导致监控脚本在计算节点上空转。"""
+    try:
+        interval = float(value)
+    except (TypeError, ValueError):
+        interval = 5.0
+    return max(1.0, interval)
+
+
+def collect_monitor_snapshot(network_interval_seconds: float = 1.0) -> dict[str, Any]:
+    """采集一帧节点监控快照；字段结构保持与 master 侧写入逻辑一致。"""
+    network_metrics: dict[str, Any] = collect_network_metrics(network_interval_seconds)
+    gpus, gpu_probe_ok = collect_gpu_summary()
+    return {
+        "cpu_usage": collect_cpu_usage(),
+        "avail_ram_mb": collect_available_ram_mb(),
+        **network_metrics,
+        "gpus": gpus,
+        "gpu_probe_ok": gpu_probe_ok,
+    }
+
+
+def print_snapshot(payload: dict[str, Any]) -> None:
+    """按 JSON Lines 输出监控结果，flush 确保 SSH 长连接实时传回 master。"""
+    print(json.dumps(payload), flush=True)
+
+
+def run_loop(interval_seconds: float) -> None:
+    """按固定节拍持续输出监控快照；采集耗时会从下一次等待时间中扣除。"""
+    next_tick = time.monotonic()
+    network_interval_seconds = min(1.0, max(0.1, interval_seconds / 2))
+    while True:
+        next_tick += interval_seconds
+        try:
+            print_snapshot(collect_monitor_snapshot(network_interval_seconds))
+        except Exception as exc:  # noqa: BLE001 - 单帧采集失败不应让 SSH 监控连接直接退出。
+            print_snapshot(
+                {
+                    "cpu_usage": 0,
+                    "avail_ram_mb": 0,
+                    "network_bandwidth_mbps": 0,
+                    "upload_mbps": 0,
+                    "download_mbps": 0,
+                    "gpus": [],
+                    "gpu_probe_ok": False,
+                    "monitor_error": str(exc),
+                }
+            )
+        sleep_seconds = next_tick - time.monotonic()
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+
+def main() -> None:
+    """远端监控入口；单次模式用于自检，循环模式用于 master 长连接线程。"""
+    args = parse_args()
+    interval_seconds = normalize_interval_seconds(args.interval)
+    if args.loop:
+        run_loop(interval_seconds)
+        return
+    try:
+        print_snapshot(collect_monitor_snapshot())
+    except BrokenPipeError:
+        sys.exit(0)
 
 
 if __name__ == "__main__":

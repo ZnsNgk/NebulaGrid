@@ -323,7 +323,8 @@ executor:
 
 monitor:
   interval_seconds: 5
-  watchdog_offline_seconds: 600
+  reconnect_attempts: 3
+  watchdog_timeout_seconds: 600
 
 file_operations:
   worker_threads: 2
