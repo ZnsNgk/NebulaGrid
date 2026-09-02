@@ -14,6 +14,9 @@ class EnvInfo(BaseModel):
     source_type: str
     state: str
     python_version: str | None = None
+    pytorch_version: str | None = None
+    pytorch_cuda_version: str | None = None
+    pytorch_arch_list: list[str] = Field(default_factory=list)
     size_bytes: int = 0
     created_at: str
 
@@ -27,6 +30,7 @@ class EnvFrameworkInfo(BaseModel):
     cudnn: str | int | None = None
     cuda_available: bool | None = None
     gpu_count: int | None = None
+    arch_list: list[str] = Field(default_factory=list)
     error: str | None = None
 
 

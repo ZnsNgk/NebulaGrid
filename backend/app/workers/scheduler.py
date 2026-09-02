@@ -7,10 +7,11 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import get_settings
 from app.core.time_utils import local_datetime
-from app.db.models import Gpu, Node, Setting, Task, TaskAllocation, TaskDependency, TaskRuntimeGuard, User
+from app.db.models import Env, Gpu, Node, Setting, Task, TaskAllocation, TaskDependency, TaskRuntimeGuard, User
 from app.db.session import SessionLocal
 from app.services.auth_service import user_model_to_record
 from app.services.metrics_service import LatestMetrics, get_latest_metrics
+from app.services.gpu_compatibility_service import pytorch_gpu_compatibility
 from app.services.node_service import (
     can_user_access_node,
     is_control_plane_node,
@@ -179,6 +180,8 @@ def select_gpu_allocation(
     required = max(1, task.requirement.need_gpus)
     allowed_models = {normalize_gpu_model(item) for item in task.requirement.gpu_types or []}
     allow_reuse = task.requirement.allow_gpu_reuse
+    # 显式型号代表用户强制意图，此时连环境兼容信息都不参与候选筛选。
+    env = db.get(Env, task.env_id) if not allowed_models and task.env_id is not None else None
     for node in nodes:
         usable: list[Gpu] = []
         for gpu in sorted(node.gpus, key=lambda item: item.gpu_index):
@@ -187,9 +190,13 @@ def select_gpu_allocation(
             if allowed_models and normalize_gpu_model(gpu.model) not in allowed_models:
                 continue
             if gpu_is_available(gpu, task, occupancy, metrics):
+                # 自动模式只排除明确“不支持”的卡；原生、同主版本和未知状态保持原有顺序。
+                if not allowed_models and pytorch_gpu_compatibility(env, node, gpu) == "unsupported":
+                    continue
                 usable.append(gpu)
-            if len(usable) >= required:
-                return node, usable[:required], "reuse" if allow_reuse else "exclusive"
+        if len(usable) < required:
+            continue
+        return node, usable[:required], "reuse" if allow_reuse else "exclusive"
     return None
 
 

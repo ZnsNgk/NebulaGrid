@@ -1347,7 +1347,7 @@ sudo smbclient //127.0.0.1/test1 -U test1
 
 普通训练任务已经以 PostgreSQL 为单一状态源，不再依赖 API 进程内存。任务提交、批量提交、修改、挂起、删除、后继任务确认、中止、重新提交、日志路径、执行时间、结束时间、实际节点和实际 GPU 分配都会写入 `tasks`、`task_requirements`、`task_dependencies`、`task_allocations`、`task_events` 和 `task_runtime_guards`。
 
-调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略选择资源。任务未指定节点时，候选节点按“用户自有节点 → 组内共享节点 → 组内他人公开共享的私有节点 → 其他公开节点”的顺序尝试；同一档内部按节点 ID 保持稳定顺序。只指定 GPU 型号时，系统只往所有可见候选节点中满足该型号的 GPU 上分配；只指定节点时，系统只在该节点内选择任意可调度 GPU；两者同时指定时，系统只在指定节点内选择指定型号的 GPU。每轮调度最多成功分配一个任务，并在下一轮开始时清理终态任务的未释放 allocation，避免同一张独占 GPU 在同一轮内被重复占用。调度器只持有单实例哨兵行锁，不再批量锁住等待任务行，因此用户修改等待任务和前端刷新任务列表不会被一次调度扫描长时间阻塞。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
+调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略选择资源。任务未指定节点时，候选节点按“用户自有节点 → 组内共享节点 → 组内他人公开共享的私有节点 → 其他公开节点”的顺序尝试；同一档内部按节点 ID 保持稳定顺序。只指定 GPU 型号时，系统只往所有可见候选节点中满足该型号的 GPU 上分配；只指定节点时，系统只在该节点内选择任意可调度 GPU；两者同时指定时，系统只在指定节点内选择指定型号的 GPU。用户未指定 GPU 型号时，调度器只排除兼容状态为“不支持”的 GPU，原生支持、同主版本兼容和信息未知的 GPU 均按原有节点顺序及 GPU index 正常参与，不按兼容等级重排；若候选中只剩不支持 GPU，任务保持等待。用户显式勾选型号视为强制选择，调度器完全忽略兼容状态并保持原有型号约束。每轮调度最多成功分配一个任务，并在下一轮开始时清理终态任务的未释放 allocation，避免同一张独占 GPU 在同一轮内被重复占用。调度器只持有单实例哨兵行锁，不再批量锁住等待任务行，因此用户修改等待任务和前端刷新任务列表不会被一次调度扫描长时间阻塞。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
 
 管理员后台的“强制下线”会立即把目标节点标记为 `offline` 并关闭调度。对于该节点上仍持有未释放 allocation 的运行任务，后端会按远端进程组执行 TERM/KILL、把任务置为 `cancelled`，并释放该节点所有未释放 GPU 调度占用；审计日志会记录受影响任务和释放数量。
 强制下线后的节点不会继续被节点监控 worker 自动 SSH 探测，也不会自动恢复为 `online`；维护完成后需要在节点管理里点击“重连”，新的长连接收到监控 JSON 后才会重新上线。
@@ -1365,6 +1365,12 @@ Runtime Guard 已经以 `task_runtime_guards` 为入口追踪运行任务。执�
 
 - 环境目录：`/home/ddltm/envs/miniconda3/envs/<env_name>`
 - 环境日志：`/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，并同步写入数据库 `env_operation_logs`
+
+环境探针还会把 `torch.__version__`、`torch.version.cuda` 和 `torch.cuda.get_arch_list()` 同步到 PostgreSQL `envs` 表。环境未安装 PyTorch 时不保留 PyTorch 版本/CUDA 数据，架构列表为空；用户通过平台安装、升级或删除 PyTorch 包成功后会自动重新探测。删除环境时这些字段与环境行一起删除。节点监控通过独立的 `nvidia-smi --query-gpu=index,compute_cap` 查询，把每张 GPU 的 Compute Capability 保存到 `gpus.compute_capability`；该查询失败不会清空 GPU 清单或上一次有效算力。
+
+从旧版本升级时，应用启动会自动补齐数据库列，但已经存在于 `envs` 表的环境不会在启动阶段批量导入 PyTorch。管理员应在升级验收时逐个点击一次“检测”完成回填；升级后首次自动发现的新环境、导入环境和环境副本会在检测阶段直接写入这些字段。
+
+管理员可在 `管理员后台 -> 节点管理 -> 修改` 中填写“GPU 算力覆盖列表”。列表按 `nvidia-smi` index 一行一个，格式为 `major.minor`，例如 `8.9`；空行表示该 index 继续使用自动探测值。任务添加/修改页面选择环境后，GPU 卡片只按 `sm_xx` 分类：精确命中为“原生支持”；普通 `sm_xx` 与 GPU 主版本相同且目标次版本不高于 GPU 时为“同主版本兼容”，例如 `sm_86` 可兼容 `sm_89`；均不满足时为“不支持”。前两类使用绿色外框，不支持使用红色外框。`compute_xx` 继续原样保存和展示，但不参与卡片或调度判断；带 `a`/`f` 等专用 SM 后缀的目标只在数值架构精确匹配时使用。所有卡片仍可正常勾选。
 
 从其他 Ubuntu 电脑导入已有 conda 环境时，推荐用户按下面流程操作：
 
@@ -1411,7 +1417,7 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 
 1. 登录管理员账号，进入环境管理页面，确认页面会自动刷新环境列表，且 `base` 环境不展示。
 2. 点击“刷新环境列表”，确认 `conda env list --json` 中的非 base 环境被同步到数据库。
-3. 对一个已有环境点击“检测”，确认返回 Python 版本、PyTorch、TensorFlow、CUDA/cuDNN 和包列表。
+3. 对一个已有环境点击“检测”，确认返回 Python 版本、PyTorch、TensorFlow、CUDA/cuDNN、`torch.cuda.get_arch_list()` 和包列表；随后执行 `SELECT id, name, pytorch_version, pytorch_cuda_version, pytorch_arch_list FROM envs ORDER BY id;`，确认已安装 PyTorch 的环境完成落库，未安装 PyTorch 的环境没有残留版本数据。
 4. 在另一台 Ubuntu x86_64/amd64 机器的 `~/miniconda3/envs` 或 `~/anaconda3/envs` 中，把测试环境打成 zip，再用普通用户账号 `scp` 到 `/home/ddltm/data/user/<user_name>/`。用户登录后应能在文件管理个人根目录看到该 zip。
 5. 用普通用户从自己的文件根目录选择打包好的环境 zip，点击导入并确认。页面应显示 `导入中 -> 修复中 -> 测试中 -> 可用`。
 6. 导入后的环境目录应位于 `/home/ddltm/envs/miniconda3/envs/<env_name>`，目录权限为 `755`，普通文件为 `644`，`bin` 或 `Scripts` 下入口文件为 `755`。
@@ -1419,8 +1425,10 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 8. 尝试导入一个明显不兼容的环境包，例如 Windows、macOS 或非 amd64 Linux 环境包，确认系统会拒绝导入或把状态标记为错误，不会显示为“可用”。
 9. 点击“创建副本”，输入新环境名，确认系统复制 `/home/ddltm/envs/miniconda3/envs/<old_env_name>` 到 `/home/ddltm/envs/miniconda3/envs/<new_env_name>`，并显示 `复制中 -> 修复中 -> 测试中 -> 可用`。
 10. 在副本里运行 `pip --version` 或 `python -m pip --version`，确认 `pip` shebang 不再指向旧路径。路径修复应覆盖所有文本文件里的旧环境前缀，而不只是 conda metadata。
-11. 普通用户只能删除自己导入或复制的环境；管理员可以删除所有环境。删除后数据库记录和 `miniconda3/envs/<env_name>` 目录应同时消失。
+11. 普通用户只能删除自己导入或复制的环境；管理员可以删除所有环境。删除后数据库记录（包括同一行的 PyTorch 兼容性字段）和 `miniconda3/envs/<env_name>` 目录应同时消失。
 12. 普通用户只能查看自己的环境日志；管理员可以查看所有环境日志。
+13. 在计算节点确认 `nvidia-smi --query-gpu=index,name,compute_cap --format=csv,noheader` 可返回算力；再执行 `SELECT node_id, gpu_index, model, compute_capability FROM gpus ORDER BY node_id, gpu_index;` 核对数据库。若驱动不支持 `compute_cap`，在节点管理中按 index 填写算力覆盖值。
+14. 打开添加任务页面，选择带 PyTorch 架构记录的环境，分别核对“原生支持”“同主版本兼容”“不支持”标签及绿/绿/红外框；至少验证 `sm_86` 对 `sm_89` 显示“同主版本兼容”，而仅有 `compute_86` 时 `sm_90` 仍显示“不支持”。确认三类卡片都可勾选；不勾选型号提交时，确认“不支持”GPU 被排除而其他状态仍按原有顺序调度，只有不支持卡可用时任务保持等待；显式勾选红色型号后，确认调度器仍可强制分配该型号。
 
 如果出现 `bad interpreter` 或 “错误的解释器”，优先检查环境日志中的修复阶段记录，并在环境目录中搜索旧路径：
 

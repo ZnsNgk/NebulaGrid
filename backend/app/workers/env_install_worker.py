@@ -10,7 +10,7 @@ from app.core.config import get_settings
 from app.core.time_utils import local_datetime
 from app.db.models import Env, EnvInstallJob, EnvPackage, Node
 from app.db.session import SessionLocal
-from app.services.env_service import env_model_to_info, run_env_install_command, tail_text, write_env_operation_log
+from app.services.env_service import env_model_to_info, refresh_env_pytorch_metadata, run_env_install_command, tail_text, write_env_operation_log
 from app.workers.common import run_forever
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,9 @@ def run_install_job(job_id: int) -> None:
         package = db.get(EnvPackage, job.package_id) if job is not None else None
         if job is not None:
             finish_job(db, job, package, status, return_code, message)
+    if status == "succeeded":
+        # 安装作业可能升级或移除 torch 依赖，完成后刷新 environments 中的兼容性元数据。
+        refresh_env_pytorch_metadata(env_info.id)
 
 
 def run_remote_install(job_id: int, command: str):

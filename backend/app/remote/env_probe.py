@@ -49,6 +49,12 @@ def probe_torch():
         cudnn_version = None
         if hasattr(torch.backends, "cudnn"):
             cudnn_version = torch.backends.cudnn.version()
+        arch_list = []
+        try:
+            # 该列表来自当前 PyTorch 二进制自身，比按版本号维护静态兼容表更准确。
+            arch_list = list(torch.cuda.get_arch_list())
+        except Exception:
+            arch_list = []
         return {
             "installed": True,
             "version": getattr(torch, "__version__", None),
@@ -56,6 +62,7 @@ def probe_torch():
             "cudnn": cudnn_version,
             "cuda_available": bool(torch.cuda.is_available()),
             "gpu_count": int(torch.cuda.device_count()),
+            "arch_list": arch_list,
         }
     except Exception as exc:
         return framework_missing(str(exc))

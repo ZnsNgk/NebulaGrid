@@ -401,6 +401,8 @@ erDiagram
 | sharing_scope | enum | 共享范围，`none` 不共享、`group` 组内共享、`public` 公开共享 |
 | is_public | bool | 兼容字段，由 `access_scope == public` 派生 |
 | max_speed_mbps | int nullable | 与主节点最大连接带宽，单位 Mbps |
+| gpu_schedulable_flags | jsonb/list | 按 GPU index 对齐的 0/1 调度开关 |
+| gpu_compute_capability_overrides | jsonb/list | 管理员按 GPU index 配置的算力覆盖；空字符串使用监控探测值 |
 | state | enum | online/offline/disabled/maintenance/reconnecting/manual_offline |
 | scheduling_enabled | bool | 是否允许调度 |
 | last_heartbeat_at | timestamp | 最近心跳时间 |
@@ -418,6 +420,7 @@ erDiagram
 | gpu_index | int | nvidia-smi 顺序编号 |
 | gpu_uuid | varchar | GPU UUID，强烈建议保存 |
 | model_name | varchar | RTX4090/A6000/H100 等 |
+| compute_capability | varchar nullable | 监控通过 `nvidia-smi --query-gpu=compute_cap` 探测的原始算力，如 `8.9` |
 | enabled | bool | 是否可被分配 |
 | used_by_scheduler | bool | 是否被非复用任务占用 |
 | running_task_count | int | 当前任务数 |
@@ -425,7 +428,7 @@ erDiagram
 | last_mem_total_mb | int | 总显存 |
 | last_utilization | float | GPU 使用率 |
 
-建议以 `gpu_uuid` 作为运行时守护检测的核心依据，`gpu_index` 只作为显示和 `CUDA_VISIBLE_DEVICES` 设置使用。
+建议以 `gpu_uuid` 作为运行时守护检测的核心依据，`gpu_index` 只作为显示、管理员覆盖列表对齐和 `CUDA_VISIBLE_DEVICES` 设置使用。兼容性判断读取“管理员覆盖值优先、自动探测值兜底”的有效算力；旧驱动不支持 `compute_cap` 查询时，基础 GPU 清单仍正常更新，管理员可在节点页面补录算力。
 
 #### 6.2.4 tasks
 
@@ -512,8 +515,14 @@ erDiagram
 | python_path | varchar | 目标 python 路径 |
 | source_type | enum | registered/conda_pack/imported |
 | state | enum | creating/importing/available/error/disabled |
+| python_version | varchar nullable | 环境 Python 版本 |
+| pytorch_version | varchar nullable | 已安装 PyTorch 版本；未安装时为 null |
+| pytorch_cuda_version | varchar nullable | `torch.version.cuda` 返回的编译 CUDA 版本；未安装时为 null |
+| pytorch_arch_list | jsonb/list | `torch.cuda.get_arch_list()` 原始架构列表，可能同时包含 `sm_xx` 和 `compute_xx`；未安装时为空列表 |
 | created_at | timestamp | 创建时间 |
 | updated_at | timestamp | 更新时间 |
+
+环境导入、创建副本、手动检测以及平台内安装/删除包成功后，都要重新运行环境探针并同步上述 PyTorch 字段。若环境中没有 PyTorch，三个 PyTorch 字段必须清空；环境删除时这些字段随 `environments` 同一行一起删除，不维护独立兼容性表，避免孤儿数据。
 
 #### 6.2.9 env_install_jobs
 
@@ -823,7 +832,7 @@ stateDiagram-v2
 
 1. 周期性扫描 `tasks.state = wait` 且 `is_onhold = false` 的任务；
 2. 按紧急程度、优先级、提交时间排序；
-3. 检查用户状态、前驱任务、可见节点、节点状态、GPU 型号约束、复用策略；
+3. 检查用户状态、前驱任务、可见节点、节点状态、GPU 型号约束、复用策略；未指定 GPU 型号时，额外排除 PyTorch 兼容状态为“不支持”的 GPU；
 4. 在数据库事务中锁定任务和候选 GPU；
 5. 写入 `task_allocations`；
 6. 更新任务状态为 `dispatching`；
@@ -849,6 +858,10 @@ COMMIT;
 如果任何一步失败，必须回滚，不允许出现“任务已进入运行区但 GPU 未占用”或“GPU 已占用但任务未启动”的状态。
 
 ### 9.4 调度算法草案
+
+系统仅按 `sm_xx` cubin 规则把信息完整的候选 GPU 分为三级：GPU 算力精确命中 `sm_xx` 为“原生支持”；未精确命中，但存在同一主版本且次版本不高于 GPU 的普通 `sm_xx` cubin 时为“同主版本兼容”；其余为“不支持”。`compute_xx` 仍按探针原始结果存入数据库，但完全不参与兼容判断，避免把理论 PTX JIT 能力误报为实际可用。带 `a`/`f` 等专用后缀的 SM 目标不参与向上兼容，只在数值架构精确匹配时使用。信息缺失时内部状态为“未知”，页面不伪造三级标签。
+
+任务表单以卡片显示 GPU 型号，“原生支持”和“同主版本兼容”使用绿色外框，“不支持”使用红色外框；同型号候选状态不一致时优先展示风险较高的等级，若存在信息未知且没有明确不支持项则不显示三级标签。用户仍可勾选三种卡片。显式选择 GPU 型号后，调度器保持原有型号强制语义，完全忽略兼容状态；用户未指定型号时，调度器只排除“不支持”的 GPU，原生支持、同主版本兼容和信息未知的 GPU 均按原有节点顺序与 GPU index 正常参与调度，不再按兼容等级重排。若候选中只剩不支持 GPU，任务保持等待。
 
 ```python
 def scheduler_loop():

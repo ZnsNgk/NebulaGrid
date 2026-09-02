@@ -375,6 +375,10 @@ def sync_gpu_inventory(db: Session, node: Node, gpus: Any, probe_ok: bool = True
         gpu.gpu_uuid = str(item.get("uuid") or gpu.gpu_uuid or "")
         gpu.model = str(item.get("name") or gpu.model or "Unknown")
         gpu.total_vram_mb = coerce_int(item.get("memory_total_mb"))
+        # 探测字段缺失通常来自旧驱动，此时保留上一次有效值，避免一次心跳把算力清空。
+        detected_capability = str(item.get("compute_capability") or "").strip()
+        if detected_capability:
+            gpu.compute_capability = detected_capability
         gpu.schedulable = gpu_index_schedulable(node, index)
         metric_rows.append((gpu, item))
     for index, gpu in list(existing.items()):

@@ -217,6 +217,8 @@ def test_env(user: UserRecord, env_id: int) -> EnvTestResult:
     except Exception as exc:
         write_env_operation_log(env, "test", "环境检测异常", user.id, {"error": str(exc)})
         raise
+    if result.ok:
+        persist_env_pytorch_metadata(env.id, result)
     write_env_operation_log(
         env,
         "test",
@@ -724,6 +726,9 @@ def delete_installed_packages(user: UserRecord, env_id: int, payload: EnvInstall
             {"packages": [item.name for item in preview.packages], "return_code": return_code, "stdout": tail_text(stdout), "stderr": tail_text(stderr)},
         )
         record_audit(user.id, "env.package.delete_installed", "env", str(env.id), result="success" if ok else "failed", detail_json={"packages": [item.name for item in preview.packages], "return_code": return_code})
+        if ok:
+            # 卸载 torch 后必须立即清空 environments 中的旧兼容性数据。
+            refresh_env_pytorch_metadata(env.id)
         return EnvInstalledPackageDeleteResult(
             ok=ok,
             env_id=env.id,
@@ -1052,6 +1057,10 @@ def sync_current_conda_envs(db, user: UserRecord, current_envs: list[tuple[str, 
         db.commit()
         for model in detected:
             db.refresh(model)
+        # 新发现环境只在首次落库时探测一次，避免每次刷新环境页面都重复导入 torch。
+        for model in detected:
+            refresh_env_pytorch_metadata(model.id)
+            db.refresh(model)
     return detected
 
 
@@ -1102,6 +1111,7 @@ def run_env_archive_import(env_id: int, actor_user_id: int, source_path: str, ta
             if model is not None:
                 model.state = "available"
                 model.python_version = result.python_version
+                apply_pytorch_metadata(model, result)
                 db.commit()
         write_env_operation_log_by_id(env_id, "import", "环境导入完成，状态已设为可用", actor_user_id)
         record_audit(actor_user_id, "env.archive.import.finish", "env", str(env_id), detail_json={"archive": virtual_source})
@@ -1158,6 +1168,7 @@ def run_env_clone(env_id: int, actor_user_id: int, source_env_path: str, target_
             if model is not None:
                 model.state = "available"
                 model.python_version = result.python_version
+                apply_pytorch_metadata(model, result)
                 db.commit()
         write_env_operation_log_by_id(env_id, "clone", "环境副本创建完成，状态已设为可用", actor_user_id)
         record_audit(actor_user_id, "env.clone.finish", "env", str(env_id), detail_json={"source": source_env_path, "source_name": source_env_name})
@@ -1510,6 +1521,9 @@ def env_model_to_info(env: Env, db=None) -> EnvInfo:
         source_type=env.source_type,
         state=state,
         python_version=env.python_version,
+        pytorch_version=getattr(env, "pytorch_version", None),
+        pytorch_cuda_version=getattr(env, "pytorch_cuda_version", None),
+        pytorch_arch_list=list(getattr(env, "pytorch_arch_list", None) or []),
         size_bytes=env.size_bytes,
         created_at=ensure_local_datetime(env.created_at).isoformat() if env.created_at else utc_now(),
     )
@@ -1593,6 +1607,52 @@ def empty_env_test_result(env: EnvInfo, error: str, python_executable: str | Non
         tensorflow=missing,
         error=error,
     )
+
+
+def apply_pytorch_metadata(env: Env, result: EnvTestResult) -> None:
+    """把探针结果同步到 environments；未安装 PyTorch 时显式清空所有相关字段。"""
+    pytorch = result.pytorch
+    if pytorch.installed:
+        env.pytorch_version = pytorch.version
+        env.pytorch_cuda_version = pytorch.cuda
+        env.pytorch_arch_list = normalize_pytorch_arch_list(pytorch.arch_list)
+        return
+    env.pytorch_version = None
+    env.pytorch_cuda_version = None
+    env.pytorch_arch_list = []
+
+
+def persist_env_pytorch_metadata(env_id: int, result: EnvTestResult) -> None:
+    """持久化一次成功环境检测，删除环境时这些同表字段会随环境记录一起删除。"""
+    with SessionLocal() as db:
+        env = db.get(Env, env_id)
+        if env is None:
+            return
+        env.python_version = result.python_version or env.python_version
+        apply_pytorch_metadata(env, result)
+        db.commit()
+
+
+def refresh_env_pytorch_metadata(env_id: int) -> EnvTestResult | None:
+    """环境包变更成功后重新探测 PyTorch；瞬时探测失败时保留上一次有效元数据。"""
+    try:
+        env = load_env_info_for_background(env_id)
+        result = inspect_env_runtime(env)
+    except Exception:
+        return None
+    if result.ok:
+        persist_env_pytorch_metadata(env_id, result)
+    return result
+
+
+def normalize_pytorch_arch_list(values: list[str] | None) -> list[str]:
+    """清理 torch.cuda.get_arch_list() 输出，避免重复或异常值污染调度偏好。"""
+    result: list[str] = []
+    for value in values or []:
+        item = str(value or "").strip().lower()
+        if item and item not in result:
+            result.append(item)
+    return result
 
 
 def mark_env_permissions(user: UserRecord, env: EnvInfo) -> EnvInfo:

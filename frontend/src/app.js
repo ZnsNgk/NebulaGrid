@@ -446,6 +446,15 @@ function parseGpuSchedulableFlags(value) {
   });
 }
 
+function parseGpuComputeCapabilityOverrides(value) {
+  const items = String(value || "").replace(/，/g, ",").replace(/\r/g, "").split(/[\n,]/).map((item) => item.trim());
+  while (items.length && !items[items.length - 1]) items.pop();
+  items.forEach((item) => {
+    if (item && !/^\d+\.\d+$/.test(item)) throw new Error("GPU 算力必须填写为 major.minor，例如 8.9；空行表示自动探测");
+  });
+  return items;
+}
+
 function checkedValues(containerId, root = document) {
   const container = root.querySelector?.(`#${containerId}`);
   if (!container) return [];
@@ -950,6 +959,7 @@ async function submitNode(event) {
     ssh_user: formValue(form, "ssh_user") || "ddltm",
     max_speed_mbps: formValue(form, "max_speed_mbps") ? Number(formValue(form, "max_speed_mbps")) : null,
     gpu_schedulable_flags: parseGpuSchedulableFlags(formValue(form, "gpu_schedulable_flags")),
+    gpu_compute_capability_overrides: parseGpuComputeCapabilityOverrides(formValue(form, "gpu_compute_capability_overrides")),
     owner_user_ids: uniqueNumbers([...checkedOwnerIds, ...manualOwnerIds]),
     access_scope: formValue(form, "access_scope") || "public",
     sharing_scope: formValue(form, "sharing_scope") || "public",
@@ -2044,7 +2054,11 @@ function updateTaskGpuTypeOptions() {
   const form = document.querySelector("#taskForm");
   const container = document.querySelector("#taskGpuTypeOptions");
   if (!form || !container) return;
-  container.innerHTML = renderTaskGpuTypeOptions(formValue(form, "node_id"), checkedValues("taskGpuTypeOptions", form));
+  container.innerHTML = renderTaskGpuTypeOptions(
+    formValue(form, "node_id"),
+    checkedValues("taskGpuTypeOptions", form),
+    formValue(form, "env_id"),
+  );
 }
 
 function switchAdminMenu(menu) {
@@ -2686,13 +2700,13 @@ function renderTaskForm(mode, task = null) {
   const isEdit = mode === "edit";
   const envOptions = renderTaskEnvOptions(draft.env_id);
   const nodeOptions = renderTaskNodeOptions(draft.node_id);
-  const gpuOptions = renderTaskGpuTypeOptions(draft.node_id || "", draft.gpu_types || []);
+  const gpuOptions = renderTaskGpuTypeOptions(draft.node_id || "", draft.gpu_types || [], draft.env_id || "");
   const predecessorOptions = renderTaskPredecessorOptions(draft.predecessor_task_id || "");
   const workdir = draft.workdir || "/";
   return `
     <form method="post" id="taskForm" class="task-edit-form" data-task-form-mode="${escapeAttr(mode)}">
       ${isEdit ? `<input type="hidden" name="task_id" value="${escapeAttr(draft.task_id)}">` : ""}
-      <label>选择环境<select name="env_id"><option value="">不指定</option>${envOptions}</select></label>
+      <label>选择环境<select name="env_id" data-task-env-select><option value="">不指定</option>${envOptions}</select></label>
       <label>项目路径
         <input type="hidden" name="workdir" value="${escapeAttr(workdir)}">
         <span class="path-pick">
@@ -2738,31 +2752,44 @@ function renderTaskNodeOptions(selectedId = "") {
     .join("");
 }
 
-function renderTaskGpuTypeOptions(nodeId = "", selectedTypes = []) {
+function renderTaskGpuTypeOptions(nodeId = "", selectedTypes = [], envId = "") {
   const selected = new Set((selectedTypes || []).map(String));
   const nodes = nodeId ? (state.data.nodes || []).filter((node) => String(node.id) === String(nodeId)) : (state.data.nodes || []);
+  const env = (state.data.envs || []).find((item) => String(item.id) === String(envId)) || null;
   const models = new Map();
   nodes.forEach((node) => {
     (node.gpus || [])
       .filter((gpu) => gpu.schedulable)
       .forEach((gpu) => {
         const model = gpu.model || "Unknown";
-        const item = models.get(model) || { total: 0, free: 0 };
+        const item = models.get(model) || { total: 0, free: 0, compatibilities: [] };
         item.total += 1;
         if (!gpu.scheduled_occupied) item.free += 1;
+        item.compatibilities.push(pytorchGpuCompatibility(env, gpu));
         models.set(model, item);
       });
   });
   return models.size
     ? Array.from(models.entries())
       .sort(([left], [right]) => left.localeCompare(right))
-      .map(([model, count]) => `
-        <label class="checkline">
-          <input type="checkbox" value="${escapeAttr(model)}" ${selected.has(String(model)) ? "checked" : ""}>
-          ${escapeHtml(model)}
-          <small class="muted">${escapeHtml(count.free)} / ${escapeHtml(count.total)} 可用</small>
-        </label>
-      `).join("")
+      .map(([model, count]) => {
+        // 同型号物理卡继续汇总；如果状态不一致则展示较保守的等级，避免把潜在风险标成原生支持。
+        const compatibility = summarizeGpuCompatibilities(count.compatibilities);
+        const compatibilityMeta = gpuCompatibilityMeta(compatibility);
+        const compatibilityBadge = compatibilityMeta
+          ? `<span class="task-gpu-card__status ${compatibilityMeta.className}">${compatibilityMeta.label}</span>`
+          : "";
+        return `
+          <label class="task-gpu-card${compatibilityMeta ? ` ${compatibilityMeta.cardClass}` : ""}">
+            <input type="checkbox" value="${escapeAttr(model)}" ${selected.has(String(model)) ? "checked" : ""}>
+            <span class="task-gpu-card__body">
+              <strong class="task-gpu-card__title">${escapeHtml(model)}</strong>
+              <span class="task-gpu-card__availability">${escapeHtml(count.free)} / ${escapeHtml(count.total)} 可用</span>
+              ${compatibilityBadge}
+            </span>
+          </label>
+        `;
+      }).join("")
     : `<span class="muted">暂无可选 GPU 型号</span>`;
 }
 
@@ -2779,6 +2806,53 @@ function taskHomeHint() {
   if (state.user?.home_path) return state.user.home_path;
   if (state.user?.role === "admin") return "/home/ddltm";
   return `/home/ddltm/data/user/${state.user?.username || "user"}`;
+}
+
+function pytorchGpuCompatibility(env, gpu) {
+  const capability = parseGpuComputeCapability(gpu?.compute_capability);
+  if (!env?.pytorch_version || !capability) return "unknown";
+  const targets = (env.pytorch_arch_list || [])
+    .map(parseTorchSmTarget)
+    .filter(Boolean);
+  if (targets.some((target) => target.major === capability.major && target.minor === capability.minor)) {
+    return "native_supported";
+  }
+  // 普通 cubin 只在同一主版本内向更高次版本兼容；a/f 等专用后缀不能套用该规则。
+  if (targets.some((target) => !target.suffix && target.major === capability.major && target.minor <= capability.minor)) {
+    return "same_major_compatible";
+  }
+  // compute_xx/PTX 即使存在也不参与产品兼容判断，避免把理论可 JIT 误报为可用。
+  return "unsupported";
+}
+
+function parseTorchSmTarget(value) {
+  const match = String(value || "").trim().toLowerCase().match(/^sm_(\d+)([a-z]*)$/);
+  if (!match) return null;
+  const architecture = Number(match[1]);
+  return {
+    major: Math.floor(architecture / 10),
+    minor: architecture % 10,
+    suffix: match[2],
+  };
+}
+
+function parseGpuComputeCapability(value) {
+  const match = String(value || "").trim().match(/^(\d+)\.(\d+)$/);
+  return match ? { major: Number(match[1]), minor: Number(match[2]) } : null;
+}
+
+function summarizeGpuCompatibilities(statuses = []) {
+  if (!statuses.length) return "unknown";
+  return ["unsupported", "unknown", "same_major_compatible", "native_supported"]
+    .find((status) => statuses.includes(status)) || "unknown";
+}
+
+function gpuCompatibilityMeta(status) {
+  return {
+    native_supported: { label: "原生支持", className: "is-native", cardClass: "compat-native" },
+    same_major_compatible: { label: "同主版本兼容", className: "is-compatible", cardClass: "compat-same-major" },
+    unsupported: { label: "不支持", className: "is-unsupported", cardClass: "compat-unsupported" },
+  }[status] || null;
 }
 
 function taskSharedHint() {
@@ -2998,11 +3072,21 @@ function renderEnvs() {
         escapeHtml(envSourceText(env.source_type)),
         `<span class="status ${env.state}">${envStateText(env.state)}</span>`,
         `<code>${escapeHtml(env.path)}</code>`,
-        escapeHtml(env.python_version || "-"),
+        renderEnvVersion(env),
         renderEnvActions(env),
       ])) : renderEmpty("暂无环境")}
     </section>
   `);
+}
+
+function renderEnvVersion(env) {
+  const torchLine = env.pytorch_version
+    ? `<br><span class="muted">PyTorch ${escapeHtml(env.pytorch_version)} · CUDA ${escapeHtml(env.pytorch_cuda_version || "-")}</span>`
+    : "";
+  const archLine = (env.pytorch_arch_list || []).length
+    ? `<br><span class="muted">${escapeHtml(env.pytorch_arch_list.join(", "))}</span>`
+    : "";
+  return `${escapeHtml(env.python_version || "-")}${torchLine}${archLine}`;
 }
 
 function renderEnvActions(env) {
@@ -3451,6 +3535,7 @@ function renderFrameworkCard(name, info = {}) {
         <dt>CUDA</dt><dd>${escapeHtml(info?.cuda || "-")}</dd>
         <dt>cuDNN</dt><dd>${escapeHtml(info?.cudnn ?? "-")}</dd>
         <dt>GPU</dt><dd>${info?.cuda_available === null || info?.cuda_available === undefined ? "-" : (info.cuda_available ? `可用，${escapeHtml(info.gpu_count ?? 0)} 张` : "不可用")}</dd>
+        ${(info?.arch_list || []).length ? `<dt>GPU 架构</dt><dd>${escapeHtml(info.arch_list.join(", "))}</dd>` : ""}
       </dl>
       ${info?.error ? `<p class="framework-error">${escapeHtml(info.error)}</p>` : ""}
     </article>
@@ -3653,6 +3738,7 @@ function renderAdminNodes(nodes) {
   const formTitle = editingNode ? "修改节点" : "新增节点";
   const selectedOwners = editingNode?.owner_user_ids || [];
   const gpuFlags = nodeGpuSchedulableFlagsText(editingNode);
+  const gpuComputeCapabilityOverrides = nodeGpuComputeCapabilityOverridesText(editingNode);
   return `
     <section class="node-management-grid">
       <article class="panel admin-card node-list-card">
@@ -3669,7 +3755,7 @@ function renderAdminNodes(nodes) {
         ])) : renderEmpty("暂无节点")}
       </article>
       <article class="panel admin-card node-form-card">
-        <div class="panel-head"><div><h2>${formTitle}</h2><span>GPU 数量和型号由节点监控自动扫描，管理员只维护按 nvidia-smi 顺序排列的可调度开关。</span></div></div>
+        <div class="panel-head"><div><h2>${formTitle}</h2><span>GPU 数量、型号和算力由节点监控自动扫描；管理员可维护调度开关并按 index 覆盖算力。</span></div></div>
         <form method="post" id="nodeForm" class="form-grid compact-form">
           <label>节点名称<input name="name" value="${escapeAttr(editingNode?.name || "")}" placeholder="node-a" required></label>
           <label>IP 地址<input name="ip" value="${escapeAttr(editingNode?.ip || "")}" placeholder="192.168.1.21" required></label>
@@ -3678,6 +3764,7 @@ function renderAdminNodes(nodes) {
           <label>使用权<select name="access_scope">${renderSelectOptions([["public", "公开"], ["private", "私有"]], editingNode?.access_scope || "public")}</select></label>
           <label>共享<select name="sharing_scope">${renderSelectOptions([["none", "不共享"], ["group", "组内共享"], ["public", "公开共享"]], editingNode?.sharing_scope || "public")}</select></label>
           <label class="full-row">GPU 可用性列表<textarea name="gpu_schedulable_flags" placeholder="按 nvidia-smi 顺序填写，一行一个：1 可调度，0 不调度&#10;1&#10;1&#10;0">${escapeHtml(gpuFlags)}</textarea></label>
+          <label class="full-row">GPU 算力覆盖列表<textarea name="gpu_compute_capability_overrides" placeholder="按 nvidia-smi index 一行一个；留空使用自动探测值&#10;8.9&#10;&#10;7.5">${escapeHtml(gpuComputeCapabilityOverrides)}</textarea><span class="muted">格式为 major.minor，例如 RTX 4090 常见为 8.9。中间空行会保留对应 GPU index。</span></label>
           ${editingNode ? `<div class="full-row">${renderNodeGpuInventory(editingNode)}</div>` : ""}
           <div class="full-row">${renderNodeOwnerSelector(selectedOwners)}</div>
           <div class="form-actions full-row">
@@ -3765,6 +3852,14 @@ function nodeGpuSchedulableFlagsText(node) {
   return Array.from({ length }, (_, index) => Number(flags[index] || 0) ? "1" : "0").join("\n");
 }
 
+function nodeGpuComputeCapabilityOverridesText(node) {
+  if (!node) return "";
+  const overrides = node.gpu_compute_capability_overrides || [];
+  const gpuCount = (node.gpus || []).length;
+  const length = Math.max(overrides.length, gpuCount);
+  return Array.from({ length }, (_, index) => String(overrides[index] || "")).join("\n");
+}
+
 function renderNodeGpuInventory(node) {
   const gpus = node.gpus || [];
   return `
@@ -3774,6 +3869,7 @@ function renderNodeGpuInventory(node) {
         <div>
           <code>GPU ${escapeHtml(gpu.gpu_index)}</code>
           <span>${escapeHtml(gpu.model || "Unknown")}</span>
+          <small>算力 ${escapeHtml(gpu.compute_capability || "未探测")}${gpu.compute_capability && gpu.detected_compute_capability && gpu.compute_capability !== gpu.detected_compute_capability ? `（探测 ${escapeHtml(gpu.detected_compute_capability)}）` : ""}</small>
           <strong>${gpu.schedulable ? "可调度" : "不调度"}</strong>
         </div>
       `).join("") : `<small class="muted">等待节点监控扫描</small>`}
@@ -4677,6 +4773,7 @@ function bindEvents() {
     openTaskWorkdirPicker().catch((error) => showToast(error.message || "打开文件夹选择器失败", "error"));
   });
   document.querySelector("[data-task-node-select]")?.addEventListener("change", updateTaskGpuTypeOptions);
+  document.querySelector("[data-task-env-select]")?.addEventListener("change", updateTaskGpuTypeOptions);
   document.querySelectorAll("[data-admin-menu]").forEach((button) => button.addEventListener("click", () => switchAdminMenu(button.dataset.adminMenu)));
   document.querySelectorAll("[data-audit-category]").forEach((button) => button.addEventListener("click", () => switchAuditCategory(button.dataset.auditCategory)));
   document.querySelectorAll("[data-audit-page]").forEach((button) => button.addEventListener("click", () => switchAuditPage(button.dataset.auditPage)));

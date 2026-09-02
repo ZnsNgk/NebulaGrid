@@ -81,6 +81,7 @@ class Node(Base, TimestampMixin):
     is_public: Mapped[bool] = mapped_column(Boolean, default=True)
     max_speed_mbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gpu_schedulable_flags: Mapped[list[int]] = mapped_column(JSON, default=list)
+    gpu_compute_capability_overrides: Mapped[list[str]] = mapped_column(JSON, default=list)
     state: Mapped[str] = mapped_column(String(32), default="offline", index=True)
     scheduling_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     gpus: Mapped[list["Gpu"]] = relationship(back_populates="node", cascade="all, delete-orphan")
@@ -98,6 +99,7 @@ class Gpu(Base):
     gpu_uuid: Mapped[str] = mapped_column(String(128), default="", index=True)
     model: Mapped[str] = mapped_column(String(128), index=True)
     total_vram_mb: Mapped[int] = mapped_column(Integer, default=0)
+    compute_capability: Mapped[str | None] = mapped_column(String(16), nullable=True)
     schedulable: Mapped[bool] = mapped_column(Boolean, default=True)
     remark: Mapped[str | None] = mapped_column(String(512), nullable=True)
     node: Mapped[Node] = relationship(back_populates="gpus")
@@ -116,6 +118,9 @@ class Env(Base, TimestampMixin):
     source_type: Mapped[str] = mapped_column(String(32), default="registered")
     state: Mapped[str] = mapped_column(String(32), default="available", index=True)
     python_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pytorch_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pytorch_cuda_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    pytorch_arch_list: Mapped[list[str]] = mapped_column(JSON, default=list)
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
 
 

@@ -13,8 +13,9 @@ from app.core.config import get_settings
 from app.core.time_utils import local_datetime
 from app.services.dashboard_service import count_available_gpus
 from app.services.auth_service import hash_session_token
-from app.services.metrics_service import parse_flux_csv
-from app.db.models import LoginSession, Node, Setting, Task, TaskAllocation, TaskRuntimeGuard
+from app.services.gpu_compatibility_service import pytorch_gpu_compatibility
+from app.services.metrics_service import LatestMetrics, parse_flux_csv
+from app.db.models import Env, Gpu, LoginSession, Node, Setting, Task, TaskAllocation, TaskRuntimeGuard, User
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.workers.node_monitor import (
@@ -31,7 +32,7 @@ from app.workers.node_monitor import (
     sync_gpu_inventory,
 )
 from app.workers.runtime_guard import expand_pid_tree, parse_gpu_apps, parse_process_table
-from app.workers.scheduler import scheduler_interval_seconds, scheduler_tick
+from app.workers.scheduler import scheduler_interval_seconds, scheduler_tick, select_gpu_allocation
 
 
 def make_client() -> TestClient:
@@ -240,6 +241,7 @@ def test_monitor_applies_admin_gpu_schedulable_flags() -> None:
         "name": f"node-flags-{uuid4().hex[:8]}",
         "ip": "10.0.0.31",
         "gpu_schedulable_flags": [1, 0],
+        "gpu_compute_capability_overrides": ["9.0", ""],
     }
     node_id = client.post("/api/admin/nodes", headers=headers, json=node_payload).json()["data"]["id"]
 
@@ -250,8 +252,8 @@ def test_monitor_applies_admin_gpu_schedulable_flags() -> None:
             db,
             node,
             [
-                {"index": 0, "uuid": "GPU-visible", "name": "RTX 4090", "memory_total_mb": 24576},
-                {"index": 1, "uuid": "GPU-display", "name": "NVIDIA T400", "memory_total_mb": 4096},
+                {"index": 0, "uuid": "GPU-visible", "name": "RTX 4090", "memory_total_mb": 24576, "compute_capability": "8.9"},
+                {"index": 1, "uuid": "GPU-display", "name": "NVIDIA T400", "memory_total_mb": 4096, "compute_capability": "7.5"},
             ],
         )
         db.commit()
@@ -260,6 +262,100 @@ def test_monitor_applies_admin_gpu_schedulable_flags() -> None:
     node = next(item for item in nodes if item["id"] == node_id)
     assert [gpu["model"] for gpu in node["gpus"]] == ["RTX 4090", "NVIDIA T400"]
     assert [gpu["schedulable"] for gpu in node["gpus"]] == [True, False]
+    assert [gpu["compute_capability"] for gpu in node["gpus"]] == ["9.0", "7.5"]
+    assert [gpu["detected_compute_capability"] for gpu in node["gpus"]] == ["8.9", "7.5"]
+
+
+def test_pytorch_gpu_compatibility_uses_effective_compute_capability() -> None:
+    """验证原生/同主版本状态、compute 忽略策略和管理员算力覆盖值。"""
+    env = SimpleNamespace(pytorch_version="2.1.0", pytorch_arch_list=["sm_50", "sm_75", "sm_86", "compute_86"])
+    gpu = SimpleNamespace(gpu_index=0, compute_capability="8.9")
+    node = SimpleNamespace(gpu_compute_capability_overrides=["8.6"])
+
+    assert pytorch_gpu_compatibility(env, node, gpu) == "native_supported"
+    node.gpu_compute_capability_overrides = []
+    assert pytorch_gpu_compatibility(env, node, gpu) == "same_major_compatible"
+    gpu.compute_capability = "9.0"
+    # compute_86 不参与判断，跨主版本的 9.0 仍属于不支持。
+    assert pytorch_gpu_compatibility(env, node, gpu) == "unsupported"
+    gpu.compute_capability = "3.7"
+    assert pytorch_gpu_compatibility(env, node, gpu) == "unsupported"
+    env.pytorch_arch_list.append("compute_37")
+    assert pytorch_gpu_compatibility(env, node, gpu) == "unsupported"
+    # 带后缀的专用 cubin 只允许数值架构精确命中，不能向同主版本更高次版本扩展。
+    env.pytorch_arch_list = ["sm_90a"]
+    gpu.compute_capability = "9.0"
+    assert pytorch_gpu_compatibility(env, node, gpu) == "native_supported"
+    gpu.compute_capability = "9.1"
+    assert pytorch_gpu_compatibility(env, node, gpu) == "unsupported"
+    env.pytorch_version = None
+    assert pytorch_gpu_compatibility(env, node, gpu) == "unknown"
+
+
+def test_scheduler_filters_unsupported_gpu_unless_model_is_forced() -> None:
+    """验证自动模式仅过滤不支持卡，其他状态保持原顺序，显式型号则完全绕过过滤。"""
+    suffix = uuid4().hex[:8]
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        assert admin is not None
+        env = Env(
+            owner_user_id=admin.id,
+            name=f"compat-{suffix}",
+            path=f"/tmp/compat-{suffix}",
+            state="available",
+            pytorch_version="2.1.0",
+            pytorch_cuda_version="11.8",
+            pytorch_arch_list=["sm_86", "compute_86"],
+        )
+        unsupported_node = Node(
+            name=f"compat-unsupported-{suffix}",
+            ip="10.20.0.1",
+            ssh_user="ddltm",
+            state="online",
+            scheduling_enabled=True,
+            gpu_schedulable_flags=[1],
+            gpus=[Gpu(gpu_index=0, gpu_uuid=f"GPU-unsupported-{suffix}", model="Unsupported GPU", total_vram_mb=24576, compute_capability="3.5", schedulable=True)],
+        )
+        same_major_node = Node(
+            name=f"compat-same-major-{suffix}",
+            ip="10.20.0.2",
+            ssh_user="ddltm",
+            state="online",
+            scheduling_enabled=True,
+            gpu_schedulable_flags=[1],
+            gpus=[Gpu(gpu_index=0, gpu_uuid=f"GPU-same-major-{suffix}", model="Compatible GPU", total_vram_mb=24576, compute_capability="8.9", schedulable=True)],
+        )
+        native_node = Node(
+            name=f"compat-native-{suffix}",
+            ip="10.20.0.3",
+            ssh_user="ddltm",
+            state="online",
+            scheduling_enabled=True,
+            gpu_schedulable_flags=[1],
+            gpus=[Gpu(gpu_index=0, gpu_uuid=f"GPU-native-{suffix}", model="Native GPU", total_vram_mb=24576, compute_capability="8.6", schedulable=True)],
+        )
+        db.add_all([env, unsupported_node, same_major_node, native_node])
+        db.commit()
+
+        requirement = SimpleNamespace(need_gpus=1, gpu_types=[], allow_gpu_reuse=False, max_reuse_count=1)
+        task = SimpleNamespace(env_id=env.id, requirement=requirement)
+        assert select_gpu_allocation(db, [unsupported_node], task, LatestMetrics()) is None
+        selected = select_gpu_allocation(db, [unsupported_node, same_major_node, native_node], task, LatestMetrics())
+        assert selected is not None
+        # 不支持节点被跳过后，同主版本节点沿用原有顺序被选中，不再为了原生支持重排到第三个节点。
+        assert selected[0].id == same_major_node.id
+
+        requirement.gpu_types = ["Unsupported GPU"]
+        forced = select_gpu_allocation(db, [unsupported_node, same_major_node, native_node], task, LatestMetrics())
+        assert forced is not None
+        assert forced[0].id == unsupported_node.id
+
+        # 本测试创建的在线节点会影响后续调度用例，断言完成后立即清理隔离数据。
+        db.delete(unsupported_node)
+        db.delete(same_major_node)
+        db.delete(native_node)
+        db.delete(env)
+        db.commit()
 
 
 def test_monitor_skips_admin_offline_node_until_reconnect(monkeypatch) -> None:

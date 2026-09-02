@@ -43,7 +43,7 @@ def list_nodes(user: UserRecord, db: Session, visible_only: bool = True) -> list
 
 
 def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> NodeInfo:
-    """登记计算节点；GPU 数量和型号由 monitor 扫描入库，管理员只保存可调度开关。"""
+    """登记计算节点；GPU 清单由 monitor 扫描，管理员维护调度开关和可选算力覆盖。"""
     require_permission(user.role, "nodes:write")
     if is_control_plane_identity(payload.name, payload.ip):
         raise validation_error("master/control-plane node should not be registered as compute node")
@@ -60,6 +60,7 @@ def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> No
         is_public=payload.access_scope == "public",
         max_speed_mbps=payload.max_speed_mbps,
         gpu_schedulable_flags=payload.gpu_schedulable_flags,
+        gpu_compute_capability_overrides=payload.gpu_compute_capability_overrides,
         state="offline",
         scheduling_enabled=False,
     )
@@ -76,7 +77,7 @@ def create_node(user: UserRecord, payload: NodeCreateRequest, db: Session) -> No
 
 
 def update_node(user: UserRecord, node_id: int, payload: NodeUpdateRequest, db: Session) -> NodeInfo:
-    """修改节点基础信息和 GPU 可调度开关，实际 GPU 清单继续由 monitor 维护。"""
+    """修改节点基础信息、GPU 可调度开关和算力覆盖，实际 GPU 清单继续由 monitor 维护。"""
     require_permission(user.role, "nodes:write")
     node = require_node_model(node_id, db)
     if is_control_plane_identity(payload.name, payload.ip):
@@ -93,6 +94,7 @@ def update_node(user: UserRecord, node_id: int, payload: NodeUpdateRequest, db: 
     node.is_public = payload.access_scope == "public"
     node.max_speed_mbps = payload.max_speed_mbps
     node.gpu_schedulable_flags = payload.gpu_schedulable_flags
+    node.gpu_compute_capability_overrides = payload.gpu_compute_capability_overrides
     apply_node_gpu_schedulable_flags(node)
     try:
         db.commit()
@@ -299,6 +301,7 @@ def build_node_info(
         is_public=node.is_public,
         max_speed_mbps=node.max_speed_mbps,
         gpu_schedulable_flags=list(getattr(node, "gpu_schedulable_flags", None) or []),
+        gpu_compute_capability_overrides=list(getattr(node, "gpu_compute_capability_overrides", None) or []),
         state=node.state,
         scheduling_enabled=node.scheduling_enabled,
         gpus=[
@@ -325,6 +328,17 @@ def gpu_index_schedulable(node: Node, gpu_index: int) -> bool:
     """按 nvidia-smi index 判断 GPU 是否允许调度，缺失配置时不把任务放到未知卡上。"""
     flags = list(getattr(node, "gpu_schedulable_flags", None) or [])
     return 0 <= gpu_index < len(flags) and bool(flags[gpu_index])
+
+
+def effective_gpu_compute_capability(node: Node, gpu: Gpu) -> str | None:
+    """优先返回管理员按 index 配置的覆盖值，未覆盖时使用 monitor 的自动探测值。"""
+    overrides = list(getattr(node, "gpu_compute_capability_overrides", None) or [])
+    if 0 <= gpu.gpu_index < len(overrides):
+        override = str(overrides[gpu.gpu_index] or "").strip()
+        if override:
+            return override
+    detected = str(getattr(gpu, "compute_capability", None) or "").strip()
+    return detected or None
 
 
 def validate_owner_ids(owner_ids: list[int], db: Session) -> list[int]:
@@ -400,6 +414,8 @@ def build_gpu_info(gpu: Gpu, latest_metrics: LatestMetrics, occupied_gpu_ids: se
         gpu_uuid=getattr(gpu, "gpu_uuid", "") or "",
         model=gpu.model,
         total_vram_mb=gpu.total_vram_mb,
+        compute_capability=effective_gpu_compute_capability(gpu.node, gpu),
+        detected_compute_capability=getattr(gpu, "compute_capability", None),
         schedulable=gpu.schedulable,
         scheduled_occupied=gpu.id in occupied_gpu_ids,
         remark=gpu.remark,

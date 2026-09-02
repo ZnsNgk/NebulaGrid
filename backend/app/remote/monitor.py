@@ -138,6 +138,7 @@ def collect_gpu_summary() -> tuple[list[dict[str, int | str]], bool]:
     if shutil.which("nvidia-smi") is None:
         return [], False
     process_counts = collect_gpu_process_counts()
+    compute_capabilities = collect_gpu_compute_capabilities()
     command = [
         "nvidia-smi",
         "--query-gpu=index,uuid,name,memory.total,memory.free,utilization.gpu",
@@ -159,9 +160,32 @@ def collect_gpu_summary() -> tuple[list[dict[str, int | str]], bool]:
                 "memory_free_mb": int(free),
                 "gpu_usage": int(util),
                 "process_count": process_counts.get(uuid, 0),
+                "compute_capability": compute_capabilities.get(int(index), ""),
             }
         )
     return rows, True
+
+
+def collect_gpu_compute_capabilities() -> dict[int, str]:
+    """单独探测 Compute Capability；旧驱动不支持该查询时不影响基础 GPU 清单。"""
+    command = [
+        "nvidia-smi",
+        "--query-gpu=index,compute_cap",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        output = subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    result: dict[int, str] = {}
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",", maxsplit=1)]
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        capability = parts[1]
+        if capability and capability != "[Not Supported]":
+            result[int(parts[0])] = capability
+    return result
 
 
 def collect_gpu_process_counts() -> dict[str, int]:

@@ -98,6 +98,8 @@ def migrate_existing_schema() -> None:
                     "access_scope": "VARCHAR(32) DEFAULT 'public'",
                     "sharing_scope": "VARCHAR(32) DEFAULT 'public'",
                     "gpu_schedulable_flags": "JSON DEFAULT '[]'::json",
+                    # 算力覆盖列表按 nvidia-smi index 对齐；空字符串表示继续使用监控探测值。
+                    "gpu_compute_capability_overrides": "JSON DEFAULT '[]'::json",
                 },
             )
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_nodes_access_scope ON nodes (access_scope)"))
@@ -109,9 +111,22 @@ def migrate_existing_schema() -> None:
                 {
                     # Runtime Guard 以 GPU UUID 作为长期稳定标识，避免节点重启后 index 漂移造成误判。
                     "gpu_uuid": "VARCHAR(128) DEFAULT ''",
+                    # 监控保存 GPU 原始 Compute Capability，管理员覆盖值保留在 nodes 表中。
+                    "compute_capability": "VARCHAR(16)",
                 },
             )
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_gpus_gpu_uuid ON gpus (gpu_uuid)"))
+        if "envs" in tables:
+            ensure_columns(
+                connection,
+                "envs",
+                {
+                    # 只在环境确实安装 PyTorch 时保存版本、编译 CUDA 和 torch 支持的 SM 架构。
+                    "pytorch_version": "VARCHAR(64)",
+                    "pytorch_cuda_version": "VARCHAR(32)",
+                    "pytorch_arch_list": "JSON DEFAULT '[]'::json",
+                },
+            )
         if "tasks" in tables:
             ensure_columns(
                 connection,

@@ -11,6 +11,8 @@ class GpuInfo(BaseModel):
     gpu_uuid: str = ""
     model: str
     total_vram_mb: int
+    compute_capability: str | None = None
+    detected_compute_capability: str | None = None
     schedulable: bool = True
     scheduled_occupied: bool = False
     remark: str | None = None
@@ -35,6 +37,7 @@ class NodeInfo(BaseModel):
     is_public: bool = True
     max_speed_mbps: int | None = None
     gpu_schedulable_flags: list[int] = Field(default_factory=list)
+    gpu_compute_capability_overrides: list[str] = Field(default_factory=list)
     state: str
     scheduling_enabled: bool
     gpus: list[GpuInfo] = Field(default_factory=list)
@@ -59,6 +62,7 @@ class NodeSaveRequest(BaseModel):
     is_public: bool | None = None
     max_speed_mbps: int | None = Field(default=None, ge=1)
     gpu_schedulable_flags: list[int] = Field(default_factory=list)
+    gpu_compute_capability_overrides: list[str] = Field(default_factory=list)
 
     @field_validator("name", "ip", "ssh_user", mode="before")
     @classmethod
@@ -100,6 +104,22 @@ class NodeSaveRequest(BaseModel):
                 cleaned.append(0)
             else:
                 raise ValueError("gpu schedulable flags must be 0 or 1")
+        return cleaned
+
+    @field_validator("gpu_compute_capability_overrides", mode="before")
+    @classmethod
+    def clean_gpu_compute_capability_overrides(cls, value: Any) -> list[str]:
+        """保留空行以维持 GPU index 对齐，并限制非空值为 major.minor 形式。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = value.replace("，", ",").replace("\r", "").replace("\n", ",").split(",")
+        cleaned = [str(item or "").strip() for item in value]
+        while cleaned and not cleaned[-1]:
+            cleaned.pop()
+        for item in cleaned:
+            if item and (item.count(".") != 1 or not all(part.isdigit() for part in item.split("."))):
+                raise ValueError("gpu compute capability must use major.minor format")
         return cleaned
 
     @model_validator(mode="after")
