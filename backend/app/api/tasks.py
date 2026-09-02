@@ -88,7 +88,7 @@ async def stream_task_events(
             if cursor != previous:
                 previous = cursor
                 yield f"event: tasks\ndata: {json.dumps(cursor, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
     headers = {
         "Cache-Control": "no-cache",
