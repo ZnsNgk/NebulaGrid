@@ -1,18 +1,23 @@
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse
+from collections.abc import Iterator
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from app.api.deps import get_current_user
 from app.core.responses import api_success
 from app.schemas.files import FileContentRequest, FileOperationRequest
-from app.services.auth_service import UserRecord
+from app.services.auth_service import UserRecord, get_user_by_token
 from app.services.file_service import (
     build_download_path,
+    build_video_stream_path,
     copy_path,
     create_directory,
     create_text_file,
     delete_path,
     get_latest_file_job,
     grant_execute_permission,
+    guess_content_type,
     list_files,
     move_path,
     preview_file,
@@ -24,6 +29,7 @@ from app.services.file_service import (
 from app.services.file_executor import run_file_operation
 
 router = APIRouter()
+MEDIA_STREAM_CHUNK_SIZE = 1024 * 1024
 
 
 @router.get("/list")
@@ -43,10 +49,11 @@ async def get_file_preview(
     request: Request,
     path: str,
     scope: str = "",
+    full: bool = False,
     current_user: UserRecord = Depends(get_current_user),
 ):
-    """预览文本、图片、音视频等文件；文本内容可被前端编辑保存。"""
-    data = await run_file_operation(preview_file, current_user, path, scope)
+    """预览文件；超限文本只有在 full=true 时才主动读取完整内容。"""
+    data = await run_file_operation(preview_file, current_user, path, scope, full)
     return api_success(data=data.model_dump(), request_id=request.headers.get("x-request-id"))
 
 
@@ -59,6 +66,19 @@ async def get_file_download(
     """下载单个文件；目录需要先通过 archive 接口打包，避免隐式遍历。"""
     real_path = await run_file_operation(build_download_path, current_user, path, scope)
     return FileResponse(real_path, filename=real_path.name)
+
+
+@router.get("/media")
+async def get_file_media(
+    request: Request,
+    path: str,
+    token: str = Query(min_length=1),
+    scope: str = "",
+):
+    """按 HTTP Range 流式返回视频；查询令牌用于无法附加 Authorization 头的 video 元素。"""
+    current_user = get_user_by_token(token)
+    real_path = await run_file_operation(build_video_stream_path, current_user, path, scope)
+    return build_media_stream_response(real_path, request.headers.get("range"))
 
 
 @router.get("/jobs/latest")
@@ -207,3 +227,76 @@ def require_target_path(payload: FileOperationRequest) -> str:
 
         raise validation_error("target_path is required")
     return payload.target_path
+
+
+def build_media_stream_response(path: Path, range_header: str | None) -> Response:
+    """生成支持单段字节范围的响应，让浏览器只拉取当前播放和拖动进度所需的视频片段。"""
+    size = path.stat().st_size
+    common_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, max-age=300",
+        "Referrer-Policy": "no-referrer",
+        "X-Accel-Buffering": "no",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if not range_header:
+        common_headers["Content-Length"] = str(size)
+        return StreamingResponse(
+            iterate_file_range(path, 0, max(0, size - 1)),
+            media_type=guess_content_type(path),
+            headers=common_headers,
+        )
+
+    requested_range = parse_byte_range(range_header, size)
+    if requested_range is None:
+        return Response(
+            status_code=416,
+            headers={**common_headers, "Content-Range": f"bytes */{size}"},
+        )
+
+    start, end = requested_range
+    headers = {
+        **common_headers,
+        "Content-Length": str(end - start + 1),
+        "Content-Range": f"bytes {start}-{end}/{size}",
+    }
+    return StreamingResponse(
+        iterate_file_range(path, start, end),
+        status_code=206,
+        media_type=guess_content_type(path),
+        headers=headers,
+    )
+
+
+def parse_byte_range(value: str, size: int) -> tuple[int, int] | None:
+    """解析浏览器常用的单段 bytes Range；多段或越界请求返回不可满足。"""
+    unit, separator, raw_range = value.strip().partition("=")
+    if unit.lower() != "bytes" or not separator or "," in raw_range or "-" not in raw_range or size <= 0:
+        return None
+    start_text, end_text = (part.strip() for part in raw_range.split("-", 1))
+    try:
+        if not start_text:
+            suffix_length = int(end_text)
+            if suffix_length <= 0:
+                return None
+            return max(0, size - suffix_length), size - 1
+        start = int(start_text)
+        end = int(end_text) if end_text else size - 1
+    except ValueError:
+        return None
+    if start < 0 or start >= size or end < start:
+        return None
+    return start, min(end, size - 1)
+
+
+def iterate_file_range(path: Path, start: int, end: int) -> Iterator[bytes]:
+    """分块读取指定闭区间，客户端断开时生成器关闭文件，不把完整视频放进内存。"""
+    remaining = max(0, end - start + 1)
+    with path.open("rb") as file:
+        file.seek(start)
+        while remaining:
+            chunk = file.read(min(MEDIA_STREAM_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk

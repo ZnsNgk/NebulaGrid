@@ -20,14 +20,19 @@ class FileListData(BaseModel):
 
 
 class FilePreviewData(BaseModel):
-    """文件预览响应数据，文本直接返回内容，二进制用 base64 片段展示。"""
+    """文件预览响应数据；不支持在线预览的类型只返回元数据，不读取文件内容。"""
 
     path: str
     content_type: str
     content: str
     encoding: str = "text"
+    previewable: bool = True
     truncated: bool
     size_bytes: int
+    content_bytes: int = 0
+    preview_limit_bytes: int | None = None
+    full_content: bool = False
+    can_save: bool = False
     mode_octal: str
     owner_executable: bool
     group_executable: bool
@@ -61,7 +66,8 @@ class FileContentRequest(BaseModel):
     """文本文件写入请求体，只用于 UTF-8 可编辑内容，避免误写二进制文件。"""
 
     path: str = Field(min_length=1, max_length=1024)
-    content: str = Field(default="", max_length=2_000_000)
+    # 与 2 MiB 在线编辑阈值对齐；更大的文件可主动完整加载，但不允许直接覆盖保存。
+    content: str = Field(default="", max_length=2 * 1024 * 1024)
 
 
 class FileJobData(BaseModel):

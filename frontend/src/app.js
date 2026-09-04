@@ -904,6 +904,13 @@ function fileQuery(path, scope = state.fileViewScope) {
   return params.toString();
 }
 
+function fileMediaUrl(path) {
+  // video 元素无法附加 Bearer 请求头，因此媒体接口沿用任务事件流的查询令牌鉴权方式。
+  const params = new URLSearchParams(fileQuery(path));
+  params.set("token", state.token);
+  return `${state.apiBase.replace(/\/$/, "")}/files/media?${params.toString()}`;
+}
+
 function requireOwnFileViewForWrite() {
   if (isStudentFileView()) throw new Error("学生文件视图仅支持查看");
   if (isSharedFileView()) throw new Error("共享文件夹视图仅支持查看和复制到我的文件夹");
@@ -1534,9 +1541,14 @@ async function openPath(path, scope = state.fileViewScope) {
 }
 
 async function previewFile(path) {
-  const payload = await api(`/files/preview?${fileQuery(path)}`);
-  state.data.preview = payload.data;
+  // 先展示选择结果，避免长文件名在预览请求完成前仍处于不可见状态。
   state.data.selectedFilePath = path;
+  state.data.preview = null;
+  render();
+  const payload = await api(`/files/preview?${fileQuery(path)}`);
+  // 用户若在请求期间切换了条目，旧响应不能覆盖新选择对应的右侧面板。
+  if (state.data.selectedFilePath !== path) return;
+  state.data.preview = payload.data;
 }
 
 function selectFile(path, kind = "") {
@@ -1778,9 +1790,18 @@ async function uploadCurrentFile(event) {
 async function saveCurrentFile(content) {
   requireOwnFileViewForWrite();
   const preview = state.data.preview;
-  if (!preview?.path || preview.encoding !== "text") throw new Error("当前文件不可保存");
+  if (!preview?.path || preview.encoding !== "text" || preview.truncated || preview.can_save === false) {
+    throw new Error("当前文件不可保存");
+  }
   await api("/files/save", { method: "POST", body: JSON.stringify({ path: preview.path, content }) });
   await previewFile(preview.path);
+}
+
+async function loadFullTextFile(path) {
+  const payload = await api(`/files/preview?${fileQuery(path)}&full=true`);
+  // 完整文件返回期间若用户切换了条目，不使用旧响应覆盖当前预览。
+  if (state.data.selectedFilePath !== path) return;
+  state.data.preview = payload.data;
 }
 
 async function grantCurrentFileExecutePermission() {
@@ -2886,6 +2907,7 @@ function renderFiles() {
   const studentView = isStudentFileView();
   const sharedView = isSharedFileView();
   const readOnlyView = isReadOnlyFileView();
+  const selectedName = selected ? baseName(selected) : "";
   const studentFilesButton = canViewStudentFiles()
     ? `<button class="secondary ${studentView ? "active" : ""}" data-file-students>${studentView ? "查看我的文件" : "查看学生文件"}</button>`
     : "";
@@ -2911,6 +2933,10 @@ function renderFiles() {
             </div>
           `).join("") : `<div class="file-empty">当前目录为空</div>`}
         </div>
+        <div class="file-selection-summary" aria-live="polite">
+          <span>当前选中</span>
+          <strong title="${escapeAttr(selected ? displayFilePath(selected) : "")}">${selectedName ? escapeHtml(selectedName) : "未选择文件或文件夹"}</strong>
+        </div>
         ${readOnlyView ? "" : `<div class="file-actions-grid">
           <button class="secondary" data-file-new-folder>新建文件夹</button>
           <button class="secondary" data-file-new-file>新建文件</button>
@@ -2932,8 +2958,8 @@ function renderFiles() {
       </aside>
       <section class="file-editor-panel">
         <div class="file-editor-toolbar">
-          <span class="status">${preview?.path ? escapeHtml(displayFilePath(preview.path)) : "未打开文件"}</span>
-          <button data-file-save ${preview?.encoding === "text" && !readOnlyView ? "" : "disabled"}>保存</button>
+          <span class="status" title="${escapeAttr(selected ? displayFilePath(selected) : "")}">${selected ? `已选择：${escapeHtml(displayFilePath(selected))}` : "未选择文件或文件夹"}</span>
+          <button data-file-save ${preview?.encoding === "text" && !preview.truncated && preview.can_save !== false && !readOnlyView ? "" : "disabled"}>保存</button>
         </div>
         ${renderFilePreview(preview, readOnlyView)}
         ${renderFilePermissionPanel(preview, readOnlyView)}
@@ -2948,19 +2974,170 @@ function renderFilePreview(preview, readOnly = false) {
     return `<textarea class="file-editor" disabled placeholder="${readOnly ? "选择左侧文件后可在这里预览" : "选择左侧文本文件后可在这里预览或编辑"}"></textarea>`;
   }
   if (preview.encoding === "text") {
-    return `<div class="file-editor-shell"><textarea id="fileEditor" class="file-editor" spellcheck="false" ${readOnly ? "readonly" : ""}>${escapeHtml(preview.content || "")}</textarea>${preview.truncated ? `<p class="file-note">文件较大，仅显示前 ${formatBytes(preview.content.length)}。</p>` : ""}</div>`;
+    const previewLimit = preview.preview_limit_bytes || 2 * 1024 * 1024;
+    const viewOnly = readOnly || preview.truncated || preview.can_save === false;
+    const note = preview.truncated
+      ? `<div class="file-note-row"><p class="file-note">文件超过 ${formatBytes(previewLimit)}，当前仅显示前 ${formatBytes(previewLimit)}。</p><button type="button" class="secondary" data-file-load-full="${escapeAttr(preview.path)}" ${state.loading ? "disabled" : ""}>加载完整文件</button></div>`
+      : (preview.size_bytes > previewLimit ? `<p class="file-note loaded">已加载完整文件（${formatBytes(preview.size_bytes)}）。超过 ${formatBytes(previewLimit)} 的文本仅供在线查看，不能直接保存。</p>` : "");
+    return `<div class="file-editor-shell"><textarea id="fileEditor" class="file-editor" spellcheck="false" ${viewOnly ? "readonly" : ""}>${escapeHtml(preview.content || "")}</textarea>${note}</div>`;
   }
-  const source = `data:${preview.content_type};base64,${preview.content}`;
+  if (preview.previewable === false || preview.encoding === "none") {
+    return `<div class="file-binary-preview"><strong>${escapeHtml(baseName(preview.path))}</strong><span>${escapeHtml(preview.content_type)} · ${formatBytes(preview.size_bytes)}</span><p>该文件类型不支持在线预览，未加载文件内容。可使用“下载选中”获取文件。</p></div>`;
+  }
+  const source = preview.encoding === "stream"
+    ? fileMediaUrl(preview.path)
+    : `data:${preview.content_type};base64,${preview.content}`;
   if (preview.content_type.startsWith("image/")) {
     return `<div class="file-media-preview"><img src="${escapeAttr(source)}" alt="${escapeAttr(baseName(preview.path))}"></div>`;
   }
   if (preview.content_type.startsWith("video/")) {
-    return `<div class="file-media-preview"><video controls src="${escapeAttr(source)}"></video></div>`;
+    return `
+      <div class="file-media-preview video-preview">
+        <div class="ng-video-player" data-video-player tabindex="0" aria-label="视频播放器">
+          <video data-video-element preload="metadata" playsinline disablepictureinpicture controlslist="nodownload noplaybackrate" referrerpolicy="no-referrer" src="${escapeAttr(source)}"></video>
+          <button type="button" class="video-center-toggle" data-video-toggle aria-label="播放">
+            <span data-video-play-symbol aria-hidden="true">▶</span>
+          </button>
+          <div class="video-control-layer" data-video-controls>
+            <input class="video-progress" data-video-progress type="range" min="0" max="0" step="0.1" value="0" aria-label="播放进度">
+            <div class="video-control-row">
+              <button type="button" class="video-control-button" data-video-toggle aria-label="播放">
+                <span data-video-play-symbol aria-hidden="true">▶</span>
+              </button>
+              <span class="video-time"><span data-video-current>0:00</span><i>/</i><span data-video-duration>0:00</span></span>
+              <span class="video-control-spacer"></span>
+              <button type="button" class="video-control-button" data-video-mute aria-label="静音">
+                <span data-video-volume-symbol aria-hidden="true">🔊</span>
+              </button>
+              <input class="video-volume" data-video-volume type="range" min="0" max="1" step="0.05" value="1" aria-label="音量">
+              <button type="button" class="video-control-button" data-video-fullscreen aria-label="全屏">
+                <span aria-hidden="true">⛶</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>`;
   }
   if (preview.content_type.startsWith("audio/")) {
     return `<div class="file-media-preview compact"><audio controls src="${escapeAttr(source)}"></audio></div>`;
   }
   return `<div class="file-binary-preview"><strong>${escapeHtml(baseName(preview.path))}</strong><span>${escapeHtml(preview.content_type)} · ${formatBytes(preview.size_bytes)}</span></div>`;
+}
+
+function formatVideoTime(value) {
+  const seconds = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = String(seconds % 60).padStart(2, "0");
+  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${remainder}` : `${minutes}:${remainder}`;
+}
+
+function bindVideoPlayerEvents() {
+  const player = document.querySelector("[data-video-player]");
+  const video = player?.querySelector("[data-video-element]");
+  if (!player || !video) return;
+
+  const progress = player.querySelector("[data-video-progress]");
+  const volume = player.querySelector("[data-video-volume]");
+  const current = player.querySelector("[data-video-current]");
+  const duration = player.querySelector("[data-video-duration]");
+  let controlsTimer = null;
+
+  const updatePlayState = () => {
+    const paused = video.paused;
+    player.classList.toggle("is-playing", !paused);
+    player.querySelectorAll("[data-video-play-symbol]").forEach((symbol) => {
+      symbol.textContent = paused ? "▶" : "❚❚";
+    });
+    player.querySelectorAll("[data-video-toggle]").forEach((button) => {
+      button.setAttribute("aria-label", paused ? "播放" : "暂停");
+    });
+  };
+  const updateTimeline = () => {
+    const total = Number.isFinite(video.duration) ? video.duration : 0;
+    progress.max = String(total);
+    progress.value = String(Math.min(video.currentTime || 0, total));
+    progress.style.setProperty("--video-progress", `${total ? (video.currentTime / total) * 100 : 0}%`);
+    current.textContent = formatVideoTime(video.currentTime);
+    duration.textContent = formatVideoTime(total);
+  };
+  const updateVolumeState = () => {
+    const effectiveVolume = video.muted ? 0 : video.volume;
+    volume.value = String(effectiveVolume);
+    volume.style.setProperty("--video-volume", `${effectiveVolume * 100}%`);
+    player.querySelector("[data-video-volume-symbol]").textContent = effectiveVolume === 0 ? "🔇" : (effectiveVolume < 0.5 ? "🔉" : "🔊");
+  };
+  const showControls = () => {
+    player.classList.remove("controls-hidden");
+    if (controlsTimer) window.clearTimeout(controlsTimer);
+    if (!video.paused) {
+      controlsTimer = window.setTimeout(() => player.classList.add("controls-hidden"), 2200);
+    }
+  };
+  const togglePlayback = async () => {
+    if (video.paused) {
+      try {
+        await video.play();
+      } catch (error) {
+        showToast("浏览器阻止了视频播放，请再次点击播放按钮", "error");
+      }
+    } else {
+      video.pause();
+    }
+  };
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement === player) document.exitFullscreen?.();
+    else player.requestFullscreen?.();
+  };
+
+  player.querySelectorAll("[data-video-toggle]").forEach((button) => button.addEventListener("click", togglePlayback));
+  video.addEventListener("click", togglePlayback);
+  video.addEventListener("loadedmetadata", updateTimeline);
+  video.addEventListener("durationchange", updateTimeline);
+  video.addEventListener("timeupdate", updateTimeline);
+  video.addEventListener("play", () => { updatePlayState(); showControls(); });
+  video.addEventListener("pause", () => { updatePlayState(); showControls(); });
+  video.addEventListener("ended", () => { updatePlayState(); showControls(); });
+  video.addEventListener("error", () => showToast("视频加载失败，请确认编码格式受浏览器支持", "error"));
+  video.addEventListener("volumechange", updateVolumeState);
+  progress.addEventListener("input", () => {
+    if (Number.isFinite(video.duration)) video.currentTime = Number(progress.value);
+    updateTimeline();
+  });
+  volume.addEventListener("input", () => {
+    video.muted = false;
+    video.volume = Number(volume.value);
+  });
+  player.querySelector("[data-video-mute]").addEventListener("click", () => {
+    video.muted = !video.muted;
+  });
+  player.querySelector("[data-video-fullscreen]").addEventListener("click", toggleFullscreen);
+  player.addEventListener("pointermove", showControls, { passive: true });
+  player.addEventListener("pointerleave", () => {
+    if (!video.paused) player.classList.add("controls-hidden");
+  });
+  player.addEventListener("keydown", (event) => {
+    if (event.target.matches("input, button")) return;
+    if ([" ", "k", "K"].includes(event.key)) {
+      event.preventDefault();
+      togglePlayback();
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      video.currentTime = Math.max(0, video.currentTime - 5);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      video.currentTime = Math.min(video.duration || 0, video.currentTime + 5);
+    } else if (["m", "M"].includes(event.key)) {
+      video.muted = !video.muted;
+    } else if (["f", "F"].includes(event.key)) {
+      toggleFullscreen();
+    }
+    showControls();
+  });
+
+  updatePlayState();
+  updateTimeline();
+  updateVolumeState();
 }
 
 function renderFilePermissionPanel(preview, readOnly = false) {
@@ -4725,6 +4902,11 @@ function bindEvents() {
     run(() => saveCurrentFile(content), "文件已保存");
   });
   document.querySelector("[data-file-grant-exec]")?.addEventListener("click", () => run(grantCurrentFileExecutePermission, "执行权限已更新"));
+  document.querySelector("[data-file-load-full]")?.addEventListener("click", (event) => {
+    const path = event.currentTarget.dataset.fileLoadFull;
+    run(() => loadFullTextFile(path));
+  });
+  bindVideoPlayerEvents();
   document.querySelectorAll("[data-select-file]").forEach((button) => {
     button.addEventListener("click", () => {
       const path = button.dataset.selectFile;

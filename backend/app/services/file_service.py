@@ -25,8 +25,9 @@ from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
 from app.services.file_executor import submit_file_operation
 
-TEXT_PREVIEW_LIMIT = 256 * 1024
+TEXT_PREVIEW_LIMIT = 2 * 1024 * 1024
 BINARY_PREVIEW_LIMIT = 2 * 1024 * 1024
+PREVIEWABLE_MEDIA_TYPE_PREFIXES = ("image/", "audio/", "video/")
 ACTIVE_JOB_STATES = ("pending", "running")
 ARCHIVE_SUFFIXES = {".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}
 MAX_ACTIVE_FILE_JOBS = 4
@@ -68,36 +69,62 @@ def list_files(user: UserRecord, path: str, scope: str = "") -> FileListData:
     return FileListData(path=normalized, items=items)
 
 
-def preview_file(user: UserRecord, path: str, scope: str = "") -> FilePreviewData:
-    """按文件类型返回预览内容，大文件只返回前段内容避免拖垮页面。"""
+def preview_file(user: UserRecord, path: str, scope: str = "", full_content: bool = False) -> FilePreviewData:
+    """只读取页面能展示的文件内容；其他类型仅返回元数据，避免无效磁盘和网络 IO。"""
     require_permission(user.role, "files:read")
     normalized = normalize_virtual_path(path)
-    real_path = (
-        resolve_student_readable_existing_path(user, normalized)
-        if is_student_files_scope(scope)
-        else resolve_shared_readable_existing_path(user, normalized)
-        if is_shared_files_scope(scope)
-        else resolve_user_visible_path(normalized, user.username, user.role.value)
-    )
+    real_path = resolve_scoped_readable_existing_path(user, normalized, scope)
     if not real_path.exists() or not real_path.is_file():
         raise validation_error("path is not a file")
 
     size = real_path.stat().st_size
     content_type = guess_content_type(real_path)
+    permission_data = build_file_permission_data(real_path, normalized).model_dump(exclude={"path"})
     if is_text_file(real_path, content_type):
-        raw = real_path.read_bytes()[:TEXT_PREVIEW_LIMIT]
+        # 超限文本默认只读固定前缀，只有用户明确点击“加载完整文件”后才执行全量读取。
+        raw = real_path.read_bytes() if full_content else read_file_prefix(real_path, TEXT_PREVIEW_LIMIT)
         content = raw.decode("utf-8", errors="replace")
+        truncated = not full_content and size > TEXT_PREVIEW_LIMIT
         return FilePreviewData(
             path=normalized,
             content_type=content_type,
             content=content,
             encoding="text",
-            truncated=size > TEXT_PREVIEW_LIMIT,
+            truncated=truncated,
             size_bytes=size,
-            **build_file_permission_data(real_path, normalized).model_dump(exclude={"path"}),
+            content_bytes=len(raw),
+            preview_limit_bytes=TEXT_PREVIEW_LIMIT,
+            full_content=not truncated,
+            # 保存截断内容会破坏原文件；超过接口安全上限的完整内容也只允许查看。
+            can_save=size <= TEXT_PREVIEW_LIMIT,
+            **permission_data,
         )
 
-    raw = real_path.read_bytes()[:BINARY_PREVIEW_LIMIT]
+    if not is_previewable_media_type(content_type):
+        return FilePreviewData(
+            path=normalized,
+            content_type=content_type,
+            content="",
+            encoding="none",
+            previewable=False,
+            truncated=False,
+            size_bytes=size,
+            **permission_data,
+        )
+
+    if content_type.startswith("video/"):
+        # 视频交给独立 Range 接口按播放进度读取，避免 Base64 截断导致只能播放开头。
+        return FilePreviewData(
+            path=normalized,
+            content_type=content_type,
+            content="",
+            encoding="stream",
+            truncated=False,
+            size_bytes=size,
+            **permission_data,
+        )
+
+    raw = read_file_prefix(real_path, BINARY_PREVIEW_LIMIT)
     return FilePreviewData(
         path=normalized,
         content_type=content_type,
@@ -105,7 +132,7 @@ def preview_file(user: UserRecord, path: str, scope: str = "") -> FilePreviewDat
         encoding="base64",
         truncated=size > BINARY_PREVIEW_LIMIT,
         size_bytes=size,
-        **build_file_permission_data(real_path, normalized).model_dump(exclude={"path"}),
+        **permission_data,
     )
 
 
@@ -325,15 +352,17 @@ def extract_archive(user: UserRecord, path: str, target_path: str | None = None)
 
 def build_download_path(user: UserRecord, path: str, scope: str = "") -> Path:
     """为下载接口解析真实路径，目录下载需先打包，避免隐式流式遍历目录。"""
-    real_path = (
-        resolve_student_readable_existing_path(user, path)
-        if is_student_files_scope(scope)
-        else resolve_shared_readable_existing_path(user, path)
-        if is_shared_files_scope(scope)
-        else resolve_readable_existing_path(user, path)
-    )
+    real_path = resolve_scoped_readable_existing_path(user, path, scope)
     if not real_path.is_file():
         raise validation_error("path is not a file")
+    return real_path
+
+
+def build_video_stream_path(user: UserRecord, path: str, scope: str = "") -> Path:
+    """只允许视频文件进入媒体流接口，防止查询令牌把任意文件暴露成内联资源。"""
+    real_path = resolve_scoped_readable_existing_path(user, path, scope)
+    if not real_path.is_file() or not guess_content_type(real_path).startswith("video/"):
+        raise validation_error("path is not a previewable video file")
     return real_path
 
 
@@ -564,6 +593,15 @@ def resolve_writable_existing_path(user: UserRecord, path: str) -> Path:
     if not real_path.exists():
         raise not_found("path not found")
     return real_path
+
+
+def resolve_scoped_readable_existing_path(user: UserRecord, path: str, scope: str | None = None) -> Path:
+    """按个人、共享或导师学生视图解析同一套只读路径，避免各读取接口的权限边界不一致。"""
+    if is_student_files_scope(scope):
+        return resolve_student_readable_existing_path(user, path)
+    if is_shared_files_scope(scope):
+        return resolve_shared_readable_existing_path(user, path)
+    return resolve_readable_existing_path(user, path)
 
 
 def build_file_permission_data(path: Path, normalized: str) -> FilePermissionData:
@@ -970,6 +1008,17 @@ def guess_content_type(path: Path) -> str:
 def is_text_file(path: Path, content_type: str) -> bool:
     """文本类型和常见脚本配置后缀允许进入编辑器，其余文件只预览。"""
     return content_type.startswith("text/") or path.suffix.lower() in EDITABLE_TEXT_TYPES
+
+
+def is_previewable_media_type(content_type: str) -> bool:
+    """只允许前端已有渲染器支持的图片、音频和视频进入二进制预览流程。"""
+    return content_type.startswith(PREVIEWABLE_MEDIA_TYPE_PREFIXES)
+
+
+def read_file_prefix(path: Path, limit: int) -> bytes:
+    """按上限读取文件前缀，不能使用 read_bytes 后切片，否则会先把超大文件完整读入内存。"""
+    with path.open("rb") as file:
+        return file.read(limit)
 
 
 def parent_virtual_path(path: str) -> str:

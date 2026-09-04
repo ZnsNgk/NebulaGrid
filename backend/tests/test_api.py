@@ -2589,6 +2589,33 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
             json={"path": "/project/copy.txt", "target_path": "/project/renamed.txt"},
         )
         preview_response = client.get("/api/files/preview?path=/project/renamed.txt", headers=headers)
+        # 压缩包即使体积很大也只应返回元数据，不能进入 Base64 内容预览流程。
+        archive_path = user_root / "project" / "large.zip"
+        archive_path.write_bytes(b"PK" + b"0" * 1024)
+        video_path = user_root / "project" / "demo.mp4"
+        video_path.write_bytes(b"0123456789")
+        large_text_path = user_root / "project" / "large.txt"
+        large_text_size = 2 * 1024 * 1024 + 7
+        large_text_path.write_bytes(b"a" * large_text_size)
+        original_path_open = Path.open
+
+        def reject_archive_content_read(path: Path, *args, **kwargs):
+            if path == archive_path:
+                raise AssertionError("unsupported archive content must not be read")
+            return original_path_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", reject_archive_content_read)
+        archive_preview_response = client.get("/api/files/preview?path=/project/large.zip", headers=headers)
+        video_preview_response = client.get("/api/files/preview?path=/project/demo.mp4", headers=headers)
+        limited_text_response = client.get("/api/files/preview?path=/project/large.txt", headers=headers)
+        full_text_response = client.get("/api/files/preview?path=/project/large.txt&full=true", headers=headers)
+        video_range_response = client.get(
+            f"/api/files/media?path=/project/demo.mp4&token={student_token}",
+            headers={"Range": "bytes=2-5"},
+        )
+        archive_media_response = client.get(
+            f"/api/files/media?path=/project/large.zip&token={student_token}",
+        )
         permission_response = client.post(
             "/api/files/permissions/execute",
             headers=headers,
@@ -2605,6 +2632,36 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
         assert rename_response.status_code == 200
         assert preview_response.json()["data"]["content"] == "updated"
         assert preview_response.json()["data"]["mode_octal"]
+        archive_preview = archive_preview_response.json()["data"]
+        assert archive_preview_response.status_code == 200
+        assert archive_preview["previewable"] is False
+        assert archive_preview["encoding"] == "none"
+        assert archive_preview["content"] == ""
+        assert archive_preview["size_bytes"] == archive_path.stat().st_size
+        video_preview = video_preview_response.json()["data"]
+        assert video_preview_response.status_code == 200
+        assert video_preview["encoding"] == "stream"
+        assert video_preview["content"] == ""
+        assert video_preview["truncated"] is False
+        assert video_range_response.status_code == 206
+        assert video_range_response.content == b"2345"
+        assert video_range_response.headers["content-range"] == "bytes 2-5/10"
+        assert video_range_response.headers["accept-ranges"] == "bytes"
+        assert archive_media_response.status_code == 422
+        limited_text = limited_text_response.json()["data"]
+        assert limited_text_response.status_code == 200
+        assert limited_text["truncated"] is True
+        assert limited_text["content_bytes"] == 2 * 1024 * 1024
+        assert limited_text["preview_limit_bytes"] == 2 * 1024 * 1024
+        assert limited_text["full_content"] is False
+        assert limited_text["can_save"] is False
+        full_text = full_text_response.json()["data"]
+        assert full_text_response.status_code == 200
+        assert full_text["truncated"] is False
+        assert full_text["content_bytes"] == large_text_size
+        assert len(full_text["content"]) == large_text_size
+        assert full_text["full_content"] is True
+        assert full_text["can_save"] is False
         assert permission_response.status_code == 200
         assert permission_response.json()["data"]["owner_executable"] is True
         assert (user_root / "project" / "renamed.txt").stat().st_mode & stat.S_IXUSR
