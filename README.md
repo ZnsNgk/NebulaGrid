@@ -316,8 +316,9 @@ scheduler:
   exclusive_gpu_max_mem_util: 0.2
 
 executor:
-  ssh_connect_timeout_seconds: 10
-  kill_grace_seconds: 10
+  ssh_connect_timeout_seconds: 20
+  task_start_timeout_seconds: 120
+  ssh_operation_timeout_seconds: 30
   ssh_username: ddltm
   remote_runner_path: /home/ddltm/envs/nebulagrid_remote/runner.py
 
@@ -334,7 +335,6 @@ runtime_guard:
   interval_seconds: 5
   startup_grace_seconds: 10
   violation_confirm_count: 2
-  kill_grace_seconds: 10
   cpu_only_policy: forbid_gpu
 
 env_install:
@@ -374,10 +374,10 @@ NEBULAGRID_CONFIG=/etc/nebulagrid/config.yaml
 ```text
 nebulagrid-api.service
 nebulagrid-scheduler.service
-nebulagrid-monitor.service
-nebulagrid-executor.service
+nebulagrid-node-monitor.service
+nebulagrid-task-executor.service
 nebulagrid-runtime-guard.service
-nebulagrid-env-worker.service
+nebulagrid-env-install-worker.service
 ```
 
 ### 8.1 API 服务示例
@@ -446,10 +446,10 @@ app.workers.log_streamer
 sudo systemctl daemon-reload
 sudo systemctl enable --now nebulagrid-api
 sudo systemctl enable --now nebulagrid-scheduler
-sudo systemctl enable --now nebulagrid-monitor
-sudo systemctl enable --now nebulagrid-executor
+sudo systemctl enable --now nebulagrid-node-monitor
+sudo systemctl enable --now nebulagrid-task-executor
 sudo systemctl enable --now nebulagrid-runtime-guard
-sudo systemctl enable --now nebulagrid-env-worker
+sudo systemctl enable --now nebulagrid-env-install-worker
 ```
 
 查看状态：
@@ -674,7 +674,7 @@ Runtime Guard 应检查任务进程树实际使用的 GPU UUID：
 
 - 普通任务使用未分配 GPU 时，按配置警告或中止。
 - CPU-only 任务调用 CUDA 时，默认按 `cpu_only_policy: forbid_gpu` 中止。
-- 中止时停止远端进程组，任务标记为 `alloc_error`。
+- 中止时先进入 `cancelling` 并保留 allocation；确认远端进程组退出后才标记为 `alloc_error` 并释放资源。停止确认超过 `NEBULAGRID_CANCELLING_TIMEOUT_SECONDS`（默认 30 秒）则归档为 `unknown` 并释放 allocation，但必须人工核查远端残留进程。
 - 记录审计日志和任务事件。
 
 ### 13.5 环境安装失败

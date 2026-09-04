@@ -1,7 +1,7 @@
 import logging
 import time
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, selectinload
 
@@ -82,6 +82,15 @@ def acquire_scheduler_lock(db: Session) -> bool:
 
 def try_schedule_task(db: Session, task: Task) -> bool:
     """尝试调度单个任务；失败时只更新阻塞原因，等待下轮重试。"""
+    if db.scalar(
+        select(TaskAllocation.id)
+        .where(TaskAllocation.task_id == task.id)
+        .where(TaskAllocation.released_at.is_(None))
+        .limit(1)
+    ) is not None:
+        # wait 任务正常情况下不可能仍占资源；禁止叠加新 allocation，等待人工或 executor 收敛旧记录。
+        mark_blocked(db, task, "STALE_ALLOCATION", "任务仍有未释放的历史资源占用，暂不重新调度")
+        return False
     owner = db.get(User, task.user_id)
     if owner is None or owner.state != "enabled":
         mark_blocked(db, task, "USER_DISABLED", "任务所有人已停用或不存在")
@@ -97,8 +106,7 @@ def try_schedule_task(db: Session, task: Task) -> bool:
         mark_blocked(db, task, "NO_AVAILABLE_NODE", "没有可调度节点")
         return False
     if task.requirement.need_gpus <= 0:
-        allocate_task(db, task, candidates[0], [], "cpu")
-        return True
+        return allocate_task(db, task, candidates[0], [], "cpu")
     gpu_ids = [gpu.id for node in candidates for gpu in node.gpus]
     metrics = load_gpu_metrics(gpu_ids)
     selected = select_gpu_allocation(db, candidates, task, metrics)
@@ -106,8 +114,7 @@ def try_schedule_task(db: Session, task: Task) -> bool:
         mark_blocked(db, task, "RESOURCE_UNAVAILABLE", "没有满足 GPU 数量、型号或复用策略的资源")
         return False
     node, gpus, mode = selected
-    allocate_task(db, task, node, gpus, mode)
-    return True
+    return allocate_task(db, task, node, gpus, mode)
 
 
 def dependency_satisfied(db: Session, task: Task) -> bool:
@@ -233,11 +240,36 @@ def load_gpu_occupancy(db: Session) -> dict[int, dict[str, int | bool]]:
     return occupancy
 
 
-def allocate_task(db: Session, task: Task, node: Node, gpus: list[Gpu], mode: str) -> None:
-    """写入 allocation、运行时守护记录和任务事件，并推进到派发状态。"""
+def allocate_task(db: Session, task: Task, node: Node, gpus: list[Gpu], mode: str) -> bool:
+    """用条件状态迁移写入 allocation，避免取消请求与调度并发时重新派发任务。"""
+    # 节点强制下线与调度必须采用相同的“节点行 -> 任务行”锁顺序，既防止把新任务
+    # 分给正在下线的节点，也避免两个事务以相反顺序持锁形成死锁。
+    locked_node = db.scalar(
+        select(Node)
+        .where(Node.id == node.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked_node is None or locked_node.state != "online" or not locked_node.scheduling_enabled:
+        return False
+
+    # 候选任务是在本轮较早时读取的，期间用户可能已经点击停止。这里用 CAS 再次要求
+    # 状态仍为 wait；失败时绝不能创建 allocation 或改写 guard。
+    claimed = db.execute(
+        update(Task)
+        .where(Task.id == task.id)
+        .where(Task.state == "wait")
+        .values(state="dispatching", last_block_reason="", generated_command="")
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        db.expire(task)
+        return False
+    db.refresh(task)
+
     allocation = TaskAllocation(
         task_id=task.id,
-        node_id=node.id,
+        node_id=locked_node.id,
         gpu_ids=[gpu.id for gpu in gpus],
         cpu_allocated=1 if mode == "cpu" else 0,
         allocation_mode=mode,
@@ -247,32 +279,36 @@ def allocate_task(db: Session, task: Task, node: Node, gpus: list[Gpu], mode: st
     if guard is None:
         guard = TaskRuntimeGuard(
             task_id=task.id,
-            node_id=node.id,
+            node_id=locked_node.id,
             allocated_gpu_ids=[gpu.id for gpu in gpus],
             state="allocated",
         )
         db.add(guard)
     else:
-        guard.node_id = node.id
+        guard.node_id = locked_node.id
         guard.allocated_gpu_ids = [gpu.id for gpu in gpus]
+        # 同一任务从历史区修改后可再次入队；新 allocation 绝不能沿用上一次运行的 PID/观测结果。
+        guard.root_pid = None
+        guard.process_group_id = None
+        guard.observed_gpu_uuids = []
+        guard.violation_count = 0
+        guard.last_check_at = None
         guard.state = "allocated"
-    task.state = "dispatching"
-    task.last_block_reason = ""
-    task.generated_command = ""
     add_task_event(
         db,
         task,
         "allocated",
         "调度器已分配资源",
         detail_json={
-            "node_id": node.id,
-            "node_name": node.name,
+            "node_id": locked_node.id,
+            "node_name": locked_node.name,
             "gpu_ids": [gpu.id for gpu in gpus],
             "gpu_indices": [gpu.gpu_index for gpu in gpus],
             "allocation_mode": mode,
         },
     )
     db.flush()
+    return True
 
 
 def release_terminal_allocations(db: Session) -> int:
@@ -289,15 +325,10 @@ def release_terminal_allocations(db: Session) -> int:
         task.id: task
         for task in db.scalars(select(Task).where(Task.id.in_(task_ids))).all()
     } if task_ids else {}
-    guards_by_task_id = {
-        guard.task_id: guard
-        for guard in db.scalars(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id.in_(task_ids))).all()
-    } if task_ids else {}
     released = 0
     for allocation in allocations:
         task = tasks_by_id.get(allocation.task_id)
-        guard = guards_by_task_id.get(allocation.task_id)
-        if task is not None and should_keep_cancel_allocation(task, guard):
+        if task is not None and should_keep_unconfirmed_terminal_allocation(task):
             continue
         allocation.released_at = now
         released += 1
@@ -306,12 +337,11 @@ def release_terminal_allocations(db: Session) -> int:
     return released
 
 
-def should_keep_cancel_allocation(task: Task, guard: TaskRuntimeGuard | None) -> bool:
-    """取消任务的远端进程未确认回收前不能释放占用，否则执行器会失去中止入口。"""
-    if task.state != "cancelled" or guard is None:
-        return False
-    has_remote_process = guard.process_group_id is not None or guard.root_pid is not None
-    return has_remote_process and guard.state != "cancelled"
+def should_keep_unconfirmed_terminal_allocation(task: Task) -> bool:
+    """旧版取消/越权终态没有可靠停止回执时保留占用，交给 executor 恢复核查。"""
+    # 新流程的终态与 allocation 释放发生在同一个事务；查询到这种组合，只可能是旧版或异常记录。
+    # 旧版 guard=cancelled 没有强制存活复核，因此也不能据此自动释放。
+    return task.state in {"cancelled", "alloc_error"}
 
 
 def mark_blocked(db: Session, task: Task, reason: str, message: str) -> None:

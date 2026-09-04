@@ -444,6 +444,10 @@ NEBULAGRID_SCHEDULER_INTERVAL_SECONDS=1
 NEBULAGRID_MONITOR_INTERVAL_SECONDS=5
 NEBULAGRID_MONITOR_RECONNECT_ATTEMPTS=3
 NEBULAGRID_MONITOR_WATCHDOG_TIMEOUT_SECONDS=600
+NEBULAGRID_SSH_CONNECT_TIMEOUT_SECONDS=20
+NEBULAGRID_TASK_START_TIMEOUT_SECONDS=120
+NEBULAGRID_SSH_OPERATION_TIMEOUT_SECONDS=30
+NEBULAGRID_CANCELLING_TIMEOUT_SECONDS=30
 NEBULAGRID_FILE_OPERATION_WORKER_THREADS=2
 EOF
 ```
@@ -496,6 +500,10 @@ sudo grep -v SECRET /etc/nebulagrid/backend.env
 | `NEBULAGRID_MONITOR_INTERVAL_SECONDS` | 节点监控远端循环输出的间隔秒数；master 会为每个可监控计算节点保持一条 SSH 长连接，并把该值传给远端 `monitor.py --loop --interval`。 |
 | `NEBULAGRID_MONITOR_RECONNECT_ATTEMPTS` | 节点监控长连接断开后的默认自动重连次数；管理员后台 `monitor.reconnect_attempts` 可在线覆盖，默认 `3` 次。 |
 | `NEBULAGRID_MONITOR_WATCHDOG_TIMEOUT_SECONDS` | 节点监控长连接无有效 JSON 输出时的默认 watchdog 超时秒数；管理员后台 `monitor.watchdog_timeout_seconds` 可在线覆盖，默认 `600` 秒。 |
+| `NEBULAGRID_SSH_CONNECT_TIMEOUT_SECONDS` | 任务执行器 SSH TCP 建连、握手和认证的超时秒数，默认 `20`；它不代表任务环境加载时限。低带宽或高时延节点可适当增大。 |
+| `NEBULAGRID_TASK_START_TIMEOUT_SECONDS` | master 等待远端 `runner.py` 写出本次启动回执的总时限，默认 `120` 秒；应覆盖慢共享盘、解释器冷启动和远端脚本加载时间。 |
+| `NEBULAGRID_SSH_OPERATION_TIMEOUT_SECONDS` | 查询任务状态、发送停止信号并核验进程退出等短 SSH 操作的总超时，默认 `30` 秒；超时只会保留任务为“停止中”并重试，不会直接释放资源。 |
+| `NEBULAGRID_CANCELLING_TIMEOUT_SECONDS` | 停止确认的最长等待秒数，默认 `30`。达到上限仍没有明确返回码或停止回执时，任务以“状态未知”归档并释放 allocation；这不是远端进程已停止的证明，管理员仍须核查节点残留进程。 |
 | `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` | 文件管理专用线程池大小，用于列表、预览、上传、复制、移动、删除、打包和解压；共享盘吞吐不足时不要调太大。 |
 
 ## 12. 初始化数据库表和默认账号
@@ -1132,6 +1140,16 @@ sudo chmod 600 /home/ddltm/.ssh/authorized_keys
 sudo chown -R ddltm:ddltm /home/ddltm/.ssh
 ```
 
+如果只有低带宽节点在任务启动时偶发超时，先分别验证 SSH 和远端 runner 文件，不要把 SSH 连接是否建立与任务进程是否启动混为一谈：
+
+```bash
+sudo -u ddltm ssh -o ConnectTimeout=20 ddltm@node-a 'test -r /home/ddltm/envs/nebulagrid_remote/runner.py && echo runner-ok'
+sudo -u ddltm ssh ddltm@node-a 'test -d /home/ddltm/data/runtime/tasks && echo runtime-ok'
+journalctl -u nebulagrid-task-executor -n 100 --no-pager
+```
+
+建连失败由 `NEBULAGRID_SSH_CONNECT_TIMEOUT_SECONDS` 控制，远端启动回执由更长的 `NEBULAGRID_TASK_START_TIMEOUT_SECONDS` 控制。启动结果不确定时，任务会进入“停止中”，保留 allocation 并继续核验；在 `NEBULAGRID_CANCELLING_TIMEOUT_SECONDS` 到期前不要手工把它改成历史状态或提前重新提交，否则旧进程与新任务可能同时占用节点。到期后的“状态未知”仅表示平台已停止等待并释放资源，仍需先核查节点进程再重提。
+
 ### 19.7 Python 包安装慢或失败
 
 可以配置 pip 镜像：
@@ -1154,18 +1172,26 @@ cd /home/ddltm/master/backend
 
 ## 20. 更新代码
 
-如果代码来自 git，以下命令以 `ddltm` 身份执行代码更新和依赖安装，再用 sudo 重启服务：
+如果代码来自 git，先停止调度，等待执行区与环境安装作业清空，再停止相关 worker；随后以 `ddltm` 身份更新代码、安装依赖并同步远端脚本，最后统一启动服务。新版 executor 与 runner 使用带 `launch_id`、进程启动时钟和节点 boot ID 的控制协议，因此不能在仍有旧版任务运行时滚动混用，也不能只更新主节点而遗漏计算节点上的 `runner.py`：
 
 ```bash
+# 先阻止新任务进入 dispatching；在页面确认没有 starting/running/cancelling 任务后再继续。
+sudo systemctl stop nebulagrid-scheduler
+
+# 停止仍可能读写旧协议的 worker，避免升级时新旧 runner 混用。
+sudo systemctl stop nebulagrid-api nebulagrid-node-monitor nebulagrid-task-executor nebulagrid-runtime-guard nebulagrid-env-install-worker
+
 cd /home/ddltm/master
 git pull
 cd backend
 /home/ddltm/envs/miniconda3/bin/python -m pip install -e .
-sudo systemctl restart nebulagrid-api nebulagrid-scheduler nebulagrid-node-monitor nebulagrid-task-executor nebulagrid-runtime-guard nebulagrid-env-install-worker
+env $(cat /etc/nebulagrid/backend.env | xargs) \
+  /home/ddltm/envs/miniconda3/bin/python scripts/sync_remote_scripts.py
+sudo systemctl start nebulagrid-api nebulagrid-scheduler nebulagrid-node-monitor nebulagrid-task-executor nebulagrid-runtime-guard nebulagrid-env-install-worker
 sudo systemctl reload nginx
 ```
 
-如果代码来自 rsync/scp，重新同步后执行同样的 pip install 和 systemctl restart。
+如果计算节点不通过 NFS 读取同一个远端脚本目录，请把上述同步命令改为 `scripts/sync_remote_scripts.py --all-db-nodes`。如果代码来自 rsync/scp，重新同步后同样需要执行 pip install、远端脚本同步和 systemctl start。升级前无法排空的旧版运行任务不具备 `launch_id/process_start_time/boot_id`，新执行器会保守地拒绝猜测或误杀；请先在旧版本中结束这些任务，或由管理员按节点实际 PID 人工核查后再升级。特别是旧版本已经把 allocation 提前释放的孤儿进程，新恢复逻辑没有可信 launch 身份也没有数据库回收入口，必须按节点 `ps`、`nvidia-smi`、旧日志和任务记录人工清理，并在同一维护窗口核对任务终态与 allocation，不能只改其中一项。
 
 ## 21. 主账户部署模式总结
 
@@ -1345,17 +1371,23 @@ sudo smbclient //127.0.0.1/test1 -U test1
 
 ### 21.1 数据库状态与共享路径说明
 
-普通训练任务已经以 PostgreSQL 为单一状态源，不再依赖 API 进程内存。任务提交、批量提交、修改、挂起、删除、后继任务确认、中止、重新提交、日志路径、执行时间、结束时间、实际节点和实际 GPU 分配都会写入 `tasks`、`task_requirements`、`task_dependencies`、`task_allocations`、`task_events` 和 `task_runtime_guards`。
+普通训练任务已经以 PostgreSQL 为单一状态源，不再依赖 API 进程内存。任务提交、批量提交、修改、挂起、删除、后继任务确认、停止、重新提交、日志路径、执行时间、结束时间、实际节点和实际 GPU 分配都会写入 `tasks`、`task_requirements`、`task_dependencies`、`task_allocations`、`task_events` 和 `task_runtime_guards`。
 
-调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略选择资源。任务未指定节点时，候选节点按“用户自有节点 → 组内共享节点 → 组内他人公开共享的私有节点 → 其他公开节点”的顺序尝试；同一档内部按节点 ID 保持稳定顺序。只指定 GPU 型号时，系统只往所有可见候选节点中满足该型号的 GPU 上分配；只指定节点时，系统只在该节点内选择任意可调度 GPU；两者同时指定时，系统只在指定节点内选择指定型号的 GPU。用户未指定 GPU 型号时，调度器只排除兼容状态为“不支持”的 GPU，原生支持、同主版本兼容和信息未知的 GPU 均按原有节点顺序及 GPU index 正常参与，不按兼容等级重排；若候选中只剩不支持 GPU，任务保持等待。用户显式勾选型号视为强制选择，调度器完全忽略兼容状态并保持原有型号约束。每轮调度最多成功分配一个任务，并在下一轮开始时清理终态任务的未释放 allocation，避免同一张独占 GPU 在同一轮内被重复占用。调度器只持有单实例哨兵行锁，不再批量锁住等待任务行，因此用户修改等待任务和前端刷新任务列表不会被一次调度扫描长时间阻塞。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会写入 PID/PGID 元数据和状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径或任务日志可能在计算节点上不可见。
+调度器按紧急任务、优先级、提交时间、前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略选择资源。任务未指定节点时，候选节点按“用户自有节点 → 组内共享节点 → 组内他人公开共享的私有节点 → 其他公开节点”的顺序尝试；同一档内部按节点 ID 保持稳定顺序。只指定 GPU 型号时，系统只往所有可见候选节点中满足该型号的 GPU 上分配；只指定节点时，系统只在该节点内选择任意可调度 GPU；两者同时指定时，系统只在指定节点内选择指定型号的 GPU。用户未指定 GPU 型号时，调度器只排除兼容状态为“不支持”的 GPU，原生支持、同主版本兼容和信息未知的 GPU 均按原有节点顺序及 GPU index 正常参与，不按兼容等级重排；若候选中只剩不支持 GPU，任务保持等待。用户显式勾选型号视为强制选择，调度器完全忽略兼容状态并保持原有型号约束。每轮调度最多成功分配一个任务，并在下一轮开始时清理终态任务的未释放 allocation，避免同一张独占 GPU 在同一轮内被重复占用。调度器用条件状态迁移处理“等待 → 派发中”，用户同时点击停止时不会把已停止任务重新派发。执行器通过 SSH 调用 `/home/ddltm/envs/nebulagrid_remote/runner.py`，远端 runner 会按 allocation ID 写入启动代次、PID、PGID、`/proc` 启动时钟和原子状态文件。主节点和计算节点必须看到一致的 `/home/ddltm/data` 与 `/home/ddltm/envs` 路径，否则项目路径、环境路径、取消标记或任务日志可能在计算节点上不可见。
 
-管理员后台的“强制下线”会立即把目标节点标记为 `offline` 并关闭调度。对于该节点上仍持有未释放 allocation 的运行任务，后端会按远端进程组执行 TERM/KILL、把任务置为 `cancelled`，并释放该节点所有未释放 GPU 调度占用；审计日志会记录受影响任务和释放数量。
+运行任务采用两阶段停止：用户点击“停止”后，数据库状态先变为 `cancelling`（页面显示“停止中”），任务仍留在执行区并保留 allocation；执行器为本次 allocation 写取消标记，读取明确返回码，或按 PID/PGID 发送 TERM/KILL，再核对 PID 启动时钟、节点 boot ID 和非僵尸进程是否消失。只有同一次启动的 runner 回执 `process_stopped=true`，或远端存活检查确认进程组已经退出后，状态才变为 `cancelled`（页面显示“已停止”）、写入结束时间并移入历史区。SSH 超时、节点不可达、控制文件损坏或缺少可验证 PID 时，任务继续保持“停止中”并保留资源，下一轮重试，不能把连接超时当作停止成功；若该状态持续超过 `NEBULAGRID_CANCELLING_TIMEOUT_SECONDS`，系统会释放 allocation 并以 `unknown`（页面显示“状态未知”）归档，同时记录节点仍可能有残留进程，必须人工核查。
+
+远端启动或状态读取失败且没有明确返回码时，也先进入相同的停止确认流程；确认潜在进程退出后再以节点/远端执行异常归档。若远端 runner 在尚未写出运行元数据前以明确的非 SSH 返回码失败，系统可直接按 `failed` 归档；若状态文件已经给出本次 allocation 的 `return_code`，则以返回码直接结束：`0` 为完成，非 `0` 为失败，不再额外进入停止流程。每次重新调度都会使用新的 allocation ID；缺少 ID 或属于旧启动代次的 runtime/status 文件不会结束当前任务。
+
+管理员后台的“强制下线”会在短事务中把目标节点标记为 `offline`、关闭调度，并把仍持有 allocation 的运行任务置为 `cancelling`；事务提交后写取消标记，由 executor 读取返回码或按经验证的远端进程组执行 TERM/KILL。确认进程退出的任务会变为 `cancelled` 并释放 allocation。SSH 失败、PID 元数据不完整或存活检查未通过的任务会在停止确认上限内保持 `cancelling` 和原调度占用；若到期仍无法确认，则以 `unknown` 归档、释放 allocation，并保留人工核查告警；审计日志会记录待确认任务和安全释放数量。
 强制下线后的节点不会继续被节点监控 worker 自动 SSH 探测，也不会自动恢复为 `online`；维护完成后需要在节点管理里点击“重连”，新的长连接收到监控 JSON 后才会重新上线。
 如果 SSH 连接没有断开但远端脚本长时间没有输出有效 JSON，节点监控 watchdog 会按 `monitor.watchdog_timeout_seconds` 把节点先置为 `offline`，再走同一套自动重连流程。
 
 任务日志默认位于 `/home/ddltm/data/logs/task_logs/<task_id>.log`；历史区默认加载最近 100 条可见任务，用户点击“查看所有历史任务”后才会加载全部可见历史任务，避免长时间运行后一次性拉取过多记录。
 
-Runtime Guard 已经以 `task_runtime_guards` 为入口追踪运行任务。执行器启动远端 runner 后会记录 root PID 和进程组，守护进程通过 SSH 展开 PID 树，再读取 `nvidia-smi --query-compute-apps` 返回的 GPU UUID。GPU UUID 是越权判断依据，GPU index 只用于页面展示和 `CUDA_VISIBLE_DEVICES`。连续两轮发现任务使用未分配 GPU 后，系统会终止远端进程组、标记 `alloc_error`、释放 allocation，并把原因写入任务日志和 `task_events`。
+Runtime Guard 已经以 `task_runtime_guards` 为入口追踪运行任务。执行器启动远端 runner 后会记录 root PID 和进程组，守护进程先核对当前 allocation、`launch_id`、PID、PGID、`/proc` 启动时钟和节点 boot ID，再通过 SSH 展开 PID 树并读取 `nvidia-smi --query-compute-apps` 返回的 GPU UUID。GPU UUID 是越权判断依据，GPU index 只用于页面展示和 `CUDA_VISIBLE_DEVICES`。连续两轮发现任务使用未分配 GPU 后，任务先进入“停止中”并保留 allocation；执行器确认远端进程退出后才标记 `alloc_error`、释放 allocation，并把原因写入任务日志和 `task_events`。身份校验或 SSH 失败只会延后检查，不能据此停止或归档任务。
+
+当前 PID/PGID、启动时钟和 boot ID 只用于防止陈旧控制文件或 PID 复用造成误杀，前提是远端 runner、共享 runtime 目录和任务命令彼此可信。现有部署让 runner 与任务命令同为 `ddltm` 账户时，任务可写入的共享目录不能视为抗恶意篡改的安全边界；若需要防御不可信工作负载，应让控制文件和每次 launch 的 cgroup/systemd scope 由独立特权 agent 管理，并将任务置于不同 UID 或容器中。用户程序主动 `setsid` 或双重 fork 脱离 runner 进程组时，也需要该类 cgroup/scope 才能完整回收。
 
 环境包安装已经进入 `env_install_jobs` 队列。本机 conda/pip 离线安装、上传包安装和 compile 安装都会持久化安装命令、工作目录、日志路径、目标节点、主节点标记、GPU 可见模式和可见 GPU index。API 创建作业后会启动后台线程领取执行，生产部署仍建议同时运行 `nebulagrid-env-install-worker` 作为独立环境安装 worker；数据库作业状态会避免同一作业重复执行。安装作业日志继续复用 `/home/ddltm/data/logs/env_install_logs/env-<env_id>-<env_name>.log`，因此该路径同样必须在主节点和计算节点保持一致。
 
@@ -1453,6 +1485,8 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 - PostgreSQL 中能看到 `file_jobs` 表；打包/解压后 `/api/files/jobs/latest` 能返回最近任务状态。
 - PostgreSQL 中能看到 `envs` 表；环境导入、复制、检测和删除后状态与真实目录一致。
 - PostgreSQL 中能看到 `tasks`、`task_allocations`、`task_events`、`task_runtime_guards` 和 `env_install_jobs` 表；任务提交、调度、日志读取和环境安装作业状态都能落库。
+- 在运行任务上点击“停止”，确认它先在执行区显示“停止中”且 allocation 未释放；远端进程组消失后才在历史区显示“已停止”。断开节点 SSH 后重复该测试，任务应在 `NEBULAGRID_CANCELLING_TIMEOUT_SECONDS` 内保持“停止中”并自动重试；达到上限后应在历史区显示“状态未知”、释放 allocation 并留下人工核查告警。
+- 构造一个返回非零码的短任务，确认状态文件给出明确 `return_code` 后直接显示“失败”；再放置一个旧 allocation ID 的 status 文件，确认它不会结束当前任务。
 - `/home/ddltm/data/logs/env_install_logs/` 中能看到单环境 JSON Lines 日志文件，数据库 `env_operation_logs` 中能看到同源结构化日志。
 - 用户通过 Samba 上传到 `/home/ddltm/data/user/<user_name>` 的新文件 owner 为 `ddltm`，`sudo -u ddltm test -w <uploaded-file>` 返回可写，说明 Samba 上传文件已经和主账户维护模型一致。
 - InfluxDB 中能查询到 `node_metrics` / `gpu_metrics` 监控点。
@@ -1462,9 +1496,9 @@ grep -R "/home/.*/envs/<env_name>" /home/ddltm/envs/miniconda3/envs/<env_name> 2
 
 当前代码适合部署后开始真实机器联调。以下能力还需要继续开发完善：
 
-- 任务服务已切换到数据库 CRUD，并支持任务可见性、批量提交、修改、挂起、删除后继确认、中止、重新提交、日志读取和历史区默认 100 条加载。
+- 任务服务已切换到数据库 CRUD，并支持任务可见性、批量提交、修改、挂起、删除后继确认、停止、重新提交、日志读取和历史区默认 100 条加载。
 - 调度器已执行真实 GPU 选择和 allocation 事务：紧急任务优先，校验前驱任务、节点可见性、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略，并写入任务事件与运行时守护记录。
-- 执行器已通过 SSH 调用远端 runner 启动任务，记录 PID/PGID、读取状态文件、归档返回码并释放 allocation；仍需在真实节点验证 SSH key、NFS 路径、conda 激活和中止回收。
+- 执行器已通过 SSH 调用远端 runner 启动任务，记录启动代次、PID/PGID 与进程启动时钟，按明确返回码归档，并以“停止中 → 已停止”的确认流程释放 allocation；停止确认超过可配置上限会以“状态未知”归档并释放 allocation，但不表示远端已停止。仍需在真实节点验证 SSH key、NFS 一致性、conda 冷启动以及 TERM/KILL 后的进程组回收。当前回收边界是 runner 创建的独立进程组；如果用户程序主动 `setsid`、双重 fork 脱离该组，需后续引入每 launch 独立 cgroup/systemd scope 才能做到内核级完整回收。
 - runtime guard 已按远端 PID 树和 GPU UUID 检查实际 PID/GPU 使用并处理 `alloc_error`；仍需在真实多进程训练和节点异常场景下压测。
 - env install worker 已从 `env_install_jobs` 领取本机和 compile 安装作业，执行受控安装命令并写回返回码、包状态和环境日志；上传文件真实落盘、sha256 校验、运行中安装取消和资源隔离仍需继续完善。
 - Alembic 数据库迁移；当前初始化使用 ORM `create_all`，适合 MVP 部署和测试。

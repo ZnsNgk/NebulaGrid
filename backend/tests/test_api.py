@@ -1,6 +1,8 @@
 from datetime import timedelta
+import json
 from pathlib import Path
 import stat
+import subprocess
 import time
 from types import SimpleNamespace
 from uuid import uuid4
@@ -9,15 +11,16 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.time_utils import local_datetime
 from app.services.dashboard_service import count_available_gpus
 from app.services.auth_service import hash_session_token
 from app.services.gpu_compatibility_service import pytorch_gpu_compatibility
 from app.services.metrics_service import LatestMetrics, parse_flux_csv
-from app.db.models import Env, Gpu, LoginSession, Node, Setting, Task, TaskAllocation, TaskRuntimeGuard, User
+from app.db.models import Env, Gpu, LoginSession, Node, Setting, Task, TaskAllocation, TaskEvent, TaskRuntimeGuard, User
 from app.db.session import SessionLocal
 from app.main import create_app
+from app.remote import runner as remote_runner
 from app.workers.node_monitor import (
     MonitorWatchdogTimeout,
     NodeMonitorTarget,
@@ -32,12 +35,111 @@ from app.workers.node_monitor import (
     sync_gpu_inventory,
 )
 from app.workers.runtime_guard import expand_pid_tree, parse_gpu_apps, parse_process_table
-from app.workers.scheduler import scheduler_interval_seconds, scheduler_tick, select_gpu_allocation
+from app.workers.scheduler import release_terminal_allocations, scheduler_interval_seconds, scheduler_tick, select_gpu_allocation
+from app.workers import runtime_guard, task_executor
 
 
 def make_client() -> TestClient:
     """创建隔离的测试客户端，避免测试直接复用全局 app 状态。"""
     return TestClient(create_app())
+
+
+def create_remote_task_fixture(
+    client: TestClient,
+    headers: dict[str, str],
+    tmp_path: Path,
+    *,
+    state: str = "running",
+    root_pid: int | None = 4321,
+) -> tuple[str, int]:
+    """创建带开放 allocation 和 guard 的任务，供停止状态机测试复用且不访问真实节点。"""
+    suffix = uuid4().hex[:8]
+    node_response = client.post(
+        "/api/admin/nodes",
+        headers=headers,
+        json={"name": f"node-task-stop-{suffix}", "ip": "10.254.0.10", "gpu_schedulable_flags": [1]},
+    )
+    assert node_response.status_code == 200
+    node_id = node_response.json()["data"]["id"]
+    task_response = client.post(
+        "/api/tasks",
+        headers=headers,
+        json={
+            "description": f"task-stop-{suffix}",
+            "workdir": "/",
+            "command": "python train.py",
+            "requirement": {"need_gpus": 0, "node_id": node_id},
+        },
+    )
+    assert task_response.status_code == 200
+    task_id = task_response.json()["data"]["task_id"]
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task.state = state
+        task.started_at = local_datetime() if state == "running" else None
+        task.log_path = str(tmp_path / "logs" / f"{task_id}.log")
+        allocation = TaskAllocation(
+            task_id=task.id,
+            node_id=node_id,
+            gpu_ids=[],
+            cpu_allocated=1,
+            allocation_mode="cpu",
+        )
+        db.add(allocation)
+        db.flush()
+        db.add(
+            TaskRuntimeGuard(
+                task_id=task.id,
+                node_id=node_id,
+                root_pid=root_pid,
+                process_group_id=root_pid,
+                allocated_gpu_ids=[],
+                state=state,
+            )
+        )
+        db.commit()
+        return task_id, allocation.id
+
+
+def isolated_executor_settings(tmp_path: Path) -> Settings:
+    """让 executor 控制文件和日志落在测试临时目录，避免依赖部署机的 NFS 路径。"""
+    return Settings(
+        runtime_root=str(tmp_path / "runtime"),
+        task_log_root=str(tmp_path / "logs"),
+    )
+
+
+def write_runtime_identity(
+    settings: Settings,
+    task_id: str,
+    allocation_id: int,
+    *,
+    launch_id: int | None = None,
+    pid: int = 4321,
+    pgid: int = 4321,
+    process_start_time: int = 987654,
+    boot_id: str = "test-node-boot-id",
+) -> Path:
+    """写入可校验的进程身份；测试可覆盖匹配或旧 launch 元数据两种边界。"""
+    runtime_path = Path(task_executor.runtime_metadata_path(settings, task_id))
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "launch_id": allocation_id if launch_id is None else launch_id,
+                "state": "running",
+                "pid": pid,
+                "pgid": pgid,
+                "process_start_time": process_start_time,
+                "boot_id": boot_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return runtime_path
 
 
 def test_health_check_returns_ok() -> None:
@@ -205,6 +307,1146 @@ def test_task_lifecycle_smoke() -> None:
     assert detail_response.json()["data"]["task_id"] == task_id
     assert cancel_response.json()["data"]["state"] == "cancelled"
     assert task_id in log_response.text
+
+
+def test_running_task_cancel_is_idempotent_and_keeps_allocation(monkeypatch, tmp_path: Path) -> None:
+    """运行任务重复停止时保持 stopping 语义，确认前不能填写结束时间或释放 allocation。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+    marker_calls: list[tuple[str, int | None]] = []
+
+    def fake_write_cancel_marker(target_task_id: str, launch_id: int | None) -> bool:
+        """标记写入发生时，另一会话必须已经能看到已提交的 cancelling 状态。"""
+        with SessionLocal() as verify_db:
+            persisted = verify_db.scalar(select(Task).where(Task.task_id == target_task_id))
+            assert persisted is not None
+            assert persisted.state == "cancelling"
+        marker_calls.append((target_task_id, launch_id))
+        return True
+
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", fake_write_cancel_marker)
+
+    first_response = client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+    running_items = client.get(
+        f"/api/tasks?state=running&search={task_id}&page_size=20",
+        headers=headers,
+    ).json()["data"]["items"]
+    history_items = client.get(
+        f"/api/tasks?state=history&search={task_id}&page_size=20",
+        headers=headers,
+    ).json()["data"]["items"]
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+        event_types_before_retry = db.scalars(
+            select(TaskEvent.event_type).where(TaskEvent.task_id == task.id)
+        ).all() if task else []
+
+    second_response = client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+
+    with SessionLocal() as db:
+        task_after_retry = db.scalar(select(Task).where(Task.task_id == task_id))
+        event_types_after_retry = db.scalars(
+            select(TaskEvent.event_type).where(TaskEvent.task_id == task_after_retry.id)
+        ).all() if task_after_retry else []
+
+    assert first_response.status_code == 200
+    assert first_response.json()["data"]["state"] == "cancelling"
+    assert first_response.json()["data"]["finished_at"] is None
+    assert second_response.status_code == 200
+    assert second_response.json()["data"]["state"] == "cancelling"
+    assert task is not None
+    assert task.state == "cancelling"
+    assert task.finished_at is None
+    assert allocation is not None
+    assert allocation.released_at is None
+    assert guard is not None
+    assert guard.state == "cancelling"
+
+    assert [item["task_id"] for item in running_items] == [task_id]
+    assert history_items == []
+    assert event_types_before_retry.count("cancelling") == 1
+    assert event_types_after_retry.count("cancelling") == 1
+    assert marker_calls == [(task_id, allocation_id)]
+
+
+def test_overlapping_allocations_never_release_after_single_launch_confirmation(monkeypatch, tmp_path: Path) -> None:
+    """异常重叠 launch 无法由单一 task 控制文件逐一证明退出，必须保留全部占用等待人工核查。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, first_allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        first_allocation = db.get(TaskAllocation, first_allocation_id)
+        assert task is not None and first_allocation is not None
+        second_allocation = TaskAllocation(
+            task_id=task.id,
+            node_id=first_allocation.node_id,
+            gpu_ids=[],
+            cpu_allocated=1,
+            allocation_mode="cpu",
+        )
+        db.add(second_allocation)
+        db.commit()
+        second_allocation_id = second_allocation.id
+
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", lambda *_: True)
+    response = client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["data"]["state"] == "cancelling"
+
+    monkeypatch.setattr(
+        task_executor.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("overlapping launches must not be killed")),
+    )
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, isolated_executor_settings(tmp_path))
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocations = db.scalars(
+            select(TaskAllocation)
+            .where(TaskAllocation.id.in_((first_allocation_id, second_allocation_id)))
+            .order_by(TaskAllocation.id)
+        ).all()
+    assert task is not None and task.state == "cancelling"
+    assert "重叠 allocation" in task.last_block_reason
+    assert len(allocations) == 2
+    assert all(allocation.released_at is None for allocation in allocations)
+
+
+def test_explicit_return_code_finishes_cancelling_task_without_stop(monkeypatch, tmp_path: Path) -> None:
+    """远端已有明确非零返回码时直接按失败归档，不再发送可能误杀新进程的停止命令。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", lambda *_: True)
+    cancel_response = client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+    assert cancel_response.json()["data"]["state"] == "cancelling"
+
+    settings = isolated_executor_settings(tmp_path)
+    status_path = Path(task_executor.runtime_status_path(settings, task_id))
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps({"launch_id": allocation_id, "state": "finished", "return_code": 17}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+
+    def unexpected_stop(*_args, **_kwargs):
+        """明确返回码必须优先完成任务，若进入终止分支则测试直接失败。"""
+        raise AssertionError("stop_remote_process must not run after an explicit return code")
+
+    monkeypatch.setattr(task_executor, "stop_remote_process", unexpected_stop)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+
+    assert task is not None
+    assert task.state == "failed"
+    assert task.return_code == 17
+    assert task.finished_at is not None
+    assert allocation is not None
+    assert allocation.released_at is not None
+    assert guard is not None
+    assert guard.state == "failed"
+
+
+@pytest.mark.parametrize(("return_code", "expected_state"), [(0, "succeeded"), (17, "failed")])
+def test_return_code_written_during_stop_probe_wins_over_cancel(
+    return_code: int,
+    expected_state: str,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """进程组核查为空后必须复读状态，保留恰在停止窗口自然结束的真实返回码。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", lambda *_: True)
+    assert client.post(f"/api/tasks/{task_id}/cancel", headers=headers).status_code == 200
+
+    settings = isolated_executor_settings(tmp_path)
+    write_runtime_identity(settings, task_id, allocation_id)
+    final_status = json.dumps(
+        {
+            "task_id": task_id,
+            "launch_id": allocation_id,
+            "state": "finished",
+            "return_code": return_code,
+        }
+    )
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+    monkeypatch.setattr(task_executor, "stop_remote_process", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(task_executor, "read_remote_status", lambda *_: final_status)
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None and task.state == expected_state
+    assert task.return_code == return_code
+    assert allocation is not None and allocation.released_at is not None
+
+
+def test_start_uses_explicit_return_code_from_runner_stdout_without_cleanup(monkeypatch, tmp_path: Path) -> None:
+    """NFS 状态视图尚未刷新时，runner stdout 中同 launch 的整数返回码也必须直接归档。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(
+        client,
+        headers,
+        tmp_path,
+        state="starting",
+        root_pid=None,
+    )
+    settings = isolated_executor_settings(tmp_path)
+    monkeypatch.setattr(task_executor, "resolve_user_visible_path", lambda *_: tmp_path)
+    monkeypatch.setattr(
+        task_executor,
+        "run_remote_runner",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "task_id": task_id,
+                "launch_id": allocation_id,
+                "state": "finished",
+                "return_code": 23,
+            }
+        ),
+    )
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.start_remote_task(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None and task.state == "failed"
+    assert task.return_code == 23
+    assert allocation is not None and allocation.released_at is not None
+
+
+def test_runner_argument_error_finishes_failed_without_cancelling(monkeypatch, tmp_path: Path) -> None:
+    """旧 runner 不认识新增参数时会在 Popen 前退出，任务应直接归档为失败。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(
+        client,
+        headers,
+        tmp_path,
+        state="starting",
+        root_pid=None,
+    )
+    settings = isolated_executor_settings(tmp_path)
+    monkeypatch.setattr(task_executor, "resolve_user_visible_path", lambda *_: tmp_path)
+
+    def raise_runner_argument_error(*_args, **_kwargs):
+        """模拟远端 argparse 直接返回 2；此时 runner 尚未创建用户进程。"""
+        raise subprocess.CalledProcessError(
+            returncode=2,
+            cmd="ssh",
+            output="usage: runner.py [-h]\\nrunner.py: error: unrecognized arguments: --cancel-path /tmp/cancel.json",
+        )
+
+    monkeypatch.setattr(task_executor, "run_remote_runner", raise_runner_argument_error)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.start_remote_task(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+
+    assert task is not None
+    assert task.state == "failed"
+    assert task.return_code == 2
+    assert task.finished_at is not None
+    assert allocation is not None and allocation.released_at is not None
+    assert guard is not None and guard.state == "failed"
+
+
+def test_cancelling_timeout_forces_unknown_history_and_releases_allocations(monkeypatch, tmp_path: Path) -> None:
+    """停止回执超时后必须释放占用并显式标记 unknown，而不是误报已停止。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path, state="cancelling")
+    settings = Settings(
+        runtime_root=str(tmp_path / "runtime"),
+        task_log_root=str(tmp_path / "logs"),
+        cancelling_timeout_seconds=30,
+    )
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        db.add(
+            TaskEvent(
+                task_id=task.id,
+                event_type="cancelling",
+                message="测试停止中超时锚点",
+                created_at=local_datetime() - timedelta(seconds=31),
+            )
+        )
+        db.commit()
+
+    monkeypatch.setattr(
+        task_executor.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("超时归档不应再发起 SSH")),
+    )
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+        assert task is not None
+        event_types = db.scalars(select(TaskEvent.event_type).where(TaskEvent.task_id == task.id)).all()
+
+    assert task.state == "unknown"
+    assert task.finished_at is not None
+    assert task.return_code is None
+    assert "30 秒" in task.last_block_reason
+    assert allocation is not None and allocation.released_at is not None
+    assert guard is not None and guard.state == "unknown"
+    assert "unknown" in event_types
+
+
+def test_start_timeout_stays_cancelling_until_runner_confirms_failure(monkeypatch, tmp_path: Path) -> None:
+    """SSH 启动超时只表示结果未知，必须先进入停止追踪并继续保留调度资源。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(
+        client,
+        headers,
+        tmp_path,
+        state="starting",
+        root_pid=None,
+    )
+    settings = isolated_executor_settings(tmp_path)
+    monkeypatch.setattr(task_executor, "resolve_user_visible_path", lambda *_: tmp_path)
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+
+    def raise_start_timeout(*_args, **_kwargs):
+        """模拟 SSH 等待 runner 启动回执超时，而不是远端明确返回失败。"""
+        raise subprocess.TimeoutExpired(cmd="ssh", timeout=settings.task_start_timeout_seconds)
+
+    monkeypatch.setattr(task_executor, "run_remote_runner", raise_start_timeout)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.start_remote_task(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+
+    assert task is not None
+    assert task.state == "cancelling"
+    assert task.finished_at is None
+    assert task.return_code is None
+    assert allocation is not None
+    assert allocation.released_at is None
+    assert guard is not None
+    assert guard.state == "cancelling"
+
+    status_path = Path(task_executor.runtime_status_path(settings, task_id))
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "launch_id": allocation_id,
+                "state": "launch_failed",
+                "return_code": None,
+                "process_stopped": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None
+    assert task.state == "failed"
+    assert task.finished_at is not None
+    assert allocation is not None
+    assert allocation.released_at is not None
+
+
+def test_start_timeout_recovers_late_runtime_and_stops_process_group(monkeypatch, tmp_path: Path) -> None:
+    """复现低带宽事故：启动 SSH 超时后 PID 元数据迟到，executor 仍须回收原进程组再归档。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(
+        client,
+        headers,
+        tmp_path,
+        state="starting",
+        root_pid=None,
+    )
+    settings = isolated_executor_settings(tmp_path)
+    monkeypatch.setattr(task_executor, "resolve_user_visible_path", lambda *_: tmp_path)
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+
+    def raise_start_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="ssh", timeout=settings.task_start_timeout_seconds)
+
+    monkeypatch.setattr(task_executor, "run_remote_runner", raise_start_timeout)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.start_remote_task(db, task, settings)
+        db.commit()
+
+    # SSH 客户端虽然超时，远端 runner 仍可能稍后完成 Popen 并写出本次 launch 的身份。
+    write_runtime_identity(settings, task_id, allocation_id)
+    ssh_commands: list[list[str]] = []
+
+    def confirm_stop(command, text=True, stderr=None, timeout=None):
+        ssh_commands.append(list(command))
+        if "probe_group()" in command[-1]:
+            return "NebulaGrid stop verification succeeded\n"
+        return ""
+
+    monkeypatch.setattr(task_executor.subprocess, "check_output", confirm_stop)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+
+    termination_commands = [command[-1] for command in ssh_commands if "probe_group()" in command[-1]]
+    assert len(termination_commands) == 1
+    assert "expected_boot=test-node-boot-id" in termination_commands[0]
+    assert 'kill -TERM -"$pgid"' in termination_commands[0]
+    assert task is not None and task.state == "offline_error"
+    assert task.finished_at is not None
+    assert allocation is not None and allocation.released_at is not None
+
+
+def test_remote_runner_uses_configured_connection_and_start_timeouts(monkeypatch, tmp_path: Path) -> None:
+    """启动命令分别使用可配置的 SSH 建连超时和更长的 runner 回执等待时间。"""
+    settings = Settings(
+        runtime_root=str(tmp_path / "runtime"),
+        ssh_connect_timeout_seconds=23,
+        task_start_timeout_seconds=137,
+        ssh_operation_timeout_seconds=41,
+    )
+    observed: dict[str, object] = {}
+
+    def fake_check_output(command, text=True, stderr=None, timeout=None):
+        """捕获 subprocess 边界参数，不建立真实 SSH 连接。"""
+        observed["command"] = command
+        observed["timeout"] = timeout
+        return json.dumps(
+            {
+                "task_id": "TASK-TIMEOUT",
+                "launch_id": 19,
+                "state": "running",
+                "pid": 4321,
+                "pgid": 4321,
+                "process_start_time": 987654,
+                "boot_id": "test-node-boot-id",
+            }
+        )
+
+    monkeypatch.setattr(task_executor.subprocess, "check_output", fake_check_output)
+    output = task_executor.run_remote_runner(
+        SimpleNamespace(ssh_user="tester", ip="10.254.0.11"),
+        settings,
+        task_id="TASK-TIMEOUT",
+        launch_id=19,
+        workdir="/tmp",
+        command="python train.py",
+        log_path=str(tmp_path / "task.log"),
+        runtime_path=str(tmp_path / "runtime.json"),
+        status_path=str(tmp_path / "status.json"),
+        cancel_path=str(tmp_path / "cancel.json"),
+        cuda_visible_devices="0",
+    )
+
+    assert json.loads(output)["launch_id"] == 19
+    assert "ConnectTimeout=23" in observed["command"]
+    assert observed["timeout"] == 137
+
+    task_executor.read_remote_status(
+        SimpleNamespace(ssh_user="tester", ip="10.254.0.11"),
+        settings,
+        str(tmp_path / "status.json"),
+    )
+    assert "ConnectTimeout=23" in observed["command"]
+    assert observed["timeout"] == 41
+
+
+def test_stop_failure_retries_then_confirms_cancelled(monkeypatch, tmp_path: Path) -> None:
+    """停止 SSH 失败时保留 stopping/allocation，下一轮通过存活检查后才进入 cancelled。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", lambda *_: True)
+    cancel_response = client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+    assert cancel_response.json()["data"]["state"] == "cancelling"
+
+    settings = isolated_executor_settings(tmp_path)
+    # 新的安全停止协议只有在 launch、PID 和 /proc 启动时钟均匹配时才允许发出 kill。
+    write_runtime_identity(settings, task_id, allocation_id)
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+    stop_attempts = 0
+
+    def stop_fails_once(command, text=True, stderr=None, timeout=None):
+        """第一次模拟网络失败，第二次模拟远端脚本已确认进程组不存在。"""
+        nonlocal stop_attempts
+        if "expected_start=" not in command[-1]:
+            # 停止成功后 executor 会复读同 launch 状态；此处模拟没有自然退出返回码。
+            return ""
+        stop_attempts += 1
+        if stop_attempts == 1:
+            raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
+        return "NebulaGrid stop verification succeeded\n"
+
+    monkeypatch.setattr(task_executor.subprocess, "check_output", stop_fails_once)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task_after_failure = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation_after_failure = db.get(TaskAllocation, allocation_id)
+        guard_after_failure = db.scalar(
+            select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task_after_failure.id)
+        ) if task_after_failure else None
+        assert task_after_failure is not None
+        assert task_after_failure.state == "cancelling"
+        assert task_after_failure.finished_at is None
+        assert allocation_after_failure is not None
+        assert allocation_after_failure.released_at is None
+        assert guard_after_failure is not None
+        assert guard_after_failure.state == "cancel_failed"
+
+        task_executor.collect_remote_status(db, task_after_failure, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task_after_success = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation_after_success = db.get(TaskAllocation, allocation_id)
+        guard_after_success = db.scalar(
+            select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task_after_success.id)
+        ) if task_after_success else None
+
+    assert stop_attempts == 2
+    assert task_after_success is not None
+    assert task_after_success.state == "cancelled"
+    assert task_after_success.finished_at is not None
+    assert allocation_after_success is not None
+    assert allocation_after_success.released_at is not None
+    assert guard_after_success is not None
+    assert guard_after_success.state == "cancelled"
+
+    running_items = client.get(
+        f"/api/tasks?state=running&search={task_id}&page_size=20",
+        headers=headers,
+    ).json()["data"]["items"]
+    history_items = client.get(
+        f"/api/tasks?state=history&search={task_id}&page_size=20",
+        headers=headers,
+    ).json()["data"]["items"]
+    assert running_items == []
+    assert [item["task_id"] for item in history_items] == [task_id]
+
+
+def test_stale_launch_status_cannot_finish_current_cancelling_task(monkeypatch, tmp_path: Path) -> None:
+    """旧 allocation 的完成文件即使包含成功返回码，也不能结束或释放当前 launch。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path, root_pid=None)
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", lambda *_: True)
+    cancel_response = client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+    assert cancel_response.json()["data"]["state"] == "cancelling"
+
+    settings = isolated_executor_settings(tmp_path)
+    stale_status = json.dumps(
+        {"launch_id": allocation_id + 1000, "state": "finished", "return_code": 0},
+    )
+    status_path = Path(task_executor.runtime_status_path(settings, task_id))
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(stale_status, encoding="utf-8")
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: False)
+    monkeypatch.setattr(task_executor, "read_remote_status", lambda *_: stale_status)
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+
+    assert task is not None
+    assert task.state == "cancelling"
+    assert task.return_code is None
+    assert task.finished_at is None
+    assert allocation is not None
+    assert allocation.released_at is None
+    assert guard is not None
+    assert guard.state == "cancel_failed"
+
+
+def test_missing_runtime_and_status_never_prove_remote_process_stopped(monkeypatch, tmp_path: Path) -> None:
+    """即使停止标记可写，控制文件缺失也不能把有历史 PID 的运行任务提前归档。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", lambda *_: True)
+    assert client.post(f"/api/tasks/{task_id}/cancel", headers=headers).json()["data"]["state"] == "cancelling"
+
+    settings = isolated_executor_settings(tmp_path)
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+    monkeypatch.setattr(task_executor, "read_remote_status", lambda *_: "")
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None
+    assert task.state == "cancelling"
+    assert task.finished_at is None
+    assert allocation is not None
+    assert allocation.released_at is None
+
+
+def test_runner_return_cannot_revive_a_concurrently_cancelled_task(monkeypatch, tmp_path: Path) -> None:
+    """SSH 回执到达前已提交的 cancelling 必须保留，同时把 PID 写入 guard 供下一轮安全回收。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path, state="starting", root_pid=None)
+    settings = isolated_executor_settings(tmp_path)
+    monkeypatch.setattr(task_executor, "resolve_user_visible_path", lambda *_: tmp_path)
+
+    def finish_ssh_after_concurrent_cancel(*_args, **_kwargs):
+        with SessionLocal() as concurrent_db:
+            concurrent_task = concurrent_db.scalar(select(Task).where(Task.task_id == task_id))
+            assert concurrent_task is not None
+            concurrent_task.state = "cancelling"
+            concurrent_task.finished_at = None
+            concurrent_task.last_block_reason = "用户已请求停止，正在确认远端进程退出"
+            concurrent_guard = concurrent_db.scalar(
+                select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == concurrent_task.id)
+            )
+            assert concurrent_guard is not None
+            concurrent_guard.state = "cancelling"
+            concurrent_db.commit()
+        return json.dumps(
+            {
+                "task_id": task_id,
+                "launch_id": allocation_id,
+                "state": "running",
+                "pid": 4321,
+                "pgid": 4321,
+                "process_start_time": 987654,
+                "boot_id": "test-node-boot-id",
+            }
+        )
+
+    monkeypatch.setattr(task_executor, "run_remote_runner", finish_ssh_after_concurrent_cancel)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.start_remote_task(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+    assert task is not None
+    assert task.state == "cancelling"
+    assert allocation is not None and allocation.released_at is None
+    assert guard is not None
+    assert guard.root_pid == 4321
+    assert guard.process_group_id == 4321
+    assert guard.state == "cancelling"
+
+
+def test_remote_runner_honors_cancel_before_popen(monkeypatch, tmp_path: Path, capsys) -> None:
+    """Popen 前看到同 launch 停止标记时写明确停止回执，绝不能创建用户进程。"""
+    args = SimpleNamespace(
+        workdir=str(tmp_path),
+        command="python train.py",
+        log_path=str(tmp_path / "task.log"),
+        runtime_path=str(tmp_path / "task.json"),
+        status_path=str(tmp_path / "task.status.json"),
+        cancel_path=str(tmp_path / "task.cancel.json"),
+        task_id="TASK-RUNNER-PRE-CANCEL",
+        launch_id=41,
+        cuda_visible_devices="0",
+    )
+    monkeypatch.setattr(remote_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(remote_runner, "cancellation_requested", lambda *_: True)
+
+    def unexpected_popen(*_args, **_kwargs):
+        raise AssertionError("Popen must not run after a matching pre-launch cancel marker")
+
+    monkeypatch.setattr(remote_runner.subprocess, "Popen", unexpected_popen)
+    remote_runner.main()
+
+    status = json.loads(Path(args.status_path).read_text(encoding="utf-8"))
+    output = json.loads(capsys.readouterr().out.strip())
+    assert status["launch_id"] == 41
+    assert status["process_stopped"] is True
+    assert output["state"] == "cancelled"
+
+
+def test_remote_runner_preserves_explicit_return_code_during_post_popen_cancel(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """极短任务先写出的真实退出码优先于 Popen 后到达的停止标记，runner 不得覆盖 status。"""
+    args = SimpleNamespace(
+        workdir=str(tmp_path),
+        command="exit 9",
+        log_path=str(tmp_path / "task.log"),
+        runtime_path=str(tmp_path / "task.json"),
+        status_path=str(tmp_path / "task.status.json"),
+        cancel_path=str(tmp_path / "task.cancel.json"),
+        task_id="TASK-RUNNER-RC-RACE",
+        launch_id=42,
+        cuda_visible_devices="",
+    )
+
+    class FakeProcess:
+        pid = 4321
+
+    checks = 0
+
+    def cancellation_requested(_path, _launch_id):
+        nonlocal checks
+        checks += 1
+        if checks == 3:
+            Path(args.status_path).write_text(
+                json.dumps(
+                    {
+                        "task_id": args.task_id,
+                        "launch_id": args.launch_id,
+                        "state": "finished",
+                        "return_code": 9,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return True
+        return False
+
+    monkeypatch.setattr(remote_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(remote_runner, "cancellation_requested", cancellation_requested)
+    monkeypatch.setattr(remote_runner, "read_boot_id", lambda: "test-node-boot-id")
+    monkeypatch.setattr(remote_runner, "read_process_start_time", lambda *_: 987654)
+    monkeypatch.setattr(remote_runner.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(remote_runner.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(
+        remote_runner,
+        "terminate_process_group",
+        lambda *_: (_ for _ in ()).throw(AssertionError("completed task must not be killed")),
+    )
+    remote_runner.main()
+
+    status = json.loads(Path(args.status_path).read_text(encoding="utf-8"))
+    output = json.loads(capsys.readouterr().out.strip())
+    assert checks == 3
+    assert status["return_code"] == 9
+    assert output["return_code"] == 9
+
+
+def test_remote_runner_missing_start_time_fails_and_recovers_spawned_group(monkeypatch, tmp_path: Path, capsys) -> None:
+    """Popen 后读不到 /proc 启动时钟时不能返回 running，必须立即回收并写无返回码失败回执。"""
+    args = SimpleNamespace(
+        workdir=str(tmp_path),
+        command="python train.py",
+        log_path=str(tmp_path / "task.log"),
+        runtime_path=str(tmp_path / "task.json"),
+        status_path=str(tmp_path / "task.status.json"),
+        cancel_path=str(tmp_path / "task.cancel.json"),
+        task_id="TASK-RUNNER-NO-STARTTIME",
+        launch_id=43,
+        cuda_visible_devices="0",
+    )
+
+    class FakeProcess:
+        pid = 4321
+
+    recovered: list[int] = []
+    monkeypatch.setattr(remote_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(remote_runner, "cancellation_requested", lambda *_: False)
+    monkeypatch.setattr(remote_runner, "read_boot_id", lambda: "test-node-boot-id")
+    monkeypatch.setattr(remote_runner, "read_process_start_time", lambda *_: None)
+    monkeypatch.setattr(remote_runner.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(remote_runner.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(
+        remote_runner,
+        "terminate_process_group",
+        lambda process: recovered.append(process.pid) or True,
+    )
+
+    with pytest.raises(SystemExit):
+        remote_runner.main()
+
+    runtime = json.loads(Path(args.runtime_path).read_text(encoding="utf-8"))
+    output = json.loads(capsys.readouterr().out.strip())
+    assert recovered == [4321]
+    assert runtime["state"] == "launch_failed"
+    assert runtime["return_code"] is None
+    assert runtime["process_stopped"] is True
+    assert output["state"] == "launch_failed"
+    # Popen 后 status 归 wrapper 独占；runner 只写 runtime，避免覆盖并发落盘的明确用户返回码。
+    assert not Path(args.status_path).exists()
+
+
+def test_remote_runner_exception_preserves_existing_explicit_return_code(monkeypatch, tmp_path: Path, capsys) -> None:
+    """runner 启动后自身异常时，若 wrapper 已有明确返回码，不得再杀进程或覆盖 status。"""
+    args = SimpleNamespace(
+        workdir=str(tmp_path),
+        command="exit 31",
+        log_path=str(tmp_path / "task.log"),
+        runtime_path=str(tmp_path / "task.json"),
+        status_path=str(tmp_path / "task.status.json"),
+        cancel_path=str(tmp_path / "task.cancel.json"),
+        task_id="TASK-RUNNER-EXPLICIT-ON-ERROR",
+        launch_id=44,
+        cuda_visible_devices="",
+    )
+
+    class FakeProcess:
+        pid = 4322
+
+    def fail_after_wrapper_finished(_pid: int):
+        Path(args.status_path).write_text(
+            json.dumps(
+                {
+                    "task_id": args.task_id,
+                    "launch_id": args.launch_id,
+                    "state": "finished",
+                    "return_code": 31,
+                }
+            ),
+            encoding="utf-8",
+        )
+        raise OSError("simulated runner bookkeeping failure")
+
+    monkeypatch.setattr(remote_runner, "parse_args", lambda: args)
+    monkeypatch.setattr(remote_runner, "cancellation_requested", lambda *_: False)
+    monkeypatch.setattr(remote_runner, "read_boot_id", lambda: "test-node-boot-id")
+    monkeypatch.setattr(remote_runner, "read_process_start_time", fail_after_wrapper_finished)
+    monkeypatch.setattr(remote_runner.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(remote_runner.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(
+        remote_runner,
+        "terminate_process_group",
+        lambda *_: (_ for _ in ()).throw(AssertionError("explicit completion must not be killed")),
+    )
+
+    remote_runner.main()
+
+    status = json.loads(Path(args.status_path).read_text(encoding="utf-8"))
+    output = json.loads(capsys.readouterr().out.strip())
+    assert status["return_code"] == 31
+    assert output["return_code"] == 31
+
+
+def test_wrapper_infrastructure_failure_never_becomes_user_return_code(tmp_path: Path) -> None:
+    """wrapper 协议只在 process.wait 成功后写整数码，转发器异常必须写 null 并等待 executor 回收。"""
+    args = SimpleNamespace(
+        workdir=str(tmp_path),
+        command="python train.py",
+        log_path=str(tmp_path / "task.log"),
+        runtime_path=str(tmp_path / "task.json"),
+        status_path=str(tmp_path / "task.status.json"),
+        cancel_path=str(tmp_path / "task.cancel.json"),
+        task_id="TASK-WRAPPER-PROTOCOL",
+        launch_id=45,
+        cuda_visible_devices="0",
+    )
+    wrapper = remote_runner.build_wrapper(args)
+    assert '"state": "wrapper_failed"' in wrapper
+    assert '"return_code": None' in wrapper
+    assert "NEBULAGRID_RETURN_CODE" not in wrapper
+    assert 'if [ "$relay_code" -ne 0 ]' in wrapper
+    assert "wrapper relay failed before a user return code was recorded" in wrapper
+    assert "completed_return_code = process.poll()" in wrapper
+
+
+def test_wrapper_failure_enters_two_phase_cleanup_without_releasing_allocation(monkeypatch, tmp_path: Path) -> None:
+    """wrapper_failed 没有用户返回码时必须从 running 转为 stopping，而不是直接失败并释放资源。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+    settings = isolated_executor_settings(tmp_path)
+    failure_status = json.dumps(
+        {
+            "task_id": task_id,
+            "launch_id": allocation_id,
+            "state": "wrapper_failed",
+            "return_code": None,
+            "process_stopped": False,
+            "error": "simulated PTY relay failure",
+        }
+    )
+    monkeypatch.setattr(task_executor, "read_remote_status", lambda *_: failure_status)
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None and task.state == "cancelling"
+    assert task.return_code is None
+    assert task.finished_at is None
+    assert task.last_block_reason.startswith(task_executor.AUTO_STOP_REASON_PREFIX)
+    assert allocation is not None and allocation.released_at is None
+
+
+def test_runtime_guard_violation_uses_confirmed_two_phase_cleanup(monkeypatch, tmp_path: Path) -> None:
+    """GPU 越权只先写 stopping；executor 确认进程退出后才归档 alloc_error 并释放资源。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        assert task is not None and allocation is not None
+        node = db.get(Node, allocation.node_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+        assert node is not None and guard is not None
+        runtime_guard.begin_alloc_error_cleanup(
+            db,
+            task,
+            allocation,
+            node,
+            guard,
+            {"GPU-unexpected"},
+            {"GPU-allowed"},
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None and task.state == "cancelling"
+    assert task.last_block_reason.startswith("Runtime Guard 检测到任务使用未分配 GPU")
+    assert allocation is not None and allocation.released_at is None
+
+    settings = isolated_executor_settings(tmp_path)
+    write_runtime_identity(settings, task_id, allocation_id)
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+    monkeypatch.setattr(task_executor.subprocess, "check_output", lambda *_args, **_kwargs: "stop confirmed")
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None and task.state == "alloc_error"
+    assert task.finished_at is not None
+    assert allocation is not None and allocation.released_at is not None
+
+
+def test_runtime_guard_explicit_return_code_finishes_without_stop(monkeypatch, tmp_path: Path) -> None:
+    """越权清理期间若已有真实返回码，则保留 alloc_error 分类并直接完成，不再发送终止信号。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        assert task is not None and allocation is not None
+        node = db.get(Node, allocation.node_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+        assert node is not None and guard is not None
+        runtime_guard.begin_alloc_error_cleanup(db, task, allocation, node, guard, {"GPU-other"}, set())
+        db.commit()
+
+    settings = isolated_executor_settings(tmp_path)
+    status_path = Path(task_executor.runtime_status_path(settings, task_id))
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "launch_id": allocation_id,
+                "state": "finished",
+                "return_code": 12,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+    monkeypatch.setattr(
+        task_executor,
+        "stop_remote_process",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("explicit return code must win")),
+    )
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None and task.state == "alloc_error"
+    assert task.return_code == 12
+    assert allocation is not None and allocation.released_at is not None
+
+
+@pytest.mark.parametrize("legacy_state", ["cancelled", "alloc_error"])
+def test_legacy_terminal_with_open_allocation_is_restored_for_confirmation(
+    legacy_state: str,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """旧版取消/越权终态即使 guard 同名，也必须因开放 allocation 恢复到 stopping。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(
+        client,
+        headers,
+        tmp_path,
+        state=legacy_state,
+        root_pid=None,
+    )
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+        assert guard is not None
+        # 保留旧版可能已经写下的 cancelled/alloc_error，证明新逻辑不把它误当作可靠退出回执。
+        guard.state = legacy_state
+        assert release_terminal_allocations(db) == 0
+        db.commit()
+
+    resubmit_response = client.post(f"/api/tasks/{task_id}/resubmit", headers=headers)
+    assert resubmit_response.status_code == 422
+
+    with SessionLocal() as db:
+        assert task_executor.restore_unconfirmed_legacy_cancellations(db) == 1
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+    assert task is not None and task.state == "cancelling"
+    assert task.finished_at is None
+    if legacy_state == "alloc_error":
+        assert task.last_block_reason.startswith("Runtime Guard 检测到任务使用未分配 GPU")
+    assert allocation is not None and allocation.released_at is None
+    assert guard is not None and guard.state == "cancelling"
+    # executor 已恢复为 cancelling 后，API 同样必须拒绝立即重提，直到停止确认和资源释放完成。
+    assert client.post(f"/api/tasks/{task_id}/resubmit", headers=headers).status_code == 422
+
+    settings = isolated_executor_settings(tmp_path)
+    status_path = Path(task_executor.runtime_status_path(settings, task_id))
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "launch_id": allocation_id,
+                "state": "cancelled",
+                "return_code": None,
+                "process_stopped": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+    assert task is not None and task.state == legacy_state
+    assert allocation is not None and allocation.released_at is not None
+    assert client.post(f"/api/tasks/{task_id}/resubmit", headers=headers).status_code == 200
 
 
 def test_admin_node_and_settings_smoke() -> None:
@@ -501,8 +1743,8 @@ def test_scheduler_schedules_one_exclusive_task_per_tick() -> None:
     assert sum(1 for allocation in allocations if allocation.gpu_ids) == 1
 
 
-def test_force_offline_node_cancels_running_tasks_and_releases_gpu(monkeypatch) -> None:
-    """验证管理员强制下线节点会中止运行任务，并立即释放该节点 GPU 调度占用。"""
+def test_force_offline_node_defers_remote_stop_until_after_intent_commit(monkeypatch, tmp_path: Path) -> None:
+    """强制下线先提交 cancelling 且不在 HTTP 锁事务中 SSH，executor 确认后才释放 GPU。"""
     client = make_client()
     token = login_as_admin(client)
     headers = {"Authorization": f"Bearer {token}"}
@@ -558,15 +1800,17 @@ def test_force_offline_node_cancels_running_tasks_and_releases_gpu(monkeypatch) 
         guard.state = "running"
         db.commit()
 
-    ssh_commands: list[list[str]] = []
+    marker_calls: list[tuple[str, int]] = []
 
-    def fake_check_output(command, text=True, stderr=None, timeout=None):
-        """记录远端终止命令，避免测试环境真实 SSH 到计算节点。"""
-        ssh_commands.append(list(command))
-        return ""
+    def record_force_offline_marker(task_id_value: str, launch_id: int) -> bool:
+        """NodeService 写外部标记前，数据库停止意图必须已对另一会话可见。"""
+        with SessionLocal() as verify_db:
+            persisted = verify_db.scalar(select(Task).where(Task.task_id == task_id_value))
+            assert persisted is not None and persisted.state == "cancelling"
+        marker_calls.append((task_id_value, launch_id))
+        return True
 
-    monkeypatch.setattr("app.services.node_service.subprocess.check_output", fake_check_output)
-
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", record_force_offline_marker)
     offline_response = client.post(f"/api/admin/nodes/{node_id}/force-offline", headers=headers)
 
     with SessionLocal() as db:
@@ -578,18 +1822,110 @@ def test_force_offline_node_cancels_running_tasks_and_releases_gpu(monkeypatch) 
 
     assert offline_response.status_code == 200
     assert offline_response.json()["data"]["state"] == "offline"
-    assert offline_response.json()["data"]["gpus"][0]["scheduled_occupied"] is False
+    assert offline_response.json()["data"]["gpus"][0]["scheduled_occupied"] is True
     assert node is not None
     assert node.state == "offline"
     assert node.scheduling_enabled is False
+    assert task.state == "cancelling"
+    assert task.finished_at is None
+    assert allocation is not None
+    assert allocation.released_at is None
+    assert guard is not None
+    assert guard.state == "cancelling"
+    assert marker_calls == [(task_id, allocation.id)]
+
+    settings = isolated_executor_settings(tmp_path)
+    write_runtime_identity(settings, task_id, allocation.id)
+    ssh_commands: list[list[str]] = []
+
+    def fake_check_output(command, text=True, stderr=None, timeout=None):
+        """executor 的远端终止命令返回成功，代表存活复核已经确认进程组退出。"""
+        ssh_commands.append(list(command))
+        return "NebulaGrid stop verification succeeded\n"
+
+    monkeypatch.setattr(task_executor, "write_task_cancel_marker", lambda *_: True)
+    monkeypatch.setattr(task_executor.subprocess, "check_output", fake_check_output)
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        node = db.get(Node, node_id)
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        allocation = db.scalar(select(TaskAllocation).where(TaskAllocation.task_id == task.id))
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+
     assert task.state == "cancelled"
-    assert task.last_block_reason == "节点被管理员强制下线"
+    assert task.last_block_reason == ""
     assert allocation is not None
     assert allocation.released_at is not None
     assert guard is not None
     assert guard.state == "cancelled"
     assert ssh_commands
-    assert "kill -KILL -4321" in ssh_commands[0][-1]
+    assert "pgid=4321" in ssh_commands[0][-1]
+    assert "expected_start=987654" in ssh_commands[0][-1]
+    assert 'kill -KILL -"$pgid"' in ssh_commands[0][-1]
+
+
+@pytest.mark.parametrize("runtime_case", ["missing", "stale_launch", "missing_boot_id"])
+def test_force_offline_with_unverified_runtime_keeps_cancelling_and_allocation(
+    monkeypatch,
+    tmp_path: Path,
+    runtime_case: str,
+) -> None:
+    """缺失或属于旧 launch 的进程身份不能触发 kill，也不能提前释放调度占用。"""
+    client = make_client()
+    token = login_as_admin(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id, allocation_id = create_remote_task_fixture(client, headers, tmp_path)
+
+    with SessionLocal() as db:
+        allocation = db.get(TaskAllocation, allocation_id)
+        assert allocation is not None
+        node_id = allocation.node_id
+
+    settings = isolated_executor_settings(tmp_path)
+    monkeypatch.setattr("app.services.task_service.write_task_cancel_marker", lambda *_: True)
+    if runtime_case == "stale_launch":
+        write_runtime_identity(settings, task_id, allocation_id, launch_id=allocation_id + 1)
+    elif runtime_case == "missing_boot_id":
+        write_runtime_identity(settings, task_id, allocation_id, boot_id="")
+
+    ssh_commands: list[list[str]] = []
+
+    def capture_unexpected_ssh(command, text=True, stderr=None, timeout=None):
+        """记录任何越过身份校验的 SSH 调用，确保测试不会通过异常吞噬误杀行为。"""
+        ssh_commands.append(list(command))
+        return ""
+
+    monkeypatch.setattr(task_executor.subprocess, "check_output", capture_unexpected_ssh)
+    offline_response = client.post(f"/api/admin/nodes/{node_id}/force-offline", headers=headers)
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        assert task is not None
+        task_executor.collect_remote_status(db, task, settings)
+        db.commit()
+
+    with SessionLocal() as db:
+        task = db.scalar(select(Task).where(Task.task_id == task_id))
+        allocation = db.get(TaskAllocation, allocation_id)
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id)) if task else None
+
+    assert offline_response.status_code == 200
+    assert offline_response.json()["data"]["state"] == "offline"
+    assert ssh_commands
+    assert all("kill -TERM" not in command[-1] and "kill -KILL" not in command[-1] for command in ssh_commands)
+    assert task is not None
+    assert task.state == "cancelling"
+    assert task.finished_at is None
+    assert allocation is not None
+    assert allocation.released_at is None
+    assert guard is not None
+    assert guard.state == "cancel_failed"
 
 
 def test_scheduler_combines_gpu_model_and_node_constraints() -> None:

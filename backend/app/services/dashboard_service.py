@@ -39,8 +39,9 @@ def build_dashboard_summary(user: UserRecord, db: Session) -> DashboardSummary:
         gpus_total=gpus_total,
         gpus_available=count_available_gpus(visible_nodes),
         tasks_waiting=sum(1 for task in tasks if task.state in {"wait", "on_hold"}),
-        tasks_running=sum(1 for task in tasks if task.state == "running"),
-        tasks_finished_today=sum(1 for task in tasks if task.state in {"succeeded", "failed", "cancelled"}),
+        # 停止确认期间任务仍持有远端进程和 allocation，因此继续计入执行中数量。
+        tasks_running=sum(1 for task in tasks if task.state in RUNNING_STATES),
+        tasks_finished_today=sum(1 for task in tasks if task.state in TERMINAL_STATES),
         viewer_role=user.role.value,
     )
 

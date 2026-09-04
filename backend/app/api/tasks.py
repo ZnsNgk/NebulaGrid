@@ -141,7 +141,7 @@ def post_cancel_task(
     current_user: UserRecord = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """中止任务，并写入任务事件和审计日志。"""
+    """请求停止任务，并写入任务事件和审计日志；远端确认后才进入终态。"""
     task = cancel_task(current_user, task_id, db)
     return api_success(data=task.model_dump(), request_id=request.headers.get("x-request-id"))
 

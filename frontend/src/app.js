@@ -273,8 +273,9 @@ async function run(action, successText) {
   state.loading = true;
   render();
   try {
-    await action();
-    if (successText) showToast(successText, "success");
+    const result = await action();
+    // 带确认框的动作在用户取消时返回 false，不能显示“已提交”等成功提示。
+    if (successText && result !== false) showToast(successText, "success");
   } catch (error) {
     showToast(error.message || "操作失败", "error");
   } finally {
@@ -979,8 +980,13 @@ async function reconnectNode(nodeId) {
 }
 
 async function forceOfflineNode(nodeId) {
+  const node = (state.data.nodes || []).find((item) => String(item.id) === String(nodeId));
+  if (!window.confirm(
+    `确认强制下线节点 ${node?.name || nodeId}？\n该节点将立即停止接收新任务；已有任务会进入“停止中”，确认远端进程退出后才释放资源。`,
+  )) return false;
   await api(`/admin/nodes/${nodeId}/force-offline`, { method: "POST" });
   await refreshPage();
+  return true;
 }
 
 async function deleteNode(nodeId) {
@@ -1010,15 +1016,17 @@ async function submitTask(event) {
 }
 
 async function cancelTask(taskId) {
-  if (!window.confirm(`确认中止任务 ${taskId}？`)) return;
+  if (!window.confirm(`确认停止任务 ${taskId}？`)) return false;
   await api(`/tasks/${taskId}/cancel`, { method: "POST" });
   await refreshPage();
+  return true;
 }
 
 async function resubmitTask(taskId) {
-  if (!window.confirm(`确认重新提交任务 ${taskId}？\n系统会生成一个新任务 ID。`)) return;
+  if (!window.confirm(`确认重新提交任务 ${taskId}？\n系统会生成一个新任务 ID。`)) return false;
   await api(`/tasks/${taskId}/resubmit`, { method: "POST" });
   await refreshPage();
+  return true;
 }
 
 async function showTaskLog(taskId) {
@@ -2568,7 +2576,7 @@ function renderTasks() {
             ${renderTaskActionButton("edit", "修改选中任务")}
             ${renderTaskActionButton("hold", "挂起/取消挂起选中任务")}
             ${renderTaskActionButton("delete", "删除选中任务", "danger")}
-            ${renderTaskActionButton("cancel", "中止选中任务", "danger")}
+            ${renderTaskActionButton("cancel", "停止选中任务", "danger")}
             ${renderTaskActionButton("resubmit", "重新提交")}
             ${renderTaskActionButton("historyAll", state.taskHistoryAllLoaded ? "已显示全部历史任务" : "查看所有历史任务")}
             ${renderTaskActionButton("log", "查看任务日志")}
@@ -2594,9 +2602,13 @@ function renderTaskZoneTable(tasks) {
   const headers = ["", "状态", "任务ID", "环境", "路径", "命令", "节点", "GPU数", "GPU型号", "前驱", "紧急", "复用", "所有人", "时间"];
   const rows = tasks.map((task) => {
     const selected = state.selectedTaskId === task.task_id;
+    // 仅复用现有黄色过渡态配色；状态未知属于异常历史结果，沿用失败配色但保留 unknown 类供后续扩展。
+    const statusClass = task.state === "cancelling"
+      ? "cancelling dispatching"
+      : (task.state === "unknown" ? "unknown failed" : task.state);
     const cells = [
       `<input type="radio" name="task_selection" value="${escapeAttr(task.task_id)}" ${selected ? "checked" : ""} data-select-task="${escapeAttr(task.task_id)}">`,
-      `<span class="status ${task.state}">${taskStateText(task.state)}</span>`,
+      `<span class="status ${statusClass}">${taskStateText(task.state)}</span>`,
       `<strong>${escapeHtml(task.task_id)}</strong>${task.description ? `<br><span class="muted">${escapeHtml(task.description)}</span>` : ""}`,
       escapeHtml(task.env_name || "-"),
       `<code>${escapeHtml(task.workdir || "/")}</code>`,
@@ -2632,7 +2644,9 @@ function isTaskActionDisabled(action) {
   const zone = state.taskZone;
   if (action === "historyAll") return zone !== "history" || state.taskHistoryAllLoaded;
   const needsSelection = ["edit", "hold", "delete", "cancel", "resubmit", "log"].includes(action);
-  if (needsSelection && !selectedTask()) return true;
+  const task = selectedTask();
+  if (needsSelection && !task) return true;
+  if (action === "cancel" && task?.state === "cancelling") return true;
   if (zone === "wait") return ["cancel", "resubmit"].includes(action);
   if (zone === "running") return ["edit", "hold", "delete", "resubmit"].includes(action);
   if (zone === "history") return ["hold", "cancel"].includes(action);
@@ -4463,13 +4477,15 @@ const taskStateLabels = {
   dispatching: "派发中",
   starting: "启动中",
   running: "运行中",
+  cancelling: "停止中",
   succeeded: "完成",
   failed: "失败",
-  cancelled: "已取消",
+  cancelled: "已停止",
   alloc_error: "调度错误",
   dependency_failed: "依赖失败",
   offline: "节点掉线",
-  offline_error: "节点掉线",
+  offline_error: "远端执行异常",
+  unknown: "状态未知",
   node_lost: "节点丢失",
 };
 
@@ -4767,7 +4783,10 @@ function bindEvents() {
   document.querySelectorAll("[data-select-task]").forEach((input) => input.addEventListener("change", () => selectTask(input.value)));
   document.querySelectorAll("[data-task-row]").forEach((row) => row.addEventListener("click", () => selectTask(row.dataset.taskRow)));
   document.querySelectorAll("[data-task-row]").forEach((row) => row.addEventListener("dblclick", () => run(() => showTaskLog(row.dataset.taskRow))));
-  document.querySelectorAll("[data-task-action]").forEach((button) => button.addEventListener("click", () => run(() => handleTaskAction(button.dataset.taskAction))));
+  document.querySelectorAll("[data-task-action]").forEach((button) => button.addEventListener("click", () => {
+    const action = button.dataset.taskAction;
+    run(() => handleTaskAction(action), action === "cancel" ? "停止请求已提交" : undefined);
+  }));
   document.querySelector("[data-task-pick-workdir]")?.addEventListener("click", (event) => {
     event.preventDefault();
     openTaskWorkdirPicker().catch((error) => showToast(error.message || "打开文件夹选择器失败", "error"));
@@ -4781,7 +4800,6 @@ function bindEvents() {
   document.querySelector("[data-action='reset-audit-filters']")?.addEventListener("click", () => resetAuditFilters());
   document.querySelector("#auditPageJumpForm")?.addEventListener("submit", (event) => jumpAuditPage(event));
   document.querySelector("[name='audit_page_size']")?.addEventListener("change", (event) => switchAuditPageSize(event.currentTarget.value));
-  document.querySelectorAll("[data-cancel]").forEach((button) => button.addEventListener("click", () => run(() => cancelTask(button.dataset.cancel), "任务已取消")));
   document.querySelectorAll("[data-resubmit]").forEach((button) => button.addEventListener("click", () => run(() => resubmitTask(button.dataset.resubmit), "任务已重新提交")));
   document.querySelectorAll("[data-log]").forEach((button) => button.addEventListener("click", () => run(() => showTaskLog(button.dataset.log))));
   document.querySelectorAll("[data-open-path]").forEach((button) => button.addEventListener("click", (event) => {

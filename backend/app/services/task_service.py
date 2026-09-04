@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -42,13 +43,16 @@ from app.services.env_service import get_env_for_user
 from app.services.node_service import can_user_access_node
 
 WAIT_STATES = {"wait", "on_hold"}
-RUNNING_STATES = {"dispatching", "starting", "running", "preparing"}
+ALLOC_ERROR_STOP_REASON_PREFIX = "Runtime Guard 检测到任务使用未分配 GPU"
+# cancelling 仍持有远端进程和调度资源，必须留在执行区，直到 executor 确认进程退出。
+RUNNING_STATES = {"dispatching", "starting", "running", "preparing", "cancelling"}
 TERMINAL_STATES = {
     "succeeded",
     "failed",
     "cancelled",
     "alloc_error",
     "offline_error",
+    "unknown",
     "offline",
     "node_lost",
     "dependency_failed",
@@ -195,8 +199,15 @@ def update_task(user: UserRecord, task_id: str, payload: TaskUpdateRequest, db: 
     """编辑等待、挂起或历史任务；历史任务编辑后会重新进入等待/挂起区。"""
     task = require_task_model_for_user(user, task_id, db)
     require_task_manager(user, task, db)
+    task = db.scalar(
+        select(Task).where(Task.id == task.id).with_for_update().execution_options(populate_existing=True)
+    )
+    if task is None:
+        raise not_found("task not found")
     if task.state in RUNNING_STATES:
         raise validation_error("running task cannot be edited")
+    if has_unconfirmed_cancel_cleanup(task, db):
+        raise validation_error("task cancellation is not confirmed yet and cannot be edited")
     data = payload.model_dump(exclude_unset=True)
     owner = require_user_model(task.user_id, db)
     if "workdir" in data and data["workdir"] is not None:
@@ -261,21 +272,69 @@ def hold_task(user: UserRecord, task_id: str, db: Session) -> TaskInfo:
 
 
 def cancel_task(user: UserRecord, task_id: str, db: Session) -> TaskInfo:
-    """中止任务；运行中任务会由执行 worker 根据运行时记录继续回收远端进程。"""
+    """请求停止任务；可能已启动远端进程的任务要等 executor 确认后才能进入历史区。"""
     task = require_task_model_for_user(user, task_id, db)
     require_task_manager(user, task, db)
+    # 锁住任务行，使取消与调度状态迁移串行化，避免 wait 任务在取消同时又被分配。
+    task = db.scalar(
+        select(Task)
+        .where(Task.id == task.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if task is None:
+        raise not_found("task not found")
     if task.state in TERMINAL_STATES:
         raise validation_error("finished task cannot be cancelled")
+    if task.state == "cancelling":
+        # 重复点击停止保持幂等，避免为同一次回收请求重复写事件和审计记录。
+        return build_task_info(task, db)
     previous_state = task.state
-    task.state = "cancelled"
     task.on_hold = False
-    task.finished_at = local_datetime()
-    if previous_state not in {"starting", "running"}:
+    open_allocations = load_open_allocations(task.id, db)
+    allocation = open_allocations[0] if open_allocations else None
+    overlapping_allocations = len(open_allocations) > 1
+    if not overlapping_allocations and (
+        (allocation is None and previous_state in WAIT_STATES) or previous_state == "dispatching"
+    ):
+        # 等待/挂起任务没有 allocation；dispatching 在当前任务行锁下也尚未被 executor 领取。
+        # 两种情况都能确定远端 runner 未被调用，可以直接完成停止。
+        task.state = "cancelled"
+        task.finished_at = local_datetime()
+        task.last_block_reason = ""
         release_task_allocations(task.id, db)
-    append_task_log(task, "\nProgram Terminated By User\n")
-    add_task_event(db, task, "cancelled", "任务已请求中止", user.id, {"previous_state": previous_state})
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+        if guard is not None:
+            guard.state = "cancelled"
+        append_task_log(task, "\nProgram Terminated By User\n")
+        add_task_event(db, task, "cancelled", "未启动任务已停止", user.id, {"previous_state": previous_state})
+    else:
+        task.state = "cancelling"
+        task.finished_at = None
+        task.last_block_reason = "用户已请求停止，正在确认远端进程退出"
+        if overlapping_allocations:
+            # 旧/异常数据可能包含多个 launch；保留全部占用，禁止只停最新一条后整体归档。
+            task.last_block_reason += "；检测到重叠 allocation，需人工核查"
+        guard = db.scalar(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id == task.id))
+        if guard is not None:
+            guard.state = "cancelling"
+        add_task_event(
+            db,
+            task,
+            "cancelling",
+            "任务已进入停止中，等待执行器确认远端进程退出",
+            user.id,
+            {
+                "previous_state": previous_state,
+                "allocation_id": allocation.id if allocation else None,
+                "open_allocation_count": len(open_allocations),
+            },
+        )
     db.commit()
     db.refresh(task)
+    # 先提交数据库停止意图，再 best-effort 写 NFS 标记；即使文件系统暂时不可用，executor 也会重试。
+    if task.state == "cancelling":
+        write_task_cancel_marker(task.task_id, allocation.id if allocation else None)
     record_audit(user.id, "task.cancel", "task", task.task_id, detail_json={"previous_state": previous_state})
     return build_task_info(task, db)
 
@@ -286,13 +345,30 @@ def delete_task(user: UserRecord, task_id: str, delete_successors: bool, db: Ses
     require_task_manager(user, task, db)
     successor_tasks = load_successor_tasks(task.id, db)
     selected = [task, *(successor_tasks if delete_successors else [])]
-    selected_by_id = {item.id: item for item in selected}
-    skipped = [item.task_id for item in selected if item.state in RUNNING_STATES]
+    selected_ids = sorted({item.id for item in selected})
+    locked_items = db.scalars(
+        select(Task)
+        .where(Task.id.in_(selected_ids))
+        .order_by(Task.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    selected_by_id = {item.id: item for item in locked_items}
+    task = selected_by_id.get(task.id)
+    if task is None:
+        raise not_found("task not found")
+    skipped = [
+        item.task_id
+        for item in locked_items
+        if item.state in RUNNING_STATES or has_unconfirmed_cancel_cleanup(item, db)
+    ]
     if task.state in RUNNING_STATES:
         raise validation_error("running task cannot be deleted")
+    if has_unconfirmed_cancel_cleanup(task, db):
+        raise validation_error("task cancellation is not confirmed yet and cannot be deleted")
     removed: list[str] = []
     for item in list(selected_by_id.values()):
-        if item.state in RUNNING_STATES:
+        if item.state in RUNNING_STATES or has_unconfirmed_cancel_cleanup(item, db):
             continue
         require_task_manager(user, item, db)
         release_task_allocations(item.id, db)
@@ -324,6 +400,15 @@ def resubmit_task(user: UserRecord, task_id: str, db: Session) -> TaskInfo:
     """基于已有任务生成新 ID 的任务，保留命令、环境、资源需求和前驱配置。"""
     source = require_task_model_for_user(user, task_id, db)
     require_task_manager(user, source, db)
+    source = db.scalar(
+        select(Task).where(Task.id == source.id).with_for_update().execution_options(populate_existing=True)
+    )
+    if source is None:
+        raise not_found("task not found")
+    if source.state in RUNNING_STATES or has_unconfirmed_cancel_cleanup(source, db):
+        # “停止中”以及升级前尚未确认退出的历史记录都不能作为重提来源，否则旧进程和
+        # 新任务可能并行运行。待 allocation 安全释放后，历史任务仍可正常重新提交。
+        raise validation_error("task cleanup is not confirmed yet and cannot be resubmitted")
     predecessor = load_predecessor(source.id, db)
     payload = TaskCreateRequest(
         description=source.description,
@@ -780,6 +865,35 @@ def load_latest_allocations(task_pks: list[int], db: Session) -> dict[int, TaskA
     return {allocation.task_id: allocation for allocation in allocations}
 
 
+def load_open_allocation(task_pk: int, db: Session) -> TaskAllocation | None:
+    """读取当前未释放 allocation；停止请求用其 ID 绑定本次远端启动，避免命中旧运行记录。"""
+    allocations = load_open_allocations(task_pk, db)
+    return allocations[0] if allocations else None
+
+
+def load_open_allocations(task_pk: int, db: Session) -> list[TaskAllocation]:
+    """最多读取两条开放 allocation，用第二条识别不允许自动收敛的重叠 launch。"""
+    return list(
+        db.scalars(
+            select(TaskAllocation)
+            .where(TaskAllocation.task_id == task_pk)
+            .where(TaskAllocation.released_at.is_(None))
+            .order_by(TaskAllocation.id.desc())
+            .limit(2)
+        ).all()
+    )
+
+
+def has_unconfirmed_cancel_cleanup(task: Task, db: Session) -> bool:
+    """识别升级前已写终态但未确认进程退出的任务，禁止编辑或删除其远端回收入口。"""
+    if task.state not in {"cancelled", "alloc_error"}:
+        return False
+    allocation = load_open_allocation(task.id, db)
+    # 新流程确认退出时会在同一事务内释放 allocation；只要终态仍有开放占用，就说明这是
+    # 旧版或异常记录。旧版 guard=cancelled 没有存活复核，也不能作为安全删除/编辑的依据。
+    return allocation is not None
+
+
 def release_task_allocations(task_pk: int, db: Session) -> None:
     """释放任务尚未释放的 allocation，保证调度器后续能重新使用资源。"""
     now = local_datetime()
@@ -790,6 +904,34 @@ def release_task_allocations(task_pk: int, db: Session) -> None:
     ).all()
     for allocation in allocations:
         allocation.released_at = now
+
+
+def write_task_cancel_marker(task_id: str, launch_id: int | None) -> bool:
+    """原子写入共享停止标记，让尚在 SSH 启动窗口中的 runner 在 Popen 前后都能看到请求。"""
+    marker_path = Path(get_settings().runtime_root) / "tasks" / f"{task_id}.cancel.json"
+    temporary_path = marker_path.with_name(f"{marker_path.name}.{time.time_ns()}.tmp")
+    try:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path.write_text(
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "launch_id": launch_id,
+                    "requested_at": local_datetime().isoformat(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        temporary_path.replace(marker_path)
+        return True
+    except OSError:
+        # API 仍需把停止意图落库；executor 会在后续轮询中继续补写标记并尝试远端回收。
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def add_task_event(

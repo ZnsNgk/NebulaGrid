@@ -433,7 +433,7 @@ nebulagrid/
 
 6. 执行器通过 SSH 激活环境、设置 CUDA_VISIBLE_DEVICES、进入项目目录、运行命令，并将 stdout/stderr 写入日志。
 
-7. 首条日志或进程启动成功后状态变为 running。任务退出后根据返回码和停止原因变为 succeeded/failed/cancelled/offline。
+7. 首条日志或进程启动成功后状态变为 running。明确返回码直接变为 succeeded/failed；用户停止、启动结果不确定和节点异常先进入 cancelling，确认远端进程退出后才变为 cancelled、offline_error 或 alloc_error。停止确认超过 `NEBULAGRID_CANCELLING_TIMEOUT_SECONDS`（默认 30 秒）仍无结果时，任务变为 unknown 并释放 allocation，但不得视为远端已停止。
 
 8. 资源释放，任务进入历史视图，但仍保留任务表记录和事件流。
 
@@ -443,22 +443,22 @@ nebulagrid/
 
 2. 系统查询该节点上处于 dispatching/starting/running 的任务。
 
-3. 对已启动任务写入 node_offline 事件，并按策略标记 offline 或 lost；对未真正启动的任务可释放资源并重新进入 wait。
+3. 对已启动任务写入 node_offline 事件；没有明确返回码时先标记 cancelling 并保留 allocation，等待节点恢复后核对或停止本次 launch。对确认尚未被执行器领取的 dispatching 任务可直接取消。
 
-4. 释放该节点 GPU/CPU 资源占用，避免页面显示资源仍被占用。
+4. 同一 launch 的明确返回码或远端进程组退出已确认时可以释放 GPU/CPU 资源；SSH 中断、控制文件缺失或身份不完整都不构成停止成功条件。停止确认达到配置上限仍无结果时，允许按受控超时写为 unknown 并释放资源，但须保留远端残留风险事件。
 
 5. 管理员可选择“重新连接”或“保持下线”。重新连接成功后节点变为 online，但不会自动恢复已标记失败的任务，除非用户或管理员手动重新提交。
 
 ## 6.3 强制下线流程
 
-强制下线是危险操作，应区别于“临时禁用调度”和“重新连接”。强制下线表示管理员主动要求节点退出调度：后端必须把节点状态落为 `offline`、关闭调度、强行终止该节点上 `dispatching/starting/running/preparing` 的任务，并释放该节点所有未释放的 `task_allocations`，确保 GPU 调度占用立即归零。该操作必须弹出确认框，列出受影响任务，并写入审计日志。
+强制下线是危险操作，应区别于“临时禁用调度”和“重新连接”。强制下线表示管理员主动要求节点退出调度：后端必须把节点状态落为 `offline`、关闭调度，并将仍可能已启动的 `starting/running/preparing` 任务写为 `cancelling`；事务提交后由执行器写停止标记、优先读取明确返回码，或按经验证的 PID/PGID 终止并复核进程组。仅确认尚未启动的 `dispatching` 任务可直接取消。确认远端进程退出的任务释放对应 `task_allocations`；无法确认的任务在配置时限内继续显示“停止中”并保留占用，时限到期后以 unknown 归档、释放 allocation 并记录远端残留风险。该操作必须弹出确认框、明确说明此语义，并写入审计日志。
 
 | **操作** | **对节点状态影响**            | **对任务影响**                         | **适用场景**             |
 |----------|-------------------------------|----------------------------------------|--------------------------|
 | 禁用调度 | node.scheduling_enabled=false | 不影响已运行任务，只是不再分配新任务。 | 临时保留给已有任务跑完。 |
 | 维护模式 | state=maintenance             | 可配置是否允许现有任务继续。           | 硬件维护前准备。         |
 | 重新连接 | 尝试重启监控连接              | 不应修改任务状态。                     | 节点在线但监控无数据。   |
-| 强制下线 | state=offline                 | 终止该节点运行任务，并释放该节点所有未释放调度占用。 | 断电、拔卡、紧急维护。   |
+| 强制下线 | state=offline                 | 写停止意图；仅已确认退出的任务释放调度占用。 | 断电、拔卡、紧急维护。   |
 | 删除节点 | 从配置和数据库标记删除        | 必须无运行任务或先强制下线。           | 节点退役。               |
 
 # 7. 数据模型与状态枚举
@@ -499,9 +499,12 @@ PostgreSQL 负责业务状态和调度一致性；InfluxDB 负责持续写入的
 | dispatching       | 派发中     | 调度器已选中资源，正在创建执行线程/SSH 会话。                                | 管理员可强制取消。                           |
 | starting          | 启动中     | SSH 已连接，正在激活环境和进入目录。                                         | 中止。                                       |
 | running           | 运行中     | 任务进程已启动并产生日志或确认运行。                                         | 中止、查看日志。                             |
+| cancelling        | 停止中     | 停止意图已提交，但远端进程退出尚未确认；仍保留 allocation。                  | 查看日志、等待自动重试。                     |
 | succeeded         | 完成       | 进程返回码为 0。                                                             | 查看日志、下载、重新提交、删除记录。         |
 | failed            | 错误       | 返回码非 0 或启动失败。                                                      | 查看错误、重新提交、删除记录。               |
 | cancelled         | 中止       | 用户/管理员主动停止。                                                        | 查看日志、重新提交、删除记录。               |
+| offline_error     | 远端执行异常 | SSH 启动/状态读取异常后，潜在远端进程已经确认退出。                         | 查看日志、重新提交、删除记录。               |
+| unknown           | 状态未知   | 停止确认超时；平台已释放 allocation，但远端进程是否退出未确认。              | 先联系管理员核查节点，再决定是否重新提交。   |
 | offline           | 节点掉线   | 运行期间节点离线或 SSH 中断。                                                | 查看事件、重新提交。                         |
 | dependency_failed | 依赖失败   | 前驱任务失败且策略为失败阻断。                                               | 修改依赖、重新提交。                         |
 | alloc_error       | 调度错误   | 守护线程检测到任务进程树实际使用了未分配 GPU，或 CPU-only 任务违规占用 GPU。 | 查看日志、重新提交；管理员查看守护检测记录。 |
@@ -731,11 +734,11 @@ export QT_QPA_PLATFORM=offscreen
 <user_command>
 ```
 
-> **关键限制：**如果不使用容器，用户理论上可以在自己的命令或代码中重新 export CUDA_VISIBLE_DEVICES。系统不能只依赖环境变量保证 GPU 隔离，应增加运行时 GPU 违规检测：任务启动后定期检查该任务进程树实际占用的 GPU UUID/index，并与 task_allocations 中记录的分配 GPU 进行比对。若发现越权占用未分配 GPU，则中止进程组，任务状态置为 alloc_error，前端显示“调度错误”。
+> **关键限制：**如果不使用容器，用户理论上可以在自己的命令或代码中重新 export CUDA_VISIBLE_DEVICES。系统不能只依赖环境变量保证 GPU 隔离，应增加运行时 GPU 违规检测：任务启动后定期检查该任务进程树实际占用的 GPU UUID/index，并与 task_allocations 中记录的分配 GPU 进行比对。若发现越权占用未分配 GPU，先将任务置为 cancelling 并保留 allocation；确认进程退出后才置为 alloc_error，前端显示“调度错误”。
 
 ## 9.5 停止任务与进程回收
 
-- 执行器启动任务时应记录远端主进程 PID、进程组 ID 和启动命令。
+- 执行器启动任务时应记录远端主进程 PID、进程组 ID、`/proc` 启动时钟、节点 boot ID 和启动命令。
 
 - 停止任务时优先发送 SIGTERM，等待 grace_period 秒后仍未退出再发送 SIGKILL。
 
@@ -743,9 +746,9 @@ export QT_QPA_PLATFORM=offscreen
 
 - 停止结果写入 task_events 和 audit_logs。
 
-- SSH 断开不等于远端任务一定退出，应尽量通过远端 pid 文件或进程组检测确认。
+- SSH 断开不等于远端任务一定退出。停止请求先写 cancelling 并保留 allocation；同一次 launch 的明确返回码、runner 的 process_stopped 回执或进程组存活检查确认退出时才能归档为已停止或具体错误终态。若停止确认超过 `NEBULAGRID_CANCELLING_TIMEOUT_SECONDS`，系统可按受控超时归档为 unknown 并释放 allocation，但必须记录远端进程仍可能存在。
 
-- 任务启动脚本应由系统包装为受控 shell wrapper。wrapper 负责写入 root_pid、process_group_id、start_time、allocated_gpu_indices 与 allocated_gpu_uuids，便于后续守护线程定位进程树。
+- 任务启动脚本应由系统包装为受控 shell wrapper。wrapper 负责写入 task_id、launch_id、root_pid、process_group_id、start_time、boot_id、allocated_gpu_indices 与 allocated_gpu_uuids，便于后续守护线程定位进程树。
 
 ## 9.6 运行中任务守护线程与 GPU 分配一致性检测
 
@@ -757,11 +760,11 @@ export QT_QPA_PLATFORM=offscreen
 
 判定规则：若任务进程树观测到的 GPU UUID 不属于本任务分配集合，或 CPU-only 任务出现 GPU 使用，则记为一次违规。为降低误判，建议设置 startup_grace_seconds 和 violation_confirm_count，例如启动后 10 秒内不判定，连续 2 次检测到违规才执行中止。
 
-处理策略：确认违规后，系统向该任务进程组发送 SIGTERM，超过 grace_period 仍未退出则发送 SIGKILL；任务状态置为 alloc_error，前端显示“调度错误”，写入 task_events、task_runtime_guards 和 audit_logs，并立即释放调度资源。
+处理策略：确认违规后，系统将任务置为 cancelling，写入 task_events、task_runtime_guards 和 audit_logs，并保留调度资源；executor 向经身份核验的任务进程组发送 SIGTERM，仍未退出再发送 SIGKILL。只有确认进程组退出后，任务状态才置为 alloc_error 并释放调度资源。
 
 日志要求：任务日志末尾追加“Program stopped because it used GPUs outside allocation.”，同时记录分配 GPU、实际观测 GPU、违规 PID、检测时间和执行动作。管理员界面应能查看完整守护检测记录，普通用户界面只显示必要原因。
 
-配置项建议：task_guard_enabled、task_guard_interval_seconds、task_guard_startup_grace_seconds、task_guard_violation_confirm_count、task_guard_kill_grace_seconds、task_guard_cpu_only_policy。默认启用守护检测，但允许管理员在测试期临时关闭。
+配置项建议：task_guard_enabled、task_guard_interval_seconds、task_guard_startup_grace_seconds、task_guard_violation_confirm_count、task_guard_cpu_only_policy。默认启用守护检测，但允许管理员在测试期临时关闭。
 
 # 10. 文件、环境与日志子系统
 
@@ -976,9 +979,9 @@ def resolve_virtual_path(user, virtual_path, mode):
 
 | **场景**              | **操作**                                         | **预期结果**                                                                           |
 |-----------------------|--------------------------------------------------|----------------------------------------------------------------------------------------|
-| 节点断电              | 运行任务时断开节点网络/电源                      | SSH 长连接退出或 keepalive 判定失败，节点 offline，任务 offline，资源释放，事件和审计记录完整。 |
+| 节点断电              | 运行任务时断开节点网络/电源                      | SSH 长连接退出或 keepalive 判定失败，节点 offline；任务进入 cancelling 并保留资源，恢复可达后确认退出才归档和释放。 |
 | master 重启           | 运行中强制重启主控服务                           | 系统启动后执行恢复扫描，无法确认任务标记 lost/offline，不出现重复派发。                |
-| SSH 启动失败          | 主账户 SSH 配置错误、UID/GID 不一致或节点不可达  | 任务 failed/offline，错误原因可见，资源释放。                                          |
+| SSH 启动失败          | 主账户 SSH 配置错误、UID/GID 不一致或节点不可达  | 无明确返回码时任务先进入 cancelling 并保留资源；确认潜在进程退出后为 offline_error。   |
 | 日志文件被删除        | 删除运行任务日志                                 | 日志接口提示日志不存在或重新创建，不影响任务状态。                                     |
 | 解压路径穿越          | 上传含 ../ 的 zip                                | 拒绝解压并记录安全事件。                                                               |
 | 用户停用              | 管理员停用学生账号                               | 该用户可登录管理文件/环境，但提交任务返回禁止。                                        |
@@ -1121,7 +1124,6 @@ task_guard:
   interval_seconds: 5
   startup_grace_seconds: 10
   violation_confirm_count: 2
-  kill_grace_seconds: 10
   cpu_only_policy: "kill"
 ```
 
@@ -1140,14 +1142,19 @@ starting --> running: process started/log ready
 starting --> failed: start failed
 running --> succeeded: exit 0
 running --> failed: exit non-zero
-running --> cancelled: user/admin stop
-running --> offline: node offline
-running --> alloc_error: gpu violation
+running --> cancelling: user/admin stop, node fault, or gpu violation
+starting --> cancelling: uncertain launch or stop request
+cancelling --> cancelled: confirmed stopped
+cancelling --> offline_error: confirmed after remote error
+cancelling --> alloc_error: confirmed policy violation
+cancelling --> unknown: stop confirmation timeout
 wait --> dependency_failed: predecessor failed
 wait --> [*]: delete
 succeeded --> [*]
 failed --> [*]
 cancelled --> [*]
+offline_error --> [*]
+unknown --> [*]
 offline --> [*]
 alloc_error --> [*]
 dependency_failed --> [*]

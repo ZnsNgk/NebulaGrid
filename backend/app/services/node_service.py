@@ -1,5 +1,3 @@
-import subprocess
-
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -24,6 +22,9 @@ from app.schemas.nodes import GpuInfo, NodeCreateRequest, NodeInfo, NodeUpdateRe
 from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
 from app.services.metrics_service import LatestMetrics, get_latest_metrics
+
+_ALLOC_ERROR_STOP_REASON_PREFIX = "Runtime Guard 检测到任务使用未分配 GPU"
+_AUTO_STOP_REASON_PREFIX = "系统检测到远端执行异常"
 
 
 def list_nodes(user: UserRecord, db: Session, visible_only: bool = True) -> list[NodeInfo]:
@@ -80,8 +81,15 @@ def update_node(user: UserRecord, node_id: int, payload: NodeUpdateRequest, db: 
     """修改节点基础信息、GPU 可调度开关和算力覆盖，实际 GPU 清单继续由 monitor 维护。"""
     require_permission(user.role, "nodes:write")
     node = require_node_model(node_id, db)
+    node = db.scalar(
+        select(Node).where(Node.id == node.id).with_for_update().execution_options(populate_existing=True)
+    ) or node
     if is_control_plane_identity(payload.name, payload.ip):
         raise validation_error("master/control-plane node should not be registered as compute node")
+    identity_changed = payload.ip.strip() != node.ip or payload.ssh_user.strip() != node.ssh_user
+    if identity_changed and has_open_node_allocation(node.id, db):
+        # allocation 只保存 node_id；运行期间改 IP/SSH 用户会让停止确认连接到错误主机。
+        raise validation_error("node ip or ssh user cannot be changed while task allocations are active")
     owner_ids = validate_owner_ids(payload.owner_user_ids, db)
     node.name = payload.name.strip()
     node.ip = payload.ip.strip()
@@ -108,9 +116,14 @@ def update_node(user: UserRecord, node_id: int, payload: NodeUpdateRequest, db: 
 
 
 def delete_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
-    """删除计算节点并清理直接外键引用，避免历史任务记录阻塞节点退役。"""
+    """删除无活动 allocation 的计算节点；运行中的节点必须先强制下线并完成停止确认。"""
     require_permission(user.role, "nodes:write")
     node = require_node_model(node_id, db)
+    node = db.scalar(
+        select(Node).where(Node.id == node.id).with_for_update().execution_options(populate_existing=True)
+    ) or node
+    if has_open_node_allocation(node.id, db):
+        raise validation_error("node still has active task allocations; force it offline and wait for cleanup first")
     node_info = build_node_info(node, load_latest_metrics([node]), load_occupied_gpu_ids([node], db))
     db.query(TaskRequirement).filter(TaskRequirement.node_id == node.id).update({TaskRequirement.node_id: None}, synchronize_session=False)
     db.query(EnvInstallJob).filter(EnvInstallJob.target_node_id == node.id).update({EnvInstallJob.target_node_id: None}, synchronize_session=False)
@@ -120,6 +133,16 @@ def delete_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
     db.commit()
     record_audit(user.id, "node.delete", "node", str(node_info.id), detail_json=node_info.model_dump())
     return node_info
+
+
+def has_open_node_allocation(node_id: int, db: Session) -> bool:
+    """检查节点是否仍有未释放占用；用于保护 SSH 身份和远端回收入口。"""
+    return db.scalar(
+        select(TaskAllocation.id)
+        .where(TaskAllocation.node_id == node_id)
+        .where(TaskAllocation.released_at.is_(None))
+        .limit(1)
+    ) is not None
 
 
 def get_node(node_id: int, db: Session) -> NodeInfo | None:
@@ -144,16 +167,33 @@ def force_offline_node(user: UserRecord, node_id: int, db: Session) -> NodeInfo:
     """强制节点离线、关闭调度，并中止该节点上仍持有调度占用的运行任务。"""
     require_permission(user.role, "nodes:write")
     node = require_node_model(node_id, db)
-    interrupted = interrupt_node_tasks(node, user.id, db)
+    # 与调度器采用相同的节点行锁。锁持有期间先关闭调度，再处理已有任务，防止新的
+    # allocation 在强制下线事务中途落到该节点。
+    node = db.scalar(
+        select(Node)
+        .where(Node.id == node.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ) or node
     node.state = "offline"
     node.scheduling_enabled = False
+    interrupted = interrupt_node_tasks(node, user.id, db)
     db.commit()
+    # 外部文件写入必须晚于数据库停止意图提交；否则数据库提交失败时，远端可能已停，
+    # 主表却仍显示 running。写标记失败不回滚状态，executor 后续会继续补写和核查。
+    from app.services.task_service import write_task_cancel_marker
+
+    for pending in interrupted.get("pending_launches", []):
+        pending["cancel_marker_written"] = write_task_cancel_marker(
+            str(pending["task_id"]),
+            int(pending["launch_id"]),
+        )
     record_audit(user.id, "node.force_offline", "node", str(node.id), detail_json=interrupted)
     return build_node_info(node, load_latest_metrics([node]), load_occupied_gpu_ids([node], db))
 
 
 def interrupt_node_tasks(node: Node, actor_user_id: int, db: Session) -> dict[str, object]:
-    """强制下线是节点级隔离动作：先终止该节点上的运行任务，再释放所有未释放调度占用。"""
+    """强制下线只提交停止意图；远端退出确认统一交给 executor，避免持锁执行 SSH。"""
     open_allocations = db.scalars(
         select(TaskAllocation)
         .where(TaskAllocation.node_id == node.id)
@@ -161,36 +201,127 @@ def interrupt_node_tasks(node: Node, actor_user_id: int, db: Session) -> dict[st
         .order_by(TaskAllocation.id)
     ).all()
     if not open_allocations:
-        return {"interrupted_task_ids": [], "released_allocations": 0, "termination_errors": []}
+        return {
+            "interrupted_task_ids": [],
+            "pending_task_ids": [],
+            "pending_launches": [],
+            "released_allocations": 0,
+            "termination_errors": [],
+        }
 
     now = local_datetime()
     task_ids = sorted({allocation.task_id for allocation in open_allocations})
-    tasks = db.scalars(select(Task).where(Task.id.in_(task_ids))).all()
+    # 节点行已经由调用方锁定；随后按固定顺序锁任务行，与调度器的节点->任务顺序一致。
+    # dispatching 行一旦在这里成功锁定，executor 的条件领取就不能再把它推进到 starting。
+    tasks = db.scalars(
+        select(Task)
+        .where(Task.id.in_(task_ids))
+        .order_by(Task.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    # 等待任务行锁期间 executor 可能已经确认退出并释放 allocation。拿到 task 锁后必须
+    # 重新查询并锁定开放 allocation，不能用之前的 ORM 快照把已完成任务改回 cancelling。
+    open_allocations = db.scalars(
+        select(TaskAllocation)
+        .where(TaskAllocation.node_id == node.id)
+        .where(TaskAllocation.released_at.is_(None))
+        .order_by(TaskAllocation.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    if not open_allocations:
+        return {
+            "interrupted_task_ids": [],
+            "pending_task_ids": [],
+            "pending_launches": [],
+            "released_allocations": 0,
+            "termination_errors": [],
+        }
+    open_task_ids = {allocation.task_id for allocation in open_allocations}
+    tasks = [task for task in tasks if task.id in open_task_ids]
     tasks_by_id = {task.id: task for task in tasks}
+    allocations_by_task_id: dict[int, list[TaskAllocation]] = {}
+    latest_allocation_by_task_id: dict[int, TaskAllocation] = {}
+    for allocation in open_allocations:
+        allocations_by_task_id.setdefault(allocation.task_id, []).append(allocation)
+        latest_allocation_by_task_id[allocation.task_id] = allocation
     guards = db.scalars(select(TaskRuntimeGuard).where(TaskRuntimeGuard.task_id.in_(task_ids))).all()
     guards_by_task_id = {guard.task_id: guard for guard in guards}
     interrupted_task_ids: list[str] = []
+    pending_task_ids: list[str] = []
+    pending_launches: list[dict[str, object]] = []
     termination_errors: list[dict[str, str]] = []
+    keep_allocation_task_ids: set[int] = set()
 
     for task in tasks:
-        if task.state in {"starting", "running", "dispatching", "preparing"}:
-            guard = guards_by_task_id.get(task.id)
-            if guard is not None and (guard.process_group_id is not None or guard.root_pid is not None):
-                try:
-                    terminate_guard_process(node, guard)
-                    guard.state = "cancelled"
-                except Exception as exc:  # noqa: BLE001 - 节点下线必须落库，远端回收失败通过事件和审计暴露。
-                    guard.state = "cancel_failed"
-                    termination_errors.append({"task_id": task.task_id, "error": str(exc)})
+        guard = guards_by_task_id.get(task.id)
+        # 旧版本可能已把任务写成 cancelled/alloc_error，但还保留着未确认的 allocation。
+        # 缺 guard/PID 同样不能证明安全，必须恢复为 cancelling，由 executor 重新核查。
+        # 新流程的终态与 allocation 释放是同一事务；因此这里出现任一旧终态都必须重查，
+        # 不能信任旧版未做存活复核就写下的 guard=cancelled。
+        legacy_terminal_unconfirmed = task.state in {"cancelled", "alloc_error"}
+        active_stop_state = task.state in {"starting", "running", "dispatching", "preparing", "cancelling"}
+        if not active_stop_state and not legacy_terminal_unconfirmed:
+            continue
+        task_allocations = allocations_by_task_id[task.id]
+        allocation = latest_allocation_by_task_id[task.id]
+        interrupted_task_ids.append(task.task_id)
+
+        task.on_hold = False
+        if task.state == "dispatching" and len(task_allocations) == 1:
+            # 持有任务行锁时 dispatching 尚未被 executor 领取，因此可以确定没有调用远端 runner。
             task.state = "cancelled"
-            task.on_hold = False
             task.finished_at = now
             task.last_block_reason = "节点被管理员强制下线"
-            interrupted_task_ids.append(task.task_id)
-            add_node_force_offline_task_event(db, task, actor_user_id, node, guard)
+            if guard is not None:
+                guard.state = "cancelled"
+            add_node_force_offline_task_event(db, task, actor_user_id, node, guard, confirmed=True)
+            continue
 
+        allocation_error_cleanup = task.state == "alloc_error" or task.last_block_reason.startswith(
+            _ALLOC_ERROR_STOP_REASON_PREFIX
+        )
+        automatic_cleanup = task.last_block_reason.startswith(_AUTO_STOP_REASON_PREFIX)
+        task.state = "cancelling"
+        task.finished_at = None
+        if allocation_error_cleanup:
+            # 管理员下线不能覆盖 Runtime Guard 的目标终态，否则确认退出后会被误记为普通取消。
+            if not task.last_block_reason.startswith(_ALLOC_ERROR_STOP_REASON_PREFIX):
+                task.last_block_reason = f"{_ALLOC_ERROR_STOP_REASON_PREFIX}；正在确认远端进程停止"
+        elif automatic_cleanup:
+            # 启动/SSH 异常的停止意图最终应归档为 offline_error，强制下线只改变节点状态。
+            pass
+        else:
+            task.last_block_reason = "节点已被管理员强制下线，远端进程停止尚未确认"
+        if len(task_allocations) > 1:
+            # 控制文件按 task_id 命名，不能只确认最新 launch 就释放同一任务的全部旧占用。
+            task.last_block_reason = f"{task.last_block_reason}；检测到重叠 allocation，需人工核查"
+        keep_allocation_task_ids.add(task.id)
+        pending_task_ids.append(task.task_id)
+        pending_launches.append({"task_id": task.task_id, "launch_id": allocation.id})
+        if guard is not None and guard.state != "cancel_failed":
+            guard.state = "cancelling"
+        add_node_force_offline_task_event(
+            db,
+            task,
+            actor_user_id,
+            node,
+            guard,
+            confirmed=False,
+            error=(
+                "检测到重叠 allocation，等待人工核查全部 launch"
+                if len(task_allocations) > 1
+                else "等待 executor 读取返回码或验证远端进程退出"
+            ),
+        )
+
+    released_allocations = 0
     for allocation in open_allocations:
+        if allocation.task_id in keep_allocation_task_ids:
+            continue
         allocation.released_at = now
+        released_allocations += 1
         task = tasks_by_id.get(allocation.task_id)
         if task is not None and task.task_id not in interrupted_task_ids:
             db.add(
@@ -205,38 +336,11 @@ def interrupt_node_tasks(node: Node, actor_user_id: int, db: Session) -> dict[st
 
     return {
         "interrupted_task_ids": interrupted_task_ids,
-        "released_allocations": len(open_allocations),
+        "pending_task_ids": pending_task_ids,
+        "pending_launches": pending_launches,
+        "released_allocations": released_allocations,
         "termination_errors": termination_errors,
     }
-
-
-def terminate_guard_process(node: Node, guard: TaskRuntimeGuard) -> None:
-    """按进程组优先终止远端任务；TERM 后补 KILL，降低 GPU 继续被占用的时间窗口。"""
-    target = guard.process_group_id or guard.root_pid
-    if target is None:
-        return
-    pid = int(target)
-    command = (
-        f"kill -TERM -{pid} 2>/dev/null || kill -TERM {pid} 2>/dev/null || true; "
-        "sleep 1; "
-        f"kill -KILL -{pid} 2>/dev/null || kill -KILL {pid} 2>/dev/null || true"
-    )
-    subprocess.check_output(build_ssh_command(node, command), text=True, stderr=subprocess.STDOUT, timeout=10)
-
-
-def build_ssh_command(node: Node, remote_command: str) -> list[str]:
-    """构造节点强制下线使用的 SSH 命令，统一保持非交互和短超时边界。"""
-    return [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        f"{node.ssh_user}@{node.ip}",
-        remote_command,
-    ]
 
 
 def add_node_force_offline_task_event(
@@ -245,19 +349,23 @@ def add_node_force_offline_task_event(
     actor_user_id: int,
     node: Node,
     guard: TaskRuntimeGuard | None,
+    confirmed: bool,
+    error: str = "",
 ) -> None:
-    """记录任务被节点强制下线中止的原因，便于用户区分主动取消和节点隔离。"""
+    """记录节点强制下线后的停止意图；只有未启动的 dispatching 任务会在此直接确认。"""
     db.add(
         TaskEvent(
             task_id=task.id,
-            event_type="cancelled",
-            message="节点被管理员强制下线，任务已中止",
+            event_type="cancelled" if confirmed else "cancelling",
+            message="节点被管理员强制下线，任务确认未启动" if confirmed else "节点已强制下线，任务进入停止中",
             actor_user_id=actor_user_id,
             detail_json={
                 "node_id": node.id,
                 "node_name": node.name,
                 "root_pid": guard.root_pid if guard else None,
                 "process_group_id": guard.process_group_id if guard else None,
+                "confirmed": confirmed,
+                "error": error,
             },
         )
     )

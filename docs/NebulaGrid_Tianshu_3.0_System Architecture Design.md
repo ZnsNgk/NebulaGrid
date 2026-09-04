@@ -171,7 +171,7 @@ flowchart TB
 ├── nebulagrid-api.service         # FastAPI API Server
 ├── nebulagrid-scheduler.service   # 调度器，单实例
 ├── nebulagrid-monitor.service     # 节点监控器
-├── nebulagrid-executor.service    # 任务执行器
+├── nebulagrid-task-executor.service    # 任务执行器
 ├── nebulagrid-guard.service       # 运行中任务 GPU 守护检测
 ├── nebulagrid-envworker.service   # 环境包安装与编译安装作业器
 ├── postgresql.service             # 主数据库
@@ -450,7 +450,7 @@ erDiagram
 | is_urgent | bool | 紧急任务 |
 | is_reuse_gpu | bool | 是否允许 GPU 复用 |
 | is_onhold | bool | 是否挂起 |
-| state | enum | wait/dispatching/starting/running/succeeded/failed/cancelled/offline/alloc_error/lost |
+| state | enum | wait/dispatching/starting/running/cancelling/succeeded/failed/cancelled/offline_error/unknown/offline/alloc_error/lost |
 | last_block_reason | varchar | 最近阻塞原因 |
 | exit_code | int nullable | 进程返回码 |
 | remote_root_pid | int nullable | 远端根进程 PID |
@@ -795,16 +795,20 @@ stateDiagram-v2
     dispatching --> starting: 执行器准备远程启动
     starting --> running: 进程启动/首条日志
     starting --> failed: 启动失败
-    dispatching --> offline: 节点掉线
     running --> succeeded: 返回码 0
     running --> failed: 返回码非 0
-    running --> cancelled: 用户/管理员中止
-    running --> offline: 节点掉线或 SSH 不可恢复
-    running --> alloc_error: 守护线程检测到越权 GPU 使用
+    running --> cancelling: 用户/管理员请求停止、节点异常或守护违规
+    starting --> cancelling: 启动结果不确定或请求停止
+    cancelling --> cancelled: 已确认远端进程退出
+    cancelling --> alloc_error: 违规进程已确认退出
+    cancelling --> offline_error: 异常进程已确认退出
+    cancelling --> unknown: 停止确认超过配置上限
     running --> lost: master 重启后无法确认
     succeeded --> [*]
     failed --> [*]
     cancelled --> [*]
+    offline_error --> [*]
+    unknown --> [*]
     offline --> [*]
     alloc_error --> [*]
     lost --> [*]
@@ -819,9 +823,12 @@ stateDiagram-v2
 | dispatching | 分配中 | 已锁定资源，等待执行器领取 |
 | starting | 启动中 | SSH 连接、环境激活、命令启动 |
 | running | 运行中 | 远端进程正在运行 |
+| cancelling | 停止中 | 停止意图已落库，仍保留 allocation 并等待远端退出确认 |
 | succeeded | 已完成 | 返回码 0 |
 | failed | 运行错误 | 用户代码或启动命令返回非 0 |
 | cancelled | 已中止 | 用户或管理员主动停止 |
+| offline_error | 远端执行异常 | SSH 启动或状态读取异常后，潜在远端进程已确认退出 |
+| unknown | 状态未知 | 停止确认超时，allocation 已释放但远端进程是否退出未确认 |
 | offline | 节点掉线 | 节点异常导致中断 |
 | alloc_error | 调度错误 | 任务使用了未分配 GPU 或 CPU-only 任务使用 GPU |
 | lost | 状态未知 | master 重启或 SSH 异常后无法确认 |
@@ -998,18 +1005,18 @@ proc = subprocess.Popen(
 
 停止任务时，系统应：
 
-1. 查询 `tasks.remote_pgid`；
-2. SSH 到目标节点；
-3. 执行 `kill -TERM -<pgid>`；
-4. 等待 `kill_grace_seconds`；
-5. 若仍存在，执行 `kill -KILL -<pgid>`；
-6. 更新任务状态为 `cancelled` 或具体错误状态；
-7. 释放资源；
-8. 写入 `task_events` 和 `audit_logs`。
+1. 先把数据库状态写为 `cancelling` 并提交，保留当前 allocation；
+2. 为当前 allocation/`launch_id` 原子写入停止标记；
+3. 若同一次启动已有明确 `return_code`，直接按返回码归档，不再发送停止信号；
+4. 否则严格核对 runtime 中的 task ID、launch ID、PID、PGID、节点 boot ID 与 `/proc` 启动时钟；
+5. SSH 到目标节点，先执行 `kill -TERM -<pgid>`，宽限后仍存活再执行 `kill -KILL -<pgid>`；
+6. 核对该进程组已无非僵尸成员；任何连接、身份或存活状态不确定都继续保持 `cancelling`，直至 `NEBULAGRID_CANCELLING_TIMEOUT_SECONDS`（默认 30 秒）到期；
+7. 只有确认退出后才更新为 `cancelled` 或具体错误终态、写结束时间并释放资源；若确认时限到期仍不确定，则写为 `unknown`、释放 allocation，并记录节点可能有残留进程；
+8. 全程写入 `task_events` 和 `audit_logs`。
 
 不要只关闭 SSH 连接，因为关闭 SSH 不等于远端 Python 训练进程一定退出。
 
-管理员强制下线节点时复用同一进程回收原则，但触发点在 NodeService：先按该节点未释放 allocation 找到 `dispatching/starting/running/preparing` 任务，优先按进程组执行 TERM/KILL，然后把任务标记为 `cancelled`，最后释放该节点全部未释放 allocation。节点本身必须写为 `offline` 且关闭 `scheduling_enabled`，审计详情记录受影响任务、释放的 allocation 数量和远端回收失败信息。
+管理员强制下线节点时复用同一进程回收原则，但 NodeService 的短事务只负责锁定节点和任务、写入 `offline/cancelling` 并提交；提交后写停止标记，不在持锁的 HTTP 请求中执行 SSH。executor 随后优先读取明确返回码或按经验证的进程组执行 TERM/KILL，确认退出后才归档并释放 allocation；停止确认超过配置上限仍无法确认时则以 `unknown` 归档、释放 allocation 并保留残留风险。尚未被 executor 领取的 `dispatching` 任务可在任务行锁内直接确认取消。
 
 ### 10.4 master 重启后的任务恢复
 
@@ -1081,20 +1088,19 @@ def detect_gpu_violation(task, observed):
 | task_guard_interval_seconds | 5 | 检测间隔 |
 | task_guard_startup_grace_seconds | 10 | 任务启动宽限期 |
 | task_guard_violation_confirm_count | 2 | 连续违规多少次才处理 |
-| task_guard_kill_grace_seconds | 10 | SIGTERM 后等待时间 |
 | task_guard_cpu_only_policy | forbid_gpu | CPU-only 是否禁止使用 GPU |
 
 ### 11.5 违规处理
 
 确认违规后：
 
-1. 追加任务日志：`Program stopped because it used GPUs outside allocation.`；
-2. 写入 `task_runtime_guard_events`；
-3. 写入 `task_events: alloc_error`；
-4. 写入 `audit_logs`；
-5. 发送 SIGTERM/SIGKILL 停止进程组；
-6. 更新 `tasks.state = alloc_error`；
-7. 释放 `task_allocations` 和 GPU 资源；
+1. 校验当前 allocation、launch ID、PID/PGID 和进程启动时钟；
+2. 写入 `task_events: alloc_error_cancelling`，并把任务置为 `cancelling`；
+3. 保留 `task_allocations`，由 executor 发送 SIGTERM/SIGKILL 并验证进程组退出；
+4. 确认退出后追加任务日志和 `task_events: alloc_error`；
+5. 更新 `tasks.state = alloc_error`；
+6. 释放 `task_allocations` 和 GPU 资源；
+7. 写入审计线索；
 8. 前端显示“调度错误”。
 
 ### 11.6 注意事项
@@ -1284,12 +1290,12 @@ SSH 命令需要启用 `ServerAliveInterval` 和 `ServerAliveCountMax`。这样�
 
 1. 查询该节点 running/starting/dispatching 任务；
 2. 尝试 SSH 重连；
-3. 若无法连接，任务标记 offline；
-4. 释放 allocation；
-5. 写入事件和审计；
-6. 前端提示用户任务因节点掉线中止。
+3. 若无法连接且没有明确返回码，任务进入 `cancelling` 并保留 allocation；
+4. 节点恢复可达后继续核对或停止本次 launch 的进程；
+5. 确认远端进程退出后再标记 `offline_error` 并释放 allocation；
+6. 写入事件和审计，前端在确认前显示“停止中”。
 
-如果 offline 来源是管理员强制下线，则不等待恢复扫描：服务层立即终止该节点运行任务、释放该节点所有未释放 allocation，并通过 `node.force_offline` 审计动作保存影响范围。这样可以避免已下线节点上的 GPU 继续显示为平台调度占用。
+如果 offline 来源是管理员强制下线，服务层立即关闭该节点调度并提交运行任务的停止意图，但不把 SSH 失败当作进程已经退出。未确认任务继续显示为平台调度占用；executor 收到明确返回码或验证进程组退出后才释放 allocation，`node.force_offline` 审计动作保存待确认范围。
 节点监控器遇到 `offline` 且 `scheduling_enabled=false` 的节点时应停止或跳过该节点线程，直到管理员点击“重连”把节点改为 `reconnecting`。这样强制下线节点不会被监控长连接自动写回 `online`，也不会因为不可达 SSH 拖慢其他节点监控。
 
 ---
@@ -1515,8 +1521,9 @@ scheduler:
   exclusive_gpu_max_mem_util: 0.2
 
 executor:
-  ssh_connect_timeout_seconds: 10
-  kill_grace_seconds: 10
+  ssh_connect_timeout_seconds: 20
+  task_start_timeout_seconds: 120
+  ssh_operation_timeout_seconds: 30
   ssh_username: ddltm
   remote_runner_path: /home/ddltm/envs/nebulagrid_remote/runner.py
 
@@ -1531,7 +1538,6 @@ runtime_guard:
   interval_seconds: 5
   startup_grace_seconds: 10
   violation_confirm_count: 2
-  kill_grace_seconds: 10
   cpu_only_policy: forbid_gpu
 
 env_install:
@@ -1557,7 +1563,7 @@ logs:
 nebulagrid-api.service
 nebulagrid-scheduler.service
 nebulagrid-monitor.service
-nebulagrid-executor.service
+nebulagrid-task-executor.service
 nebulagrid-runtime-guard.service
 nebulagrid-env-worker.service
 ```
@@ -1639,8 +1645,8 @@ while True:
 2. 用户代码强行改到其他 GPU；
 3. TaskRuntimeGuard 检测到实际 GPU UUID 不属于 allocation；
 4. 连续违规达到阈值；
-5. 系统停止任务；
-6. 状态变为 `alloc_error`；
+5. 系统将任务置为 `cancelling` 并请求停止；
+6. 确认远端进程组退出后状态变为 `alloc_error`；
 7. 前端显示“调度错误”；
 8. GPU 资源释放；
 9. 审计日志记录违规 PID 和实际 GPU。
@@ -1670,7 +1676,7 @@ while True:
 2. 先建立数据库模型，再写迁移脚本；
 3. 旧的 `wait_task.json/exec_task.json/hist_task.json` 可一次性导入；
 4. 旧字段 `slaver` 迁移为 `node`；
-5. 旧状态 `accp/err/term/offline_error` 映射到 `succeeded/failed/cancelled/offline`；
+5. 旧状态 `accp/err/term/offline_error` 映射到 `succeeded/failed/cancelled/offline_error`；
 6. 旧任务日志保留原路径或建立索引映射；
 7. 旧环境列表导入为 `environments.source_type = registered`。
 
@@ -1684,7 +1690,7 @@ while True:
 | accp | succeeded |
 | err | failed |
 | term | cancelled |
-| offline_error | offline |
+| offline_error | offline_error |
 | alloc_error | alloc_error |
 
 ---
@@ -1773,8 +1779,8 @@ while True:
 - 任务主表新增 `generated_command`、`urgent`、`last_block_reason`、`log_path` 和 `return_code`，GPU 表新增 `gpu_uuid`，初始化脚本会对旧库补列和索引。
 - API 支持单任务、批量任务、等待/执行/历史分区、任务变化 SSE、日志 tail、日志增量 SSE、删除后继预览、递归删除、重新提交和运行时守护摘要。
 - scheduler 以 PostgreSQL 为单一状态源，按紧急任务、优先级、提交时间、前驱依赖、节点可见性、节点归属优先级、GPU 数量、GPU 型号、指定节点、GPU 可调度开关和 GPU 复用策略写入 allocation；每轮最多成功分配一个任务，并同步创建 `task_events` 与 `task_runtime_guards`。只指定 GPU 型号时在用户可见候选节点中匹配该型号；只指定节点时只在该节点中匹配任意可调度 GPU；两者同时指定时只在该节点内匹配指定型号。调度器只使用单实例哨兵行互斥，不批量锁住等待任务行，避免任务编辑和列表刷新被调度扫描阻塞。
-- executor 通过 SSH 调用远端 `runner.py`，生成环境激活、CUDA 绑定和用户命令组合后的执行命令；远端 wrapper 写入 PID/PGID 元数据和状态文件，executor 回收返回码、结束时间并释放 allocation。
-- Runtime Guard 通过远端 PID 树和 `nvidia-smi --query-compute-apps` 采集实际 GPU UUID，连续两轮发现越权后终止远端进程组、标记 `alloc_error`、释放 allocation，并写入任务日志与事件。
+- executor 通过 SSH 调用远端 `runner.py`，生成环境激活、CUDA 绑定和用户命令组合后的执行命令；远端 wrapper 原子写入 launch ID、PID/PGID、进程启动时钟、节点 boot ID 和状态文件。停止时先进入 `cancelling` 并保留 allocation，收到明确返回码或验证进程退出后才归档和释放；停止确认超过配置上限则以 `unknown` 归档并释放 allocation，保留远端残留风险告警。
+- Runtime Guard 先验证当前 launch 的进程身份，再通过远端 PID 树和 `nvidia-smi --query-compute-apps` 采集实际 GPU UUID；连续两轮发现越权后同样先进入 `cancelling`，确认进程退出后才标记 `alloc_error`、释放 allocation，并写入任务日志与事件。
 - 部署自检脚本 `backend/scripts/deployment_self_check.py` 用于上线前只读检查本机共享目录、远端脚本、数据库节点、SSH、NFS 路径和 `nvidia-smi` 可用性。
 
 ## 24. 结论

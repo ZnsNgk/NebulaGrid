@@ -8,7 +8,7 @@ class Settings:
     """保存后端运行所需的非敏感配置，敏感项后续从 secrets/env 注入。"""
 
     app_name: str = "NebulaGrid"
-    app_version: str = "0.1.0"
+    app_version: str = "1.0.2"
     environment: str = "development"
     data_root: str = "/home/ddltm/data"
     user_home_root: str = "/home/ddltm/data/user"
@@ -41,6 +41,12 @@ class Settings:
     monitor_interval_seconds: int = 5
     monitor_reconnect_attempts: int = 3
     monitor_watchdog_timeout_seconds: int = 600
+    # SSH 建连超时只覆盖 TCP、握手和认证；远端 runner 启动确认使用独立的更长超时。
+    ssh_connect_timeout_seconds: int = 20
+    task_start_timeout_seconds: int = 120
+    ssh_operation_timeout_seconds: int = 30
+    # 停止结果长期无法确认时的强制归档上限；归档状态会明确标为 unknown，避免伪造停止成功。
+    cancelling_timeout_seconds: int = 30
     file_operation_worker_threads: int = 2
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
@@ -60,7 +66,7 @@ def get_settings() -> Settings:
     )
     return Settings(
         app_name=os.getenv("NEBULAGRID_APP_NAME", "NebulaGrid"),
-        app_version=os.getenv("NEBULAGRID_APP_VERSION", "0.1.0"),
+        app_version=os.getenv("NEBULAGRID_APP_VERSION", "1.0.2"),
         environment=os.getenv("NEBULAGRID_ENV", "development"),
         data_root=os.getenv("NEBULAGRID_DATA_ROOT", "/home/ddltm/data"),
         user_home_root=os.getenv("NEBULAGRID_USER_HOME_ROOT", "/home/ddltm/data/user"),
@@ -93,6 +99,10 @@ def get_settings() -> Settings:
         monitor_interval_seconds=int(os.getenv("NEBULAGRID_MONITOR_INTERVAL_SECONDS", "5")),
         monitor_reconnect_attempts=int(os.getenv("NEBULAGRID_MONITOR_RECONNECT_ATTEMPTS", "3")),
         monitor_watchdog_timeout_seconds=int(os.getenv("NEBULAGRID_MONITOR_WATCHDOG_TIMEOUT_SECONDS", "600")),
+        ssh_connect_timeout_seconds=max(1, int(os.getenv("NEBULAGRID_SSH_CONNECT_TIMEOUT_SECONDS", "20"))),
+        task_start_timeout_seconds=max(10, int(os.getenv("NEBULAGRID_TASK_START_TIMEOUT_SECONDS", "120"))),
+        ssh_operation_timeout_seconds=max(5, int(os.getenv("NEBULAGRID_SSH_OPERATION_TIMEOUT_SECONDS", "30"))),
+        cancelling_timeout_seconds=max(1, int(os.getenv("NEBULAGRID_CANCELLING_TIMEOUT_SECONDS", "30"))),
         file_operation_worker_threads=int(os.getenv("NEBULAGRID_FILE_OPERATION_WORKER_THREADS", "2")),
         cors_origins=tuple(
             origin.strip()
