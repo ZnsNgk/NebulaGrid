@@ -1720,6 +1720,7 @@ nav {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
   padding-top: 4px;
 }
 
@@ -1731,6 +1732,63 @@ nav {
   flex: 0 0 auto;
   min-height: 34px;
   padding: 6px 12px;
+}
+
+.file-note-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.file-markdown-preview.markdown-body {
+  min-height: 420px;
+  height: 100%;
+  max-width: none;
+  overflow: auto;
+  border: 1px solid rgba(177, 204, 255, 0.18);
+  border-radius: 8px;
+  background: #07101f;
+}
+
+.markdown-body a {
+  color: var(--cyan);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+  text-decoration: underline;
+  text-decoration-color: rgba(34, 211, 238, 0.45);
+  text-underline-offset: 3px;
+}
+
+.markdown-body a:hover {
+  color: #a5f3fc;
+  text-decoration-color: currentColor;
+}
+
+.markdown-image-frame {
+  margin: 16px 0;
+  text-align: center;
+}
+
+.markdown-image {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: 72vh;
+  margin: 12px auto;
+  object-fit: contain;
+  border: 1px solid rgba(177, 204, 255, 0.18);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+}
+
+.markdown-image-frame figcaption,
+.markdown-image-error {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .file-media-preview,
@@ -1758,6 +1816,40 @@ nav {
 .file-media-preview img {
   max-width: 100%;
   max-height: 72vh;
+}
+
+.file-pdf-preview {
+  min-height: 100%;
+  display: grid;
+  grid-template-rows: minmax(520px, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid rgba(177, 204, 255, 0.18);
+  border-radius: 8px;
+  background: #07101f;
+}
+
+.file-pdf-preview iframe {
+  width: 100%;
+  height: 100%;
+  min-height: 520px;
+  border: 0;
+  background: #fff;
+}
+
+.file-pdf-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.file-pdf-footer a {
+  flex: 0 0 auto;
+  color: var(--cyan);
+  font-weight: 700;
 }
 
 .ng-video-player {
@@ -3074,6 +3166,14 @@ td {
   .ng-video-player,
   .ng-video-player video {
     min-height: 240px;
+  }
+
+  .file-pdf-preview {
+    grid-template-rows: minmax(68vh, 1fr) auto;
+  }
+
+  .file-pdf-preview iframe {
+    min-height: 68vh;
   }
 
   .file-permission-panel {

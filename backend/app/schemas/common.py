@@ -26,4 +26,5 @@ class RuntimeConfigData(BaseModel):
     """前端运行时配置；只暴露登录用户提交任务和查看文件时需要的非敏感路径。"""
 
     shared_folder_root: str
+    external_nfs_enabled: bool = False
 

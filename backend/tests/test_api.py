@@ -21,6 +21,7 @@ from app.db.models import Env, Gpu, LoginSession, Node, Setting, Task, TaskAlloc
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.remote import runner as remote_runner
+from app.services import file_service
 from app.workers.node_monitor import (
     MonitorWatchdogTimeout,
     NodeMonitorTarget,
@@ -2542,6 +2543,45 @@ def login_user(client: TestClient, identity: str, password: str) -> str:
     return response.json()["data"]["access_token"]
 
 
+def test_office_preview_conversion_uses_isolated_profile_and_cache(monkeypatch, tmp_path: Path) -> None:
+    """验证四种 Office 扩展名均可转换，且相同版本文档复用 PDF 缓存。"""
+    source = tmp_path / "slides.pptx"
+    source.write_bytes(b"fake-presentation")
+    calls: list[tuple[list[str], dict]] = []
+
+    monkeypatch.setattr(file_service.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        file_service.shutil,
+        "which",
+        lambda command: "/usr/bin/libreoffice" if command == "libreoffice" else None,
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        output_root = Path(command[command.index("--outdir") + 1])
+        (output_root / "slides.pdf").write_bytes(b"%PDF-1.4\nconverted\n%%EOF")
+        return SimpleNamespace(returncode=0, stdout="converted", stderr="")
+
+    monkeypatch.setattr(file_service.subprocess, "run", fake_run)
+
+    first = file_service.build_office_preview_pdf(source)
+    second = file_service.build_office_preview_pdf(source)
+
+    assert first == second
+    assert first.read_bytes().startswith(b"%PDF")
+    assert len(calls) == 1
+    command, run_options = calls[0]
+    assert command[0] == "/usr/bin/libreoffice"
+    assert "--headless" in command
+    assert any(argument.startswith("-env:UserInstallation=file:") for argument in command)
+    assert run_options["timeout"] == file_service.OFFICE_PREVIEW_TIMEOUT_SECONDS
+    assert run_options["check"] is False
+    assert all(
+        file_service.is_office_preview_file(Path(f"document{suffix}"))
+        for suffix in (".doc", ".docx", ".ppt", ".pptx")
+    )
+
+
 def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) -> None:
     """验证文件管理接口在虚拟根目录 / 内完成新建、预览、保存、复制、重命名和删除。"""
     user_home_root = tmp_path / "user"
@@ -2594,6 +2634,15 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
         archive_path.write_bytes(b"PK" + b"0" * 1024)
         video_path = user_root / "project" / "demo.mp4"
         video_path.write_bytes(b"0123456789")
+        image_path = user_root / "project" / "diagram.jpg"
+        image_path.write_bytes(b"fake-jpeg-content")
+        pdf_path = user_root / "project" / "report.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n0123456789\n%%EOF")
+        office_path = user_root / "project" / "slides.pptx"
+        office_path.write_bytes(b"fake-office-content")
+        converted_office_pdf = tmp_path / "converted-office.pdf"
+        converted_office_pdf.write_bytes(b"%PDF-1.4\noffice-preview\n%%EOF")
+        monkeypatch.setattr(file_service, "build_office_preview_pdf", lambda _source: converted_office_pdf)
         large_text_path = user_root / "project" / "large.txt"
         large_text_size = 2 * 1024 * 1024 + 7
         large_text_path.write_bytes(b"a" * large_text_size)
@@ -2607,11 +2656,28 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
         monkeypatch.setattr(Path, "open", reject_archive_content_read)
         archive_preview_response = client.get("/api/files/preview?path=/project/large.zip", headers=headers)
         video_preview_response = client.get("/api/files/preview?path=/project/demo.mp4", headers=headers)
+        pdf_preview_response = client.get("/api/files/preview?path=/project/report.pdf", headers=headers)
+        office_preview_response = client.get("/api/files/preview?path=/project/slides.pptx", headers=headers)
         limited_text_response = client.get("/api/files/preview?path=/project/large.txt", headers=headers)
         full_text_response = client.get("/api/files/preview?path=/project/large.txt&full=true", headers=headers)
         video_range_response = client.get(
             f"/api/files/media?path=/project/demo.mp4&token={student_token}",
             headers={"Range": "bytes=2-5"},
+        )
+        markdown_image_response = client.get(
+            f"/api/files/media?path=/project/diagram.jpg&token={student_token}",
+        )
+        pdf_range_response = client.get(
+            f"/api/files/media?path=/project/report.pdf&token={student_token}",
+            headers={"Range": "bytes=0-7"},
+        )
+        office_range_response = client.get(
+            f"/api/files/media?path=/project/slides.pptx&token={student_token}",
+            headers={"Range": "bytes=0-7"},
+        )
+        office_download_response = client.get(
+            "/api/files/download?path=/project/slides.pptx",
+            headers=headers,
         )
         archive_media_response = client.get(
             f"/api/files/media?path=/project/large.zip&token={student_token}",
@@ -2647,6 +2713,31 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
         assert video_range_response.content == b"2345"
         assert video_range_response.headers["content-range"] == "bytes 2-5/10"
         assert video_range_response.headers["accept-ranges"] == "bytes"
+        assert markdown_image_response.status_code == 200
+        assert markdown_image_response.content == b"fake-jpeg-content"
+        assert markdown_image_response.headers["content-type"].startswith("image/jpeg")
+        pdf_preview = pdf_preview_response.json()["data"]
+        assert pdf_preview_response.status_code == 200
+        assert pdf_preview["content_type"] == "application/pdf"
+        assert pdf_preview["encoding"] == "stream"
+        assert pdf_preview["content"] == ""
+        assert pdf_range_response.status_code == 206
+        assert pdf_range_response.content == b"%PDF-1.4"
+        assert pdf_range_response.headers["content-type"].startswith("application/pdf")
+        office_preview = office_preview_response.json()["data"]
+        assert office_preview_response.status_code == 200
+        assert office_preview["content_type"] == "application/pdf"
+        assert (
+            office_preview["converted_from"]
+            == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        )
+        assert office_preview["encoding"] == "stream"
+        assert office_preview["content"] == ""
+        assert office_range_response.status_code == 206
+        assert office_range_response.content == b"%PDF-1.4"
+        assert office_range_response.headers["content-type"].startswith("application/pdf")
+        assert office_download_response.status_code == 200
+        assert office_download_response.content == b"fake-office-content"
         assert archive_media_response.status_code == 422
         limited_text = limited_text_response.json()["data"]
         assert limited_text_response.status_code == 200
@@ -2672,6 +2763,126 @@ def test_file_manager_crud_uses_user_root_boundary(monkeypatch, tmp_path: Path) 
         assert (user_root / "project" / "note.txt").read_text(encoding="utf-8") == "updated"
         assert not (user_root / "project" / "renamed.txt").exists()
     finally:
+        get_settings.cache_clear()
+
+
+def test_external_nfs_scope_is_read_only_and_hides_mount_path(monkeypatch, tmp_path: Path) -> None:
+    """验证 NAS 开关和路径落库，普通用户只能通过虚拟路径浏览、预览和下载。"""
+    user_home_root = tmp_path / "users"
+    nas_root = tmp_path / "mounted-nas"
+    nas_root.mkdir()
+    (nas_root / "dataset.txt").write_text("nas-data", encoding="utf-8")
+    (nas_root / "folder").mkdir()
+    monkeypatch.setenv("NEBULAGRID_USER_HOME_ROOT", str(user_home_root))
+    monkeypatch.setenv("NEBULAGRID_VISIBLE_ROOTS", str(user_home_root))
+    get_settings.cache_clear()
+    keys = ("external_nfs.enabled", "external_nfs.path")
+    with SessionLocal() as db:
+        previous_values = {}
+        for key in keys:
+            row = db.get(Setting, key)
+            previous_values[key] = row.value if row is not None else None
+    try:
+        client = make_client()
+        admin_token = login_as_admin(client)
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        student_name = f"nas-student-{uuid4().hex[:8]}"
+        create_user_response = client.post(
+            "/api/users",
+            headers=admin_headers,
+            json={
+                "username": student_name,
+                "real_name": "NAS Student",
+                "role": "student",
+                "state": "enabled",
+                "password": "student123",
+            },
+        )
+        overlapping_path_response = client.patch(
+            "/api/admin/settings",
+            headers=admin_headers,
+            json={"values": {"external_nfs.path": str(user_home_root)}},
+        )
+        relative_path_response = client.patch(
+            "/api/admin/settings",
+            headers=admin_headers,
+            json={"values": {"external_nfs.path": "mounted-nas"}},
+        )
+        settings_response = client.patch(
+            "/api/admin/settings",
+            headers=admin_headers,
+            json={"values": {"external_nfs.path": str(nas_root), "external_nfs.enabled": "true"}},
+        )
+        student_token = login_user(client, student_name, "student123")
+        headers = {"Authorization": f"Bearer {student_token}"}
+        create_own_response = client.post(
+            "/api/files/create",
+            headers=headers,
+            json={"path": "/own.txt", "content": "own-data"},
+        )
+
+        runtime_response = client.get("/api/runtime-config", headers=headers)
+        list_response = client.get("/api/files/list?scope=nas&path=/", headers=headers)
+        preview_response = client.get("/api/files/preview?scope=nas&path=/dataset.txt", headers=headers)
+        download_response = client.get("/api/files/download?scope=nas&path=/dataset.txt", headers=headers)
+        copy_from_response = client.post(
+            "/api/files/copy",
+            headers=headers,
+            json={"path": "/dataset.txt", "target_path": "/copied.txt", "scope": "nas"},
+        )
+        copy_to_response = client.post(
+            "/api/files/copy",
+            headers=headers,
+            json={"path": "/own.txt", "target_path": "/forbidden.txt", "target_scope": "nas"},
+        )
+
+        assert create_user_response.status_code == 200
+        assert overlapping_path_response.status_code == 422
+        assert relative_path_response.status_code == 422
+        assert settings_response.status_code == 200
+        with SessionLocal() as db:
+            assert db.get(Setting, "external_nfs.enabled").value == "true"
+            assert db.get(Setting, "external_nfs.path").value == str(nas_root)
+        assert create_own_response.status_code == 200
+        runtime_data = runtime_response.json()["data"]
+        assert runtime_response.status_code == 200
+        assert runtime_data["external_nfs_enabled"] is True
+        assert str(nas_root) not in runtime_response.text
+        list_data = list_response.json()["data"]
+        assert list_response.status_code == 200
+        assert list_data["display_path"] == "/NAS"
+        assert {item["path"] for item in list_data["items"]} == {"/dataset.txt", "/folder"}
+        assert str(nas_root) not in list_response.text
+        assert preview_response.status_code == 200
+        assert preview_response.json()["data"]["content"] == "nas-data"
+        assert download_response.status_code == 200
+        assert download_response.text == "nas-data"
+        assert copy_from_response.status_code == 403
+        assert copy_to_response.status_code == 403
+
+        disable_response = client.patch(
+            "/api/admin/settings",
+            headers=admin_headers,
+            json={"values": {"external_nfs.enabled": "false"}},
+        )
+        disabled_runtime_response = client.get("/api/runtime-config", headers=headers)
+        disabled_list_response = client.get("/api/files/list?scope=nas&path=/", headers=headers)
+        assert disable_response.status_code == 200
+        assert disabled_runtime_response.json()["data"]["external_nfs_enabled"] is False
+        assert disabled_list_response.status_code == 403
+    finally:
+        # 共享测试数据库需要恢复原设置，避免 NAS 开关影响后续文件接口用例。
+        with SessionLocal() as db:
+            for key, previous_value in previous_values.items():
+                row = db.get(Setting, key)
+                if previous_value is None:
+                    if row is not None:
+                        db.delete(row)
+                elif row is None:
+                    db.add(Setting(key=key, value=previous_value))
+                else:
+                    row.value = previous_value
+            db.commit()
         get_settings.cache_clear()
 
 

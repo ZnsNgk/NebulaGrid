@@ -1,10 +1,13 @@
 import base64
+import hashlib
 import mimetypes
 import os
 import shutil
 import stat
 import subprocess
 import tarfile
+import tempfile
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -21,13 +24,18 @@ from app.core.time_utils import ensure_local_datetime, local_datetime
 from app.db.models import FileJob as FileJobModel, User, UserSupervisor
 from app.db.session import SessionLocal
 from app.schemas.files import FileEntry, FileJobData, FileListData, FilePermissionData, FilePreviewData
-from app.services.audit_service import record_audit
+from app.services.audit_service import external_nfs_configuration, record_audit, validate_external_nfs_path
 from app.services.auth_service import UserRecord
 from app.services.file_executor import submit_file_operation
 
 TEXT_PREVIEW_LIMIT = 2 * 1024 * 1024
 BINARY_PREVIEW_LIMIT = 2 * 1024 * 1024
 PREVIEWABLE_MEDIA_TYPE_PREFIXES = ("image/", "audio/", "video/")
+PREVIEWABLE_DOCUMENT_TYPES = {"application/pdf"}
+OFFICE_PREVIEW_SUFFIXES = {".doc", ".docx", ".ppt", ".pptx"}
+OFFICE_PREVIEW_MAX_SIZE = 100 * 1024 * 1024
+OFFICE_PREVIEW_TIMEOUT_SECONDS = 120
+OFFICE_PREVIEW_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 ACTIVE_JOB_STATES = ("pending", "running")
 ARCHIVE_SUFFIXES = {".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}
 MAX_ACTIVE_FILE_JOBS = 4
@@ -50,6 +58,8 @@ EDITABLE_TEXT_TYPES = {
 }
 STUDENT_FILES_SCOPE = "students"
 SHARED_FILES_SCOPE = "shared"
+NAS_FILES_SCOPE = "nas"
+NAS_DISPLAY_ROOT = "/NAS"
 
 
 def list_files(user: UserRecord, path: str, scope: str = "") -> FileListData:
@@ -60,6 +70,8 @@ def list_files(user: UserRecord, path: str, scope: str = "") -> FileListData:
         return list_student_files(user, normalized)
     if is_shared_files_scope(scope):
         return list_shared_files(user, normalized)
+    if is_nas_files_scope(scope):
+        return list_nas_files(user, normalized)
     real_path = resolve_user_visible_path(normalized, user.username, user.role.value)
     if not real_path.exists():
         return FileListData(path=normalized, items=[])
@@ -100,7 +112,22 @@ def preview_file(user: UserRecord, path: str, scope: str = "", full_content: boo
             **permission_data,
         )
 
-    if not is_previewable_media_type(content_type):
+    if is_office_preview_file(real_path):
+        # 先完成一次转换再返回预览元数据，让缺少 LibreOffice、文件损坏或超限等问题通过
+        # 正常 API 错误展示给用户；后续媒体请求命中同一个缓存，不会再次转换。
+        build_office_preview_pdf(real_path)
+        return FilePreviewData(
+            path=normalized,
+            content_type="application/pdf",
+            converted_from=content_type,
+            content="",
+            encoding="stream",
+            truncated=False,
+            size_bytes=size,
+            **permission_data,
+        )
+
+    if not is_previewable_file_type(content_type):
         return FilePreviewData(
             path=normalized,
             content_type=content_type,
@@ -112,8 +139,8 @@ def preview_file(user: UserRecord, path: str, scope: str = "", full_content: boo
             **permission_data,
         )
 
-    if content_type.startswith("video/"):
-        # 视频交给独立 Range 接口按播放进度读取，避免 Base64 截断导致只能播放开头。
+    if is_streamable_preview_type(content_type):
+        # 视频和 PDF 交给 Range 接口按需读取，避免 Base64 放大或截断大文件。
         return FilePreviewData(
             path=normalized,
             content_type=content_type,
@@ -358,11 +385,13 @@ def build_download_path(user: UserRecord, path: str, scope: str = "") -> Path:
     return real_path
 
 
-def build_video_stream_path(user: UserRecord, path: str, scope: str = "") -> Path:
-    """只允许视频文件进入媒体流接口，防止查询令牌把任意文件暴露成内联资源。"""
+def build_preview_stream_path(user: UserRecord, path: str, scope: str = "") -> Path:
+    """只允许图片、视频、PDF 和受支持的 Office 文档进入预览流接口。"""
     real_path = resolve_scoped_readable_existing_path(user, path, scope)
-    if not real_path.is_file() or not guess_content_type(real_path).startswith("video/"):
-        raise validation_error("path is not a previewable video file")
+    if real_path.is_file() and is_office_preview_file(real_path):
+        return build_office_preview_pdf(real_path)
+    if not real_path.is_file() or not is_streamable_preview_type(guess_content_type(real_path)):
+        raise validation_error("path is not a streamable preview file")
     return real_path
 
 
@@ -399,6 +428,9 @@ def complete_upload(user: UserRecord, directory_path: str, filename: str) -> dic
 def resolve_readable_existing_path(user: UserRecord, path: str, scope: str | None = None) -> Path:
     """解析可读路径并要求目标存在，便于读、复制、打包类操作复用。"""
     require_permission(user.role, "files:read")
+    if is_nas_files_scope(scope):
+        # NAS 只允许专用预览/下载链路读取，复制、打包和任务相关调用不能借用通用解析器。
+        raise forbidden("external NFS scope only supports browsing, preview and download")
     if is_shared_files_scope(scope):
         real_path = resolve_shared_visible_path(path)
     else:
@@ -416,6 +448,11 @@ def is_student_files_scope(scope: str | None) -> bool:
 def is_shared_files_scope(scope: str | None) -> bool:
     """判断是否进入共享文件夹视图；共享根独立配置，不依赖用户 home 边界。"""
     return (scope or "").strip().lower() == SHARED_FILES_SCOPE
+
+
+def is_nas_files_scope(scope: str | None) -> bool:
+    """识别独立 NAS 只读作用域；该作用域不会加入个人或任务可见根。"""
+    return (scope or "").strip().lower() == NAS_FILES_SCOPE
 
 
 def list_shared_files(user: UserRecord, normalized: str) -> FileListData:
@@ -456,6 +493,50 @@ def shared_display_path(path: str) -> str:
     """生成共享文件夹的展示路径，避免前端把共享视图误认为个人根目录。"""
     normalized = normalize_virtual_path(path)
     return "/共享文件夹" if normalized == "/" else f"/共享文件夹{normalized}"
+
+
+def list_nas_files(user: UserRecord, normalized: str) -> FileListData:
+    """列出 NAS 目录，响应只包含 /NAS 展示路径和虚拟条目，不泄露主节点真实挂载点。"""
+    require_permission(user.role, "files:read")
+    real_path = resolve_nas_visible_path(normalized)
+    display_path = nas_display_path(normalized)
+    if not real_path.exists():
+        return FileListData(path=normalized, display_path=display_path, items=[])
+    if not real_path.is_dir():
+        raise validation_error("path is not a directory")
+    items = [build_file_entry(child, normalized) for child in sorted(real_path.iterdir(), key=file_sort_key)]
+    return FileListData(path=normalized, display_path=display_path, items=items)
+
+
+def resolve_nas_readable_existing_path(user: UserRecord, path: str) -> Path:
+    """解析 NAS 中已存在的只读条目，权限和挂载状态在每次请求时重新确认。"""
+    require_permission(user.role, "files:read")
+    real_path = resolve_nas_visible_path(path)
+    if not real_path.exists():
+        raise not_found("path not found")
+    return real_path
+
+
+def resolve_nas_visible_path(path: str) -> Path:
+    """把 NAS 虚拟路径映射到数据库配置的挂载点，并阻止 .. 和符号链接逃逸。"""
+    enabled, configured_path = external_nfs_configuration()
+    if not enabled or not configured_path:
+        raise forbidden("external NFS share is disabled or not configured")
+    validate_external_nfs_path(configured_path)
+    nas_root = Path(configured_path).expanduser().resolve(strict=False)
+    if not nas_root.exists() or not nas_root.is_dir():
+        raise validation_error("external NFS share is unavailable")
+    normalized = normalize_virtual_path(path)
+    candidate = nas_root.joinpath(*PurePosixPath(normalized).parts[1:]).resolve(strict=False)
+    if candidate != nas_root and nas_root not in candidate.parents:
+        raise forbidden("path is outside external NFS share")
+    return candidate
+
+
+def nas_display_path(path: str) -> str:
+    """生成固定 NAS 展示路径，确保真实挂载目录不会进入普通用户响应。"""
+    normalized = normalize_virtual_path(path)
+    return NAS_DISPLAY_ROOT if normalized == "/" else f"{NAS_DISPLAY_ROOT}{normalized}"
 
 
 def list_student_files(user: UserRecord, normalized: str) -> FileListData:
@@ -582,6 +663,8 @@ def ensure_assigned_student(user: UserRecord, student_username: str) -> None:
 def resolve_writable_path(user: UserRecord, path: str, scope: str | None = None) -> Path:
     """解析可写路径；权限检查集中在这里，避免各操作遗漏 RBAC。"""
     require_permission(user.role, "files:write")
+    if is_nas_files_scope(scope):
+        raise forbidden("external NFS share is read-only")
     if is_shared_files_scope(scope):
         return resolve_shared_visible_path(path)
     return resolve_user_visible_path(path, user.username, user.role.value)
@@ -601,6 +684,8 @@ def resolve_scoped_readable_existing_path(user: UserRecord, path: str, scope: st
         return resolve_student_readable_existing_path(user, path)
     if is_shared_files_scope(scope):
         return resolve_shared_readable_existing_path(user, path)
+    if is_nas_files_scope(scope):
+        return resolve_nas_readable_existing_path(user, path)
     return resolve_readable_existing_path(user, path)
 
 
@@ -1010,9 +1095,116 @@ def is_text_file(path: Path, content_type: str) -> bool:
     return content_type.startswith("text/") or path.suffix.lower() in EDITABLE_TEXT_TYPES
 
 
-def is_previewable_media_type(content_type: str) -> bool:
-    """只允许前端已有渲染器支持的图片、音频和视频进入二进制预览流程。"""
-    return content_type.startswith(PREVIEWABLE_MEDIA_TYPE_PREFIXES)
+def is_previewable_file_type(content_type: str) -> bool:
+    """只允许前端已有渲染器支持的媒体和 PDF 进入内容预览流程。"""
+    return content_type.startswith(PREVIEWABLE_MEDIA_TYPE_PREFIXES) or content_type in PREVIEWABLE_DOCUMENT_TYPES
+
+
+def is_streamable_preview_type(content_type: str) -> bool:
+    """图片、视频和 PDF 使用 Range 流式加载，供媒体控件及 Markdown 相对图片按需读取。"""
+    return content_type.startswith(("image/", "video/")) or content_type in PREVIEWABLE_DOCUMENT_TYPES
+
+
+def is_office_preview_file(path: Path) -> bool:
+    """仅识别已经验证可由 LibreOffice 转换的 Word 和 PowerPoint 扩展名。"""
+    return path.suffix.lower() in OFFICE_PREVIEW_SUFFIXES
+
+
+def build_office_preview_pdf(source: Path) -> Path:
+    """把 Office 文档转换成缓存 PDF；缓存键不含明文路径，且不会修改源文件。"""
+    size = source.stat().st_size
+    if size > OFFICE_PREVIEW_MAX_SIZE:
+        raise validation_error("Office preview supports files up to 100 MiB")
+
+    cache_root = office_preview_cache_root()
+    source_stat = source.stat()
+    signature = f"{source.resolve(strict=False)}\0{source_stat.st_size}\0{source_stat.st_mtime_ns}"
+    cache_key = hashlib.sha256(signature.encode("utf-8", errors="surrogatepass")).hexdigest()
+    cached_pdf = cache_root / f"{cache_key}.pdf"
+    if cached_pdf.is_file() and cached_pdf.stat().st_size > 0:
+        return cached_pdf
+    converter = find_office_preview_converter()
+
+    # LibreOffice 会锁定用户配置目录。每次转换使用独立 profile，避免并发预览互相等待，
+    # 临时目录放在缓存根内，确保最终 os.replace 始终是同一文件系统上的原子操作。
+    conversion_root = Path(tempfile.mkdtemp(prefix=f".{cache_key}-", dir=cache_root))
+    output_root = conversion_root / "output"
+    profile_root = conversion_root / "profile"
+    output_root.mkdir()
+    profile_root.mkdir()
+    command = [
+        converter,
+        f"-env:UserInstallation={profile_root.as_uri()}",
+        "--headless",
+        "--nologo",
+        "--nodefault",
+        "--nofirststartwizard",
+        "--norestore",
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        str(output_root),
+        str(source),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=OFFICE_PREVIEW_TIMEOUT_SECONDS,
+        )
+        generated_files = list(output_root.glob("*.pdf"))
+        if completed.returncode != 0 or len(generated_files) != 1 or generated_files[0].stat().st_size <= 0:
+            raise validation_error("Office preview conversion failed; the document may be damaged or unsupported")
+        os.replace(generated_files[0], cached_pdf)
+    except subprocess.TimeoutExpired as exc:
+        raise validation_error("Office preview conversion timed out") from exc
+    except OSError as exc:
+        raise validation_error("Office preview conversion failed") from exc
+    finally:
+        # 这里只删除本次请求创建的唯一临时目录；已完成的 PDF 缓存保留供 Range 请求复用。
+        shutil.rmtree(conversion_root, ignore_errors=True)
+
+    cleanup_office_preview_cache(cache_root, keep=cached_pdf)
+    return cached_pdf
+
+
+def find_office_preview_converter() -> str:
+    """寻找 LibreOffice 命令；部署机未安装时返回可操作的错误，而不是读取原文件。"""
+    for command in ("libreoffice", "soffice"):
+        executable = shutil.which(command)
+        if executable:
+            return executable
+    raise validation_error("Office preview requires LibreOffice on the API host")
+
+
+def office_preview_cache_root() -> Path:
+    """使用主节点本地私有缓存，避免 NAS 文档副本进入任务共享的 NFS runtime 目录。"""
+    account_suffix = str(os.getuid()) if hasattr(os, "getuid") else "current-user"
+    cache_root = Path(tempfile.gettempdir()).resolve(strict=False) / f"nebulagrid-office-preview-{account_suffix}"
+    cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        # mkdir 的 mode 不会收紧已存在目录，因此每次都尝试恢复为仅 API 账号可访问。
+        cache_root.chmod(0o700)
+    except OSError:
+        # Windows 开发环境不提供完整 POSIX 权限语义，实际生产部署仍由 Linux 权限保护。
+        pass
+    return cache_root
+
+
+def cleanup_office_preview_cache(cache_root: Path, keep: Path) -> None:
+    """按固定寿命清理旧 PDF，限制多次修改同一文档造成的缓存增长。"""
+    expire_before = time.time() - OFFICE_PREVIEW_CACHE_MAX_AGE_SECONDS
+    for candidate in cache_root.glob("*.pdf"):
+        if candidate == keep:
+            continue
+        try:
+            if candidate.stat().st_mtime < expire_before:
+                candidate.unlink()
+        except OSError:
+            # 清理失败不影响当前预览；下次转换仍会再次尝试。
+            continue
 
 
 def read_file_prefix(path: Path, limit: int) -> bytes:

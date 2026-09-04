@@ -62,7 +62,14 @@ sudo apt update
 sudo apt install -y \
   build-essential curl git rsync nginx \
   nfs-kernel-server postgresql postgresql-contrib redis-server \
-  influxdb2 openssh-client samba acl
+  influxdb2 openssh-client samba acl \
+  libreoffice-writer libreoffice-impress fonts-noto-cjk
+```
+
+`libreoffice-writer` 和 `libreoffice-impress` 只需要安装在运行 API 的主节点，用于把 `.doc`、`.docx`、`.ppt`、`.pptx` 转成 PDF 后在线预览；计算节点不需要安装。`fonts-noto-cjk` 用于降低中文文档转换时缺字或字体替换的概率。安装后验证：
+
+```bash
+libreoffice --version
 ```
 
 启动基础服务：
@@ -204,6 +211,25 @@ sudo exportfs -ra
 sudo exportfs -v
 sudo systemctl restart nfs-kernel-server
 ```
+
+### 5.1 可选：在主节点挂载实验室 NAS
+
+如果实验室已有 NAS，可以把它通过 NFS 单独挂载到主节点，再由文件管理页面提供只读访问。这个挂载点只用于浏览、预览和下载，不能放在 `/home/ddltm/data`、`/home/ddltm/envs`、用户 home 根目录或任何 `NEBULAGRID_VISIBLE_ROOTS` 之内；否则管理员保存配置时会被拒绝。不要把这个 NAS 挂载点同步到计算节点，也不要把它加入任务可见根。
+
+下面以 NAS 导出 `nas.example:/export/lab-data`、主节点挂载点 `/mnt/lab-nas` 为例。实际地址和导出目录请按现场环境替换：
+
+```bash
+sudo apt install -y nfs-common
+sudo mkdir -p /mnt/lab-nas
+echo 'nas.example:/export/lab-data /mnt/lab-nas nfs4 ro,nofail,_netdev,x-systemd.automount 0 0' | sudo tee -a /etc/fstab
+sudo mount -a
+findmnt /mnt/lab-nas
+sudo -u ddltm test -r /mnt/lab-nas && echo 'NAS readable'
+```
+
+建议同时在客户端挂载参数和 NAS 端导出权限上限制为只读。NebulaGrid 后端还会拒绝 NAS 作用域的上传、新建、保存、复制、移动、重命名、删除、打包、解压和权限修改，但操作系统层面的只读挂载仍是更稳妥的第二道保护。
+
+挂载验证成功后，以管理员身份进入 `管理员后台 → 系统设置`，先把 `external_nfs.path` 设置为主节点上的绝对挂载路径 `/mnt/lab-nas`，再把 `external_nfs.enabled` 设置为 `true`。这两个值保存在 PostgreSQL 的 `settings` 表中，不需要写入 `backend.env`；普通用户的运行时配置只会收到是否启用，不会收到真实挂载路径。刷新页面后，“共享文件夹”按钮后面会出现“查看NAS文件”。
 
 ## 6. 计算节点挂载 NFS
 
@@ -959,7 +985,15 @@ curl -s http://127.0.0.1:8000/api/tasks \
 
 文件预览下方提供 `文件权限` 面板。用户上传 `.sh` 后，如果任务命令直接使用 `./script.sh` 运行脚本，应先在文件管理中打开该脚本并点击 `授予执行权限`。后端会设置文件属主执行位；在系统支持 `setfacl` 时，还会给 `NEBULAGRID_MAIN_LINUX_USER` 对应的主账户写入 `rwx` ACL，覆盖 SSH 子账户上传文件缺少主账户执行权限的情况。该操作只允许在个人文件可写边界内执行，并写入文件审计日志。
 
+Markdown 文件默认以原始文本打开，编辑器下方显示“预览”按钮；点击后使用前端安全转义的 Markdown 渲染器展示内容，按钮变为“源文件”，再次点击即可返回文本模式。切换到预览前会保留文本框中尚未保存的修改，预览模式下“保存”按钮禁用，返回源文件后再保存。超过 2 MiB 的 Markdown 仍只加载前 2 MiB，页面会同时显示“加载完整文件”和模式切换按钮；系统不会因为点击“预览”而隐式读取完整文件。
+
+`.doc`、`.docx`、`.ppt`、`.pptx` 不由浏览器直接解析。用户点击后，API 使用主节点上的 LibreOffice 无界面转换为 PDF，再复用 PDF Range 预览器按需加载；“下载选中”仍下载原始 Office 文件。单个 Office 文件的在线预览上限为 100 MiB，转换超时为 120 秒。转换结果缓存在主节点本地临时目录 `$(python -c 'import tempfile; print(tempfile.gettempdir())')/nebulagrid-office-preview-<uid>`，目录权限收紧为 `0700`；它不会写入 NFS 共享的 `NEBULAGRID_RUNTIME_ROOT`，因此也不会把 NAS 文档副本同步给计算节点。缓存键包含源路径哈希、文件大小和修改时间，同一版本只转换一次，源文件变化后自动生成新缓存；超过 24 小时的旧 PDF 会在后续转换时渐进清理。NAS 中的 Office 文件也只读取源文件，不会写回 NAS。
+
+首次转换可能需要几秒到几十秒，复杂排版、未安装字体、嵌入对象或损坏文件可能导致版式差异或转换失败。出现 `Office preview requires LibreOffice on the API host` 时检查主节点安装和 API 服务的 `PATH`；出现超时或转换失败时，先用本机 LibreOffice 打开原文件确认它未损坏，再检查 `journalctl -u nebulagrid-api` 和系统临时目录写权限。
+
 文件管理还提供共享文件夹视图，对应 `NEBULAGRID_SHARED_FOLDER_ROOT`，默认绝对路径为 `/home/ddltm/shared`。所有登录用户可以查看共享文件夹，并通过页面按钮把个人目录中的文件或文件夹复制到共享文件夹，也可以在共享文件夹中复制回自己的目录。共享视图只开放查看、下载和复制回个人目录，避免用户误删共享 SSD 根目录或其他人的资料。
+
+管理员在数据库设置中配置 `external_nfs.path` 并启用 `external_nfs.enabled` 后，文件管理会在“共享文件夹”后显示“查看NAS文件”。页面统一用 `/NAS` 作为展示根路径，列表、预览、媒体流和下载响应都不会暴露主节点的真实挂载路径。NAS 视图只允许进入目录、预览受支持的文本/图片/音频/视频/PDF 文件和下载单个文件；不允许上传、新建、保存、复制、移动、重命名、删除、打包、解压或修改权限。任务项目路径选择器不会显示 NAS；`/NAS` 只是文件管理中的展示标签，不能用它在任务命令或项目路径中引用外部 NAS。
 
 列表、预览、上传、创建、保存、复制、移动、删除、打包和解压统一进入专用文件线程池，避免共享盘或 NFS IO 抖动挤占 FastAPI 默认请求线程。线程数由 `NEBULAGRID_FILE_OPERATION_WORKER_THREADS` 控制，默认 `2`；调大前应先确认共享盘吞吐足够。
 
@@ -1116,6 +1150,16 @@ showmount -e master
 sudo mount -v -t nfs master:/home/ddltm/data /home/ddltm/data
 sudo mount -v -t nfs master:/home/ddltm/envs /home/ddltm/envs
 ```
+
+如果是文件管理中的外部 NAS 入口失败，只在主节点检查管理员配置的挂载点：
+
+```bash
+findmnt /mnt/lab-nas
+sudo -u ddltm test -r /mnt/lab-nas && echo 'NAS readable'
+journalctl -u nebulagrid-api -n 100 --no-pager
+```
+
+确认 `external_nfs.enabled=true`、`external_nfs.path` 是主节点已挂载的绝对目录，并且 API 运行账号对沿途目录有执行权限、对文件有读取权限。若要卸载或更换 NAS，先把 `external_nfs.enabled` 改为 `false`，刷新用户页面确认入口消失，再执行卸载。不要把真实挂载路径加入用户 home、`NEBULAGRID_VISIBLE_ROOTS` 或任务项目目录；外部 NAS 只供 Web 文件管理只读访问。
 
 ### 19.6 SSH 免密失败
 
@@ -1366,6 +1410,8 @@ sudo smbclient //127.0.0.1/test1 -U test1
 如果 Samba 状态在页面显示“失败”，优先检查 `journalctl -u nebulagrid-api`、`journalctl -u smbd`、`testparm`、`sudo smbclient //127.0.0.1/<user_name> -U <user_name>` 和 sudoers 路径。如果 Samba 上传成功但 `ddltm` 不能更新用户目录内的新文件，优先用 `testparm -s | grep -A15 '^\[homes\]'` 确认当前生效配置里是否仍是旧的 `force user = %S`，再检查父目录 ACL；不要先改成宽范围 `chown -R ddltm`。Samba 协议只暴露主节点上的用户目录，不替代 NFS；NFS 仍然负责 master 与计算节点之间的训练数据和日志共享。
 
 文件管理页面提供“共享文件夹”视图，所有登录用户都可以查看 `NEBULAGRID_SHARED_FOLDER_ROOT` 指向的共享 SSD 目录。默认部署路径为 `/home/ddltm/shared`；如果现场用 `~/ddltm/shared` 这类写法，请在写入 `backend.env` 前先展开成 API 运行用户实际看到的绝对路径，避免 systemd 环境中 `~` 指向不同 home。用户可把个人目录中的文件或文件夹复制到共享文件夹，也可在共享文件夹中把文件或文件夹复制回自己的目录；新建、删除、重命名、上传、打包和解压仍限定在个人文件视图内，避免共享根被误操作。
+
+外部 NAS 与上述平台共享目录是两个独立作用域。NAS 的启用状态和真实挂载点分别保存在数据库设置 `external_nfs.enabled`、`external_nfs.path` 中；后者只在管理员系统设置中展示，普通运行时响应和文件列表只使用 `/NAS` 虚拟路径。NAS 视图严格只读且不可复制，任务目录选择和执行路径保持原样，不会访问该挂载点。管理员配置时必须使用独立绝对目录，并确保它与用户 home 根、主账户 home 及 `NEBULAGRID_VISIBLE_ROOTS` 都不重叠。
 
 不要给 `ddltm` 配置宽泛的 `NOPASSWD: ALL`，这样会扩大系统风险。
 

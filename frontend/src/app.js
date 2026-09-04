@@ -63,6 +63,7 @@ const state = {
   envPackageInstall: null,
   envPackageDelete: null,
   fileViewScope: "own",
+  fileMarkdownPreviewPath: "",
   data: {
     dashboard: null,
     presenter: null,
@@ -88,7 +89,7 @@ const state = {
     adminOnlineUsers: [],
     adminUserSessions: [],
     nodeOwnerUsers: [],
-    runtimeConfig: { shared_folder_root: "/home/ddltm/shared" },
+    runtimeConfig: { shared_folder_root: "/home/ddltm/shared", external_nfs_enabled: false },
   },
 };
 
@@ -520,7 +521,7 @@ async function loadMe() {
   ]);
   state.user = userPayload.data;
   state.data.runtimeConfig = configPayload.data;
-  if (isStudentFileView() && !canViewStudentFiles()) state.fileViewScope = "own";
+  ensureFileViewScopeAvailable();
   ensureVisiblePage();
 }
 
@@ -890,8 +891,16 @@ function isSharedFileView() {
   return state.fileViewScope === "shared";
 }
 
+function isNasFileView() {
+  return state.fileViewScope === "nas";
+}
+
+function nasFeatureEnabled() {
+  return Boolean(state.data.runtimeConfig?.external_nfs_enabled);
+}
+
 function isReadOnlyFileView() {
-  return isStudentFileView() || isSharedFileView();
+  return isStudentFileView() || isSharedFileView() || isNasFileView();
 }
 
 function canViewStudentFiles() {
@@ -900,12 +909,23 @@ function canViewStudentFiles() {
 
 function fileQuery(path, scope = state.fileViewScope) {
   const params = new URLSearchParams({ path: path || "/" });
-  if (scope === "students" || scope === "shared") params.set("scope", scope);
+  if (["students", "shared", "nas"].includes(scope)) params.set("scope", scope);
   return params.toString();
 }
 
+function ensureFileViewScopeAvailable() {
+  const invalidStudentView = isStudentFileView() && !canViewStudentFiles();
+  const invalidNasView = isNasFileView() && !nasFeatureEnabled();
+  if (!invalidStudentView && !invalidNasView) return;
+  state.fileViewScope = "own";
+  state.data.files = { path: "/", items: [] };
+  state.data.preview = null;
+  state.data.selectedFilePath = "";
+  state.fileMarkdownPreviewPath = "";
+}
+
 function fileMediaUrl(path) {
-  // video 元素无法附加 Bearer 请求头，因此媒体接口沿用任务事件流的查询令牌鉴权方式。
+  // video/iframe 元素无法附加 Bearer 请求头，因此媒体接口沿用任务事件流的查询令牌鉴权方式。
   const params = new URLSearchParams(fileQuery(path));
   params.set("token", state.token);
   return `${state.apiBase.replace(/\/$/, "")}/files/media?${params.toString()}`;
@@ -914,6 +934,7 @@ function fileMediaUrl(path) {
 function requireOwnFileViewForWrite() {
   if (isStudentFileView()) throw new Error("学生文件视图仅支持查看");
   if (isSharedFileView()) throw new Error("共享文件夹视图仅支持查看和复制到我的文件夹");
+  if (isNasFileView()) throw new Error("NAS 文件仅支持查看和下载");
 }
 
 function displayFilePath(path) {
@@ -923,6 +944,10 @@ function displayFilePath(path) {
   const normalizedPath = normalizeClientPath(path || "/");
   const normalizedCurrent = normalizeClientPath(currentPath);
   if (normalizedPath === normalizedCurrent) return currentDisplayPath;
+  if (normalizedCurrent === "/" && currentDisplayPath !== "/") {
+    // 共享目录和 NAS 都使用虚拟根；根目录条目也必须带展示前缀，不能退回看似真实的裸路径。
+    return `${currentDisplayPath}${normalizedPath}`;
+  }
   if (normalizedCurrent !== "/" && normalizedPath.startsWith(`${normalizedCurrent}/`)) {
     return `${currentDisplayPath}${normalizedPath.slice(normalizedCurrent.length)}`;
   }
@@ -1537,6 +1562,7 @@ async function openPath(path, scope = state.fileViewScope) {
   state.data.files.path = path;
   state.data.preview = null;
   state.data.selectedFilePath = "";
+  state.fileMarkdownPreviewPath = "";
   await refreshPage();
 }
 
@@ -1544,6 +1570,7 @@ async function previewFile(path) {
   // 先展示选择结果，避免长文件名在预览请求完成前仍处于不可见状态。
   state.data.selectedFilePath = path;
   state.data.preview = null;
+  state.fileMarkdownPreviewPath = "";
   render();
   const payload = await api(`/files/preview?${fileQuery(path)}`);
   // 用户若在请求期间切换了条目，旧响应不能覆盖新选择对应的右侧面板。
@@ -1552,6 +1579,7 @@ async function previewFile(path) {
 }
 
 function selectFile(path, kind = "") {
+  if (state.data.selectedFilePath !== path) state.fileMarkdownPreviewPath = "";
   state.data.selectedFilePath = path;
   if (kind === "directory") state.data.preview = null;
   render();
@@ -1567,6 +1595,11 @@ async function toggleStudentFileView() {
 
 async function toggleSharedFileView() {
   await openPath("/", isSharedFileView() ? "own" : "shared");
+}
+
+async function toggleNasFileView() {
+  if (!nasFeatureEnabled()) throw new Error("管理员尚未启用外部 NFS 共享");
+  await openPath("/", isNasFileView() ? "own" : "nas");
 }
 
 async function createFolderFromPrompt() {
@@ -1790,7 +1823,7 @@ async function uploadCurrentFile(event) {
 async function saveCurrentFile(content) {
   requireOwnFileViewForWrite();
   const preview = state.data.preview;
-  if (!preview?.path || preview.encoding !== "text" || preview.truncated || preview.can_save === false) {
+  if (!preview?.path || preview.encoding !== "text" || preview.truncated || preview.can_save === false || isMarkdownPreviewActive(preview)) {
     throw new Error("当前文件不可保存");
   }
   await api("/files/save", { method: "POST", body: JSON.stringify({ path: preview.path, content }) });
@@ -1802,6 +1835,30 @@ async function loadFullTextFile(path) {
   // 完整文件返回期间若用户切换了条目，不使用旧响应覆盖当前预览。
   if (state.data.selectedFilePath !== path) return;
   state.data.preview = payload.data;
+}
+
+function isMarkdownFile(path) {
+  return String(path || "").toLowerCase().endsWith(".md");
+}
+
+function isMarkdownPreviewActive(preview = state.data.preview) {
+  return Boolean(preview?.path && isMarkdownFile(preview.path) && state.fileMarkdownPreviewPath === preview.path);
+}
+
+function toggleMarkdownFilePreview(path) {
+  const preview = state.data.preview;
+  if (!preview?.path || preview.path !== path || preview.encoding !== "text" || !isMarkdownFile(path)) {
+    throw new Error("当前文件不支持 Markdown 预览");
+  }
+  if (isMarkdownPreviewActive(preview)) {
+    state.fileMarkdownPreviewPath = "";
+  } else {
+    // 切换前同步文本框中的未保存内容，使预览和返回源文件时都不会丢失用户刚输入的修改。
+    const editor = document.querySelector("#fileEditor");
+    if (editor) state.data.preview = { ...preview, content: editor.value };
+    state.fileMarkdownPreviewPath = path;
+  }
+  render();
 }
 
 async function grantCurrentFileExecutePermission() {
@@ -1816,7 +1873,9 @@ async function grantCurrentFileExecutePermission() {
 async function downloadSelectedPath() {
   const source = requireSelectedPath();
   const selectedItem = currentSelectedFileItem();
-  if (isReadOnlyFileView() && selectedItem?.type === "directory") throw new Error("只读视图中的文件夹请进入查看或使用复制按钮");
+  if (isReadOnlyFileView() && selectedItem?.type === "directory") {
+    throw new Error(isNasFileView() ? "NAS 文件夹请进入后选择文件下载" : "只读视图中的文件夹请进入查看或使用复制按钮");
+  }
   if (selectedItem?.type === "directory") {
     await archiveSelectedFolder();
     return;
@@ -2906,12 +2965,17 @@ function renderFiles() {
   const preview = state.data.preview;
   const studentView = isStudentFileView();
   const sharedView = isSharedFileView();
+  const nasView = isNasFileView();
   const readOnlyView = isReadOnlyFileView();
+  const markdownPreviewActive = isMarkdownPreviewActive(preview);
   const selectedName = selected ? baseName(selected) : "";
   const studentFilesButton = canViewStudentFiles()
     ? `<button class="secondary ${studentView ? "active" : ""}" data-file-students>${studentView ? "查看我的文件" : "查看学生文件"}</button>`
     : "";
   const sharedFilesButton = `<button class="secondary ${sharedView ? "active" : ""}" data-file-shared>${sharedView ? "查看我的文件" : "共享文件夹"}</button>`;
+  const nasFilesButton = nasFeatureEnabled()
+    ? `<button class="secondary ${nasView ? "active" : ""}" data-file-nas>${nasView ? "查看我的文件" : "查看NAS文件"}</button>`
+    : "";
   return shell(`
     <section class="file-manager">
       <aside class="file-sidebar-panel">
@@ -2921,6 +2985,7 @@ function renderFiles() {
           <button class="secondary" data-action="refresh">刷新</button>
           ${studentFilesButton}
           ${sharedFilesButton}
+          ${nasFilesButton}
         </div>
         <div class="file-path">${escapeHtml(currentDisplayPath)}</div>
         <div class="file-list" role="list" data-preserve-scroll="file-list">
@@ -2959,7 +3024,7 @@ function renderFiles() {
       <section class="file-editor-panel">
         <div class="file-editor-toolbar">
           <span class="status" title="${escapeAttr(selected ? displayFilePath(selected) : "")}">${selected ? `已选择：${escapeHtml(displayFilePath(selected))}` : "未选择文件或文件夹"}</span>
-          <button data-file-save ${preview?.encoding === "text" && !preview.truncated && preview.can_save !== false && !readOnlyView ? "" : "disabled"}>保存</button>
+          <button data-file-save ${preview?.encoding === "text" && !preview.truncated && preview.can_save !== false && !readOnlyView && !markdownPreviewActive ? "" : "disabled"}>保存</button>
         </div>
         ${renderFilePreview(preview, readOnlyView)}
         ${renderFilePermissionPanel(preview, readOnlyView)}
@@ -2976,10 +3041,29 @@ function renderFilePreview(preview, readOnly = false) {
   if (preview.encoding === "text") {
     const previewLimit = preview.preview_limit_bytes || 2 * 1024 * 1024;
     const viewOnly = readOnly || preview.truncated || preview.can_save === false;
-    const note = preview.truncated
-      ? `<div class="file-note-row"><p class="file-note">文件超过 ${formatBytes(previewLimit)}，当前仅显示前 ${formatBytes(previewLimit)}。</p><button type="button" class="secondary" data-file-load-full="${escapeAttr(preview.path)}" ${state.loading ? "disabled" : ""}>加载完整文件</button></div>`
-      : (preview.size_bytes > previewLimit ? `<p class="file-note loaded">已加载完整文件（${formatBytes(preview.size_bytes)}）。超过 ${formatBytes(previewLimit)} 的文本仅供在线查看，不能直接保存。</p>` : "");
-    return `<div class="file-editor-shell"><textarea id="fileEditor" class="file-editor" spellcheck="false" ${viewOnly ? "readonly" : ""}>${escapeHtml(preview.content || "")}</textarea>${note}</div>`;
+    const markdownFile = isMarkdownFile(preview.path);
+    const markdownPreviewActive = isMarkdownPreviewActive(preview);
+    const noteText = preview.truncated
+      ? `文件超过 ${formatBytes(previewLimit)}，当前仅显示前 ${formatBytes(previewLimit)}。`
+      : (preview.size_bytes > previewLimit
+        ? `已加载完整文件（${formatBytes(preview.size_bytes)}）。超过 ${formatBytes(previewLimit)} 的文本仅供在线查看，不能直接保存。`
+        : (markdownFile ? "Markdown 文件可在源文件和渲染预览之间切换。" : ""));
+    const noteClass = preview.size_bytes > previewLimit && !preview.truncated ? "file-note loaded" : "file-note";
+    const actions = [
+      preview.truncated
+        ? `<button type="button" class="secondary" data-file-load-full="${escapeAttr(preview.path)}" ${state.loading ? "disabled" : ""}>加载完整文件</button>`
+        : "",
+      markdownFile
+        ? `<button type="button" class="secondary" data-file-markdown-toggle="${escapeAttr(preview.path)}">${markdownPreviewActive ? "源文件" : "预览"}</button>`
+        : "",
+    ].filter(Boolean).join("");
+    const footer = noteText || actions
+      ? `<div class="file-note-row"><p class="${noteClass}">${escapeHtml(noteText)}</p><div class="file-note-actions">${actions}</div></div>`
+      : "";
+    const body = markdownPreviewActive
+      ? `<article class="file-markdown-preview markdown-body">${renderMarkdown(preview.content || "", { sourcePath: preview.path })}</article>`
+      : `<textarea id="fileEditor" class="file-editor" spellcheck="false" ${viewOnly ? "readonly" : ""}>${escapeHtml(preview.content || "")}</textarea>`;
+    return `<div class="file-editor-shell">${body}${footer}</div>`;
   }
   if (preview.previewable === false || preview.encoding === "none") {
     return `<div class="file-binary-preview"><strong>${escapeHtml(baseName(preview.path))}</strong><span>${escapeHtml(preview.content_type)} · ${formatBytes(preview.size_bytes)}</span><p>该文件类型不支持在线预览，未加载文件内容。可使用“下载选中”获取文件。</p></div>`;
@@ -2987,6 +3071,20 @@ function renderFilePreview(preview, readOnly = false) {
   const source = preview.encoding === "stream"
     ? fileMediaUrl(preview.path)
     : `data:${preview.content_type};base64,${preview.content}`;
+  if (preview.content_type === "application/pdf") {
+    const pdfSource = `${source}#toolbar=1&navpanes=0&view=FitH`;
+    const pdfNote = preview.converted_from
+      ? "Office 文件已转换为 PDF 供在线预览；下载选中仍会获取原始文件。"
+      : "若浏览器未显示 PDF，请使用新窗口打开或下载文件。";
+    return `
+      <div class="file-pdf-preview">
+        <iframe src="${escapeAttr(pdfSource)}" title="PDF 预览：${escapeAttr(baseName(preview.path))}" referrerpolicy="no-referrer"></iframe>
+        <div class="file-pdf-footer">
+          <span>${escapeHtml(pdfNote)}</span>
+          <a href="${escapeAttr(source)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">新窗口打开</a>
+        </div>
+      </div>`;
+  }
   if (preview.content_type.startsWith("image/")) {
     return `<div class="file-media-preview"><img src="${escapeAttr(source)}" alt="${escapeAttr(baseName(preview.path))}"></div>`;
   }
@@ -4502,11 +4600,11 @@ function vramUsedPercent(gpu) {
   return Math.round((used / gpu.total_vram_mb) * 100);
 }
 
-function renderMarkdown(markdown) {
-  return renderMarkdownDocument(markdown).html;
+function renderMarkdown(markdown, options = {}) {
+  return renderMarkdownDocument(markdown, options).html;
 }
 
-function renderMarkdownDocument(markdown) {
+function renderMarkdownDocument(markdown, options = {}) {
   const lines = String(markdown || "").split(/\r?\n/);
   const html = [];
   const toc = [];
@@ -4543,6 +4641,12 @@ function renderMarkdownDocument(markdown) {
       closeList();
       continue;
     }
+    const rawImage = renderRawMarkdownImage(line, options);
+    if (rawImage) {
+      closeList();
+      html.push(rawImage);
+      continue;
+    }
     if (line.trim().startsWith("|")) {
       closeList();
       const tableLines = [];
@@ -4551,7 +4655,7 @@ function renderMarkdownDocument(markdown) {
         index += 1;
       }
       index -= 1;
-      html.push(renderMarkdownTable(tableLines));
+      html.push(renderMarkdownTable(tableLines, options));
       continue;
     }
     const heading = line.match(/^(#{1,4})\s+(.+)$/);
@@ -4561,7 +4665,7 @@ function renderMarkdownDocument(markdown) {
       const headingText = stripInlineMarkdown(heading[2]);
       const id = uniqueMarkdownHeadingId(headingText, headingIds);
       toc.push({ id, text: headingText, level: heading[1].length });
-      html.push(`<h${level} id="${escapeAttr(id)}">${inlineMarkdown(heading[2])}</h${level}>`);
+      html.push(`<h${level} id="${escapeAttr(id)}">${inlineMarkdown(heading[2], options)}</h${level}>`);
       continue;
     }
     const list = line.match(/^\s*[-*]\s+(.+)$/);
@@ -4570,24 +4674,24 @@ function renderMarkdownDocument(markdown) {
         html.push("<ul>");
         inList = true;
       }
-      html.push(`<li>${inlineMarkdown(list[1])}</li>`);
+      html.push(`<li>${inlineMarkdown(list[1], options)}</li>`);
       continue;
     }
     if (line.startsWith(">")) {
       closeList();
-      html.push(`<blockquote>${inlineMarkdown(line.replace(/^>\s?/, ""))}</blockquote>`);
+      html.push(`<blockquote>${inlineMarkdown(line.replace(/^>\s?/, ""), options)}</blockquote>`);
       continue;
     }
     closeList();
-    html.push(`<p>${inlineMarkdown(line)}</p>`);
+    html.push(`<p>${inlineMarkdown(line, options)}</p>`);
   }
   closeList();
   return { html: html.join(""), toc };
 }
 
-function renderMarkdownTable(lines) {
+function renderMarkdownTable(lines, options = {}) {
   const rows = lines
-    .map((line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => inlineMarkdown(cell.trim())))
+    .map((line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => inlineMarkdown(cell.trim(), options)))
     .filter((row) => !row.every((cell) => /^:?-{3,}:?$/.test(cell)));
   if (!rows.length) return "";
   const [head, ...body] = rows;
@@ -4601,10 +4705,92 @@ function renderMarkdownTable(lines) {
   `;
 }
 
-function inlineMarkdown(value) {
+function inlineMarkdown(value, options = {}) {
+  const replacements = [];
+  const preserve = (html) => {
+    const token = `\u0000ng-markdown-${replacements.length}\u0000`;
+    replacements.push(html);
+    return token;
+  };
+  let text = String(value || "")
+    .replace(/`([^`]+)`/g, (_match, code) => preserve(`<code>${escapeHtml(code)}</code>`))
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g, (_match, alt, target) => (
+      preserve(renderMarkdownImage(target, alt, options))
+    ))
+    .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g, (_match, label, target) => (
+      preserve(renderMarkdownLink(label, target, options))
+    ));
+  text = escapeHtml(text).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  return text.replace(/\u0000ng-markdown-(\d+)\u0000/g, (_match, index) => replacements[Number(index)] || "");
+}
+
+function renderRawMarkdownImage(line, options = {}) {
+  const tag = String(line || "").trim().match(/^<img\b([^>]*)\/?\s*>$/i);
+  if (!tag) return "";
+  const source = markdownHtmlAttribute(tag[1], "src");
+  if (!source) return "";
+  const alt = markdownHtmlAttribute(tag[1], "alt");
+  const image = renderMarkdownImage(source, alt, options);
+  return `<figure class="markdown-image-frame">${image}${alt ? `<figcaption>${escapeHtml(alt)}</figcaption>` : ""}</figure>`;
+}
+
+function markdownHtmlAttribute(attributes, name) {
+  const pattern = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i");
+  const match = String(attributes || "").match(pattern);
+  return match ? (match[1] ?? match[2] ?? "") : "";
+}
+
+function renderMarkdownImage(target, alt, options = {}) {
+  const source = resolveMarkdownImageSource(target, options.sourcePath);
+  if (!source) return `<span class="markdown-image-error">无法加载图片：${escapeHtml(alt || target)}</span>`;
+  return `<img class="markdown-image" src="${escapeAttr(source)}" alt="${escapeAttr(alt || "")}" loading="lazy" decoding="async" referrerpolicy="no-referrer">`;
+}
+
+function renderMarkdownLink(label, target, options = {}) {
+  const text = formatMarkdownLinkLabel(label);
+  const href = String(target || "").trim().replace(/^<|>$/g, "");
+  if (href.startsWith("#")) {
+    // 页内锚点仅定位当前预览区域，不把 #章节 误判成同目录文件路径。
+    return `<a href="${escapeAttr(href)}" data-markdown-anchor="${escapeAttr(href.slice(1))}">${text}</a>`;
+  }
+  if (/^(https?:|mailto:)/i.test(href)) {
+    return `<a href="${escapeAttr(href)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">${text}</a>`;
+  }
+  if (options.sourcePath && href && !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+    const filePath = resolveMarkdownAssetPath(options.sourcePath, href);
+    return `<a href="#" data-markdown-file-link="${escapeAttr(filePath)}">${text}</a>`;
+  }
+  return text;
+}
+
+function formatMarkdownLinkLabel(value) {
   return escapeHtml(value)
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+
+function resolveMarkdownImageSource(target, sourcePath) {
+  const source = String(target || "").trim().replace(/^<|>$/g, "");
+  if (/^https?:\/\//i.test(source) || /^\/\//.test(source) || /^data:image\//i.test(source)) return source;
+  if (!sourcePath || /^[a-z][a-z0-9+.-]*:/i.test(source)) return "";
+  return fileMediaUrl(resolveMarkdownAssetPath(sourcePath, source));
+}
+
+function resolveMarkdownAssetPath(sourcePath, target) {
+  const rawPath = String(target || "").split(/[?#]/, 1)[0];
+  let decodedPath = rawPath;
+  try {
+    decodedPath = decodeURIComponent(rawPath);
+  } catch (_error) {
+    // 非法百分号编码按原始文件名处理，最终仍由后端路径边界校验。
+  }
+  const parts = decodedPath.startsWith("/") ? [] : parentPath(sourcePath).split("/").filter(Boolean);
+  decodedPath.replaceAll("\\", "/").split("/").filter(Boolean).forEach((part) => {
+    if (part === ".") return;
+    if (part === "..") parts.pop();
+    else parts.push(part);
+  });
+  return `/${parts.join("/")}`;
 }
 
 function stripInlineMarkdown(value) {
@@ -4886,6 +5072,7 @@ function bindEvents() {
   document.querySelector("[data-file-up]")?.addEventListener("click", () => run(openParentPath));
   document.querySelector("[data-file-students]")?.addEventListener("click", () => run(toggleStudentFileView));
   document.querySelector("[data-file-shared]")?.addEventListener("click", () => run(toggleSharedFileView));
+  document.querySelector("[data-file-nas]")?.addEventListener("click", () => run(toggleNasFileView));
   document.querySelector("[data-file-new-folder]")?.addEventListener("click", () => run(createFolderFromPrompt, "文件夹已创建"));
   document.querySelector("[data-file-new-file]")?.addEventListener("click", () => run(createFileFromPrompt, "文件已创建"));
   document.querySelector("[data-file-rename]")?.addEventListener("click", () => run(renameSelectedPath, "已重命名"));
@@ -4905,6 +5092,27 @@ function bindEvents() {
   document.querySelector("[data-file-load-full]")?.addEventListener("click", (event) => {
     const path = event.currentTarget.dataset.fileLoadFull;
     run(() => loadFullTextFile(path));
+  });
+  document.querySelector("[data-file-markdown-toggle]")?.addEventListener("click", (event) => {
+    toggleMarkdownFilePreview(event.currentTarget.dataset.fileMarkdownToggle);
+  });
+  document.querySelectorAll("[data-markdown-file-link]").forEach((link) => {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      run(() => previewFile(event.currentTarget.dataset.markdownFileLink));
+    });
+  });
+  document.querySelectorAll("[data-markdown-anchor]").forEach((link) => {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      let targetId = event.currentTarget.dataset.markdownAnchor || "";
+      try {
+        targetId = decodeURIComponent(targetId);
+      } catch (_error) {
+        // 非法百分号编码保持原样，避免一个异常锚点影响整页事件绑定。
+      }
+      document.getElementById(targetId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   });
   bindVideoPlayerEvents();
   document.querySelectorAll("[data-select-file]").forEach((button) => {

@@ -1,10 +1,12 @@
 from dataclasses import fields
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import String, cast, func, or_, select
 
 from app.core.config import get_settings
+from app.core.errors import validation_error
 from app.core.rbac import require_permission
 from app.core.time_utils import ensure_local_datetime, local_datetime, local_now, parse_datetime_local
 from app.db.models import AuditLog, Setting, User
@@ -41,6 +43,8 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "main.linux_user": "主控 Linux 账号名，管理员账号通常映射到该系统用户。",
     "manage.linux_accounts": "是否由 NebulaGrid 自动创建和维护 Linux 子账号。",
     "manage.samba_accounts": "是否由 NebulaGrid 自动执行 smbpasswd/pdbedit 来维护用户 Samba 账号；关闭时只记录用户期望状态，不改动系统 Samba 数据库。",
+    "external_nfs.enabled": "是否在文件管理器中启用外部 NAS/NFS 只读入口；启用前必须配置独立挂载路径。",
+    "external_nfs.path": "NAS 通过 NFS 挂载到主节点后的真实绝对路径；只对管理员显示，不会暴露给普通用户。",
     "session.secret": "登录会话签名密钥；生产环境应使用外部密钥并定期轮换。",
     "monitor.interval_seconds": "节点监控远端循环输出间隔，单位为秒；worker 会为每个可监控节点保持 SSH 长连接。",
     "monitor.reconnect_attempts": "节点监控 SSH 长连接断开后的自动重连次数；达到上限后节点保持离线并停止继续连接。",
@@ -53,6 +57,7 @@ SETTING_VALUE_TYPES: dict[str, str] = {
     "monitor.enabled": "boolean",
     "manage.linux_accounts": "boolean",
     "manage.samba_accounts": "boolean",
+    "external_nfs.enabled": "boolean",
     "scheduler.interval_seconds": "number",
     "monitor.interval_seconds": "integer",
     "monitor.reconnect_attempts": "integer",
@@ -65,6 +70,7 @@ SETTING_OPTIONS: dict[str, list[dict[str, str]]] = {
     "monitor.enabled": [{"value": "true", "label": "开启"}, {"value": "false", "label": "关闭"}],
     "manage.linux_accounts": [{"value": "true", "label": "开启"}, {"value": "false", "label": "关闭"}],
     "manage.samba_accounts": [{"value": "true", "label": "开启"}, {"value": "false", "label": "关闭"}],
+    "external_nfs.enabled": [{"value": "true", "label": "开启"}, {"value": "false", "label": "关闭"}],
     "environment": [
         {"value": "development", "label": "开发环境"},
         {"value": "testing", "label": "测试环境"},
@@ -125,6 +131,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "monitor.reconnect_attempts": "3",
     "monitor.watchdog_timeout_seconds": "600",
     "uploads.max_size_mb": "20480",
+    "external_nfs.enabled": "false",
+    "external_nfs.path": "",
 }
 
 AUDIT_CATEGORIES = {"all", "system", "user", "archive", "file", "task", "env", "node", "other"}
@@ -307,6 +315,8 @@ def update_settings(user: UserRecord, values: dict[str, str]) -> list[SettingInf
         for key, value in values.items()
         if key and key.strip() and key.strip() not in ENV_ONLY_SETTING_KEYS
     }
+    if "external_nfs.path" in cleaned_values:
+        validate_external_nfs_path(cleaned_values["external_nfs.path"])
     now = local_datetime()
     with SessionLocal() as db:
         ensure_default_settings(db)
@@ -359,6 +369,36 @@ def setting_value_to_text(value: Any) -> str:
     if isinstance(value, (tuple, list)):
         return ",".join(str(item) for item in value)
     return str(value)
+
+
+def external_nfs_configuration() -> tuple[bool, str]:
+    """读取数据库中的 NAS 开关和挂载点；挂载点只供后端路径解析，不能放入普通运行时响应。"""
+    keys = ("external_nfs.enabled", "external_nfs.path")
+    with SessionLocal() as db:
+        rows = db.scalars(select(Setting).where(Setting.key.in_(keys))).all()
+    values = {row.key: row.value for row in rows}
+    enabled = str(values.get("external_nfs.enabled", DEFAULT_SETTINGS["external_nfs.enabled"])).lower() == "true"
+    path = str(values.get("external_nfs.path", DEFAULT_SETTINGS["external_nfs.path"])).strip()
+    return enabled, path
+
+
+def validate_external_nfs_path(value: str) -> None:
+    """要求 NAS 使用独立绝对挂载点，并与任务可访问根完全隔离。"""
+    text = str(value).strip()
+    if not text:
+        return
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        raise validation_error("external NFS path must be an absolute path")
+    candidate = candidate.resolve(strict=False)
+    settings = get_settings()
+    task_roots = {
+        Path(settings.user_home_root).expanduser().resolve(strict=False),
+        Path(f"/home/{settings.main_linux_user}").resolve(strict=False),
+        *(Path(item).expanduser().resolve(strict=False) for item in settings.visible_roots),
+    }
+    if any(candidate == root or candidate in root.parents or root in candidate.parents for root in task_roots):
+        raise validation_error("external NFS path must not overlap task-visible roots")
 
 
 def normalize_setting_value(key: str, value: Any) -> str:

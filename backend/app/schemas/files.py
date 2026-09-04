@@ -29,6 +29,7 @@ class FilePreviewData(BaseModel):
     previewable: bool = True
     truncated: bool
     size_bytes: int
+    converted_from: str | None = None
     content_bytes: int = 0
     preview_limit_bytes: int | None = None
     full_content: bool = False

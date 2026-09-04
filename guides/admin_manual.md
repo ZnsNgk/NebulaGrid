@@ -213,16 +213,24 @@ scp test1@192.168.0.1:~/outputs/result.csv ./result.csv
 
 ## 6. 文件管理
 
-管理员可维护平台可见文件，包括个人目录和共享文件夹。
+管理员可维护平台可见文件，包括个人目录和共享文件夹；启用外部 NFS 共享后，还可以只读查看 NAS。
 
 常用操作：
 
 - 进入目录、上级、刷新。
 - 上传、下载、新建文件夹、新建文件。
-- 文本文件预览、编辑和保存。
+- 文本文件预览、编辑和保存；PDF 直接流式预览，`.doc`、`.docx`、`.ppt`、`.pptx` 由主节点 LibreOffice 转为 PDF 后预览。
+- Markdown 默认显示原始文本，通过编辑器下方的 `预览` / `源文件` 按钮切换；渲染前会进行 HTML 转义，预览模式禁用保存，超过 2 MiB 时不会自动读取全文。
 - 重命名、复制、移动、打包 zip、解压压缩包、删除。
 - 文件权限面板可为普通文件授予执行权限，用于处理用户上传 `.sh` 后主账户无法直接执行的问题。
 - 在个人目录和共享文件夹之间转移资料。
+
+外部 NAS 视图：
+
+- 只有数据库设置 `external_nfs.enabled=true` 且 `external_nfs.path` 非空时，文件管理才会在“共享文件夹”后显示 `查看NAS文件`。
+- 页面只显示 `/NAS` 虚拟路径；真实挂载路径只在管理员系统设置中可见，不会进入普通用户运行时配置、文件列表或预览响应。
+- NAS 只允许浏览、预览和下载单个文件，后端会拒绝上传、新建、保存、复制、移动、重命名、删除、打包、解压和权限修改。
+- NAS 不加入任务项目路径选择器或任务可见根，`/NAS` 仅是文件管理展示标签，不能用于在任务中引用外部 NAS。不得把 NAS 挂载到用户 home、主账户 home 或 `NEBULAGRID_VISIBLE_ROOTS` 内；系统设置保存时会拒绝与这些任务可见根重叠的路径。
 
 注意：
 
@@ -231,11 +239,23 @@ scp test1@192.168.0.1:~/outputs/result.csv ./result.csv
 - 共享文件夹只放可公开给登录用户的资料。
 - 大文件、二进制文件不建议在线编辑。
 - 压缩包建议使用 zip、tar、tar.gz、tar.bz2、tar.xz。
+- Office 预览单文件上限为 100 MiB、转换超时为 120 秒；下载操作始终返回原始 Office 文件。
+
+Office 预览部署与缓存：
+
+1. 在 API 主节点安装 `libreoffice-writer`、`libreoffice-impress` 和所需字体包，运行 `libreoffice --version` 确认服务账号的 `PATH` 可以找到命令。
+2. 转换缓存位于主节点本地系统临时目录的 `nebulagrid-office-preview-<uid>` 子目录，权限为 `0700`；不要把该目录改到 NFS 或任务可见根。转换不会修改个人、共享或 NAS 中的源文件。
+3. 同一文件版本只转换一次；源文件大小或修改时间变化后自动使用新缓存。旧缓存超过 24 小时后，在后续转换请求中渐进删除。
+4. 如果出现 `Office preview requires LibreOffice on the API host`，检查软件安装和 systemd `PATH`；如果出现 conversion failed 或 timed out，检查文件是否损坏、系统临时目录权限、可用内存及 `journalctl -u nebulagrid-api`。
+5. 转换后的字体和分页以服务器字体为准；对版式要求严格的材料，建议上传作者导出的 PDF。
 
 文件问题排查：
 
 - `path not found`：路径不存在或用户目录未创建。
 - `path is outside shared folder`：路径超出共享目录边界。
+- `external NFS share is disabled or not configured`：NAS 开关未开启，或挂载路径尚未配置。
+- `external NFS share is unavailable`：配置的主节点挂载点不存在或不是目录；检查 NFS 挂载和 API 账号读取权限。
+- `external NFS path must not overlap task-visible roots`：NAS 路径与任务可见目录重叠；请改用独立挂载点。
 - `target already exists`：目标文件已存在。
 - `target cannot be inside source directory`：不能把目录复制或移动到自身内部。
 - `unsupported archive type`：压缩包格式不支持。
@@ -428,6 +448,16 @@ GPU 数量、型号、UUID、显存和 Compute Capability 由节点监控自动�
 2. 阅读说明。
 3. 按类型修改配置值。
 4. 保存后刷新页面观察效果。
+
+启用外部 NAS：
+
+1. 先在主节点把 NAS 挂载到独立绝对目录，推荐使用 NFS 只读挂载，例如 `/mnt/lab-nas`；不要挂载到用户 home、`/home/ddltm` 或任何 `NEBULAGRID_VISIBLE_ROOTS` 下面，也不要把它挂载到计算节点供任务使用。
+2. 确认 API 运行账号能遍历挂载点并读取其中的目录和文件。
+3. 在系统设置中先把 `external_nfs.path` 填为主节点实际绝对挂载路径，再把 `external_nfs.enabled` 设为 `true` 并保存。
+4. 以普通账号刷新文件管理页，确认出现 `查看NAS文件`、页面只显示 `/NAS`，且只能预览和下载。
+5. 卸载或更换 NAS 前，先把 `external_nfs.enabled` 设为 `false`，确认入口消失后再卸载。
+
+这两个设置都保存在 PostgreSQL 的 `settings` 表中，不写入 `backend.env`。普通用户只能获取最终是否启用的布尔值，不能获取 `external_nfs.path`。
 
 注意：
 

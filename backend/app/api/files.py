@@ -10,7 +10,7 @@ from app.schemas.files import FileContentRequest, FileOperationRequest
 from app.services.auth_service import UserRecord, get_user_by_token
 from app.services.file_service import (
     build_download_path,
-    build_video_stream_path,
+    build_preview_stream_path,
     copy_path,
     create_directory,
     create_text_file,
@@ -75,9 +75,9 @@ async def get_file_media(
     token: str = Query(min_length=1),
     scope: str = "",
 ):
-    """按 HTTP Range 流式返回视频；查询令牌用于无法附加 Authorization 头的 video 元素。"""
+    """按 HTTP Range 返回图片、视频、PDF 或 Office 转换结果；查询令牌用于嵌入元素。"""
     current_user = get_user_by_token(token)
-    real_path = await run_file_operation(build_video_stream_path, current_user, path, scope)
+    real_path = await run_file_operation(build_preview_stream_path, current_user, path, scope)
     return build_media_stream_response(real_path, request.headers.get("range"))
 
 
@@ -230,7 +230,7 @@ def require_target_path(payload: FileOperationRequest) -> str:
 
 
 def build_media_stream_response(path: Path, range_header: str | None) -> Response:
-    """生成支持单段字节范围的响应，让浏览器只拉取当前播放和拖动进度所需的视频片段。"""
+    """生成支持单段字节范围的响应，让浏览器读取图片、视频或文档展示所需的片段。"""
     size = path.stat().st_size
     common_headers = {
         "Accept-Ranges": "bytes",
@@ -290,7 +290,7 @@ def parse_byte_range(value: str, size: int) -> tuple[int, int] | None:
 
 
 def iterate_file_range(path: Path, start: int, end: int) -> Iterator[bytes]:
-    """分块读取指定闭区间，客户端断开时生成器关闭文件，不把完整视频放进内存。"""
+    """分块读取指定闭区间，客户端断开时生成器关闭文件，不把完整媒体文件放进内存。"""
     remaining = max(0, end - start + 1)
     with path.open("rb") as file:
         file.seek(start)
