@@ -2,6 +2,8 @@
 
 本文档根据 `docs/` 目录中的需求规格说明书与系统架构设计书整理，用于指导 NebulaGrid 3.0 在实验室主控节点和计算节点上的部署、配置、启动、验证与日常运维。
 
+完整部署教程请查看：[NebulaGrid 3.0 完整部署文档](./docs/NebulaGrid_3.0_Full_Deployment_Tutorial.md)
+
 > 当前仓库已经具备 FastAPI、前端控制台、数据库模型、任务数据库 CRUD、调度器 allocation 事务、任务执行 worker、节点监控 worker 和远端 runner 骨架。真实 GPU 集群上线前仍需按本文档完成 PostgreSQL/InfluxDB/Redis、NFS、SSH key、conda 路径和 systemd 服务联调。
 
 ## 1. 部署目标
