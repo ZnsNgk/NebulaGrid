@@ -15,6 +15,8 @@ from app.schemas.admin import AuditLogInfo, SettingInfo
 from app.services.auth_service import UserRecord
 
 SETTING_DESCRIPTIONS: dict[str, str] = {
+    "task.progress.interval_seconds": "执行区日志扫描间隔，单位秒，默认 60；允许 10～3600，保存后自动生效。",
+    "task.progress.read_chunk_mb": "单任务每次日志读取上限，单位 MiB，默认 4；允许 1～16，保存后自动生效。调大可加快旧日志补读，也会增加解析 CPU 和磁盘负载。",
     "scheduler.enabled": "控制任务调度器是否从等待队列领取新任务；关闭后不影响已运行任务。",
     "scheduler.instance_lock": "调度器实例锁占位行，用于防止多个调度器同时分配同一批任务。",
     "scheduler.interval_seconds": "调度器扫描等待任务的时间间隔，单位为秒；支持 0.5 这类小数值。",
@@ -53,6 +55,8 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
 }
 
 SETTING_VALUE_TYPES: dict[str, str] = {
+    "task.progress.interval_seconds": "integer",
+    "task.progress.read_chunk_mb": "integer",
     "scheduler.enabled": "boolean",
     "monitor.enabled": "boolean",
     "manage.linux_accounts": "boolean",
@@ -124,6 +128,8 @@ ENV_ONLY_SETTING_KEYS = {
 
 
 DEFAULT_SETTINGS: dict[str, str] = {
+    "task.progress.interval_seconds": "60",
+    "task.progress.read_chunk_mb": "4",
     "scheduler.enabled": "true",
     "scheduler.instance_lock": "locked-by-row-transaction",
     "scheduler.interval_seconds": "1",
@@ -301,7 +307,7 @@ def list_settings(user: UserRecord) -> list[SettingInfo]:
         ensure_default_settings(db)
         rows = db.scalars(
             select(Setting)
-            .where(~Setting.key.in_(ENV_ONLY_SETTING_KEYS))
+            .where(~Setting.key.in_(ENV_ONLY_SETTING_KEYS), ~Setting.key.startswith("internal."))
             .order_by(Setting.key.asc())
         ).all()
         return [setting_to_info(row) for row in rows]
@@ -313,7 +319,7 @@ def update_settings(user: UserRecord, values: dict[str, str]) -> list[SettingInf
     cleaned_values = {
         key.strip(): normalize_setting_value(key.strip(), value)
         for key, value in values.items()
-        if key and key.strip() and key.strip() not in ENV_ONLY_SETTING_KEYS
+        if key and key.strip() and key.strip() not in ENV_ONLY_SETTING_KEYS and not key.strip().startswith("internal.")
     }
     if "external_nfs.path" in cleaned_values:
         validate_external_nfs_path(cleaned_values["external_nfs.path"])
@@ -404,6 +410,14 @@ def validate_external_nfs_path(value: str) -> None:
 def normalize_setting_value(key: str, value: Any) -> str:
     """按配置类型收敛管理员输入，避免布尔大小写或数字空格影响 worker 读取。"""
     text = str(value).strip()
+    if key == "task.progress.interval_seconds":
+        if not text.isdecimal() or not 10 <= int(text) <= 3600:
+            raise validation_error("日志扫描间隔必须是 10～3600 秒的整数")
+        return str(int(text))
+    if key == "task.progress.read_chunk_mb":
+        if not text.isdecimal() or not 1 <= int(text) <= 16:
+            raise validation_error("日志每次读取上限必须是 1～16 MiB 的整数")
+        return str(int(text))
     value_type = SETTING_VALUE_TYPES.get(key, "string")
     if value_type == "boolean":
         return "true" if text.lower() in {"1", "true", "yes", "on", "开启"} else "false"

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import event, Float, Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -152,7 +152,33 @@ class Task(Base, TimestampMixin):
     return_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 终态落库时计算；旧任务由启动维护补齐，缺少可信起止时间保持 NULL。
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     requirement: Mapped["TaskRequirement"] = relationship(back_populates="task", cascade="all, delete-orphan")
+
+
+@event.listens_for(Task, "before_insert")
+@event.listens_for(Task, "before_update")
+def update_task_duration(mapper, connection, task):
+    """统一覆盖正常结束、取消、节点离线等 ORM 归档路径；重新入队清空旧时长。"""
+    from app.services.task_timing import ACTIVE_STATES, execution_duration
+    task.duration_seconds = (None if task.state in ACTIVE_STATES else
+                             execution_duration(task.started_at, task.finished_at))
+
+
+class TaskProgress(Base):
+    """独立保存增量游标和解析状态；租约避免多个 API 进程重复读取同一日志。"""
+
+    __tablename__ = "task_progress"
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    run_key: Mapped[str] = mapped_column(String(128), default="")
+    parser_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    scanned_at: Mapped[float] = mapped_column(Float, default=0)
+    lease_until: Mapped[float] = mapped_column(Float, default=0)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    # 页面版本与扫描租约版本分离，只有可见摘要变化才通知浏览器。
+    summary_version: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class TaskRequirement(Base):

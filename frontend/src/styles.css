@@ -2136,6 +2136,19 @@ nav {
   grid-column: 2;
 }
 
+/* 使用原生进度条保留无障碍语义，限定宽度避免补读状态撑宽任务表格。 */
+.task-log-catchup {
+  display: grid;
+  gap: 4px;
+  width: 160px;
+}
+
+.task-log-catchup progress {
+  width: 100%;
+  height: 10px;
+  accent-color: #2563eb;
+}
+
 .file-job-progress {
   display: grid;
   gap: 8px;

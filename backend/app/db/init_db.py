@@ -139,6 +139,7 @@ def migrate_existing_schema() -> None:
                     "last_block_reason": "VARCHAR(512) DEFAULT ''",
                     "log_path": "VARCHAR(1024) DEFAULT ''",
                     "return_code": "INTEGER",
+                    "duration_seconds": "DOUBLE PRECISION",
                 },
             )
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_urgent ON tasks (urgent)"))
@@ -146,6 +147,9 @@ def migrate_existing_schema() -> None:
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_running_zone_order ON tasks (state, started_at, created_at)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_history_zone_order ON tasks (state, finished_at, created_at)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_user_state_created ON tasks (user_id, state, created_at)"))
+        if "task_progress" in tables:
+            # 兼容已经部署过首版扫描器的数据库，保留原有游标和解析结果。
+            ensure_columns(connection, "task_progress", {"summary_version": "INTEGER NOT NULL DEFAULT 0"})
         if "task_allocations" in tables:
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_task_allocations_latest ON task_allocations (task_id, allocated_at, id)"))
         if "env_install_jobs" in tables:

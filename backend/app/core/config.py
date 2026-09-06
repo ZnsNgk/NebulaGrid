@@ -8,7 +8,7 @@ class Settings:
     """保存后端运行所需的非敏感配置，敏感项后续从 secrets/env 注入。"""
 
     app_name: str = "NebulaGrid"
-    app_version: str = "1.0.2"
+    app_version: str = "1.0.3"
     environment: str = "development"
     data_root: str = "/home/ddltm/data"
     user_home_root: str = "/home/ddltm/data/user"
@@ -66,7 +66,7 @@ def get_settings() -> Settings:
     )
     return Settings(
         app_name=os.getenv("NEBULAGRID_APP_NAME", "NebulaGrid"),
-        app_version=os.getenv("NEBULAGRID_APP_VERSION", "1.0.2"),
+        app_version=os.getenv("NEBULAGRID_APP_VERSION", "1.0.3"),
         environment=os.getenv("NEBULAGRID_ENV", "development"),
         data_root=os.getenv("NEBULAGRID_DATA_ROOT", "/home/ddltm/data"),
         user_home_root=os.getenv("NEBULAGRID_USER_HOME_ROOT", "/home/ddltm/data/user"),

@@ -21,6 +21,7 @@ from app.db.models import (
     TaskAllocation,
     TaskDependency,
     TaskEvent,
+    TaskProgress,
     TaskRequirement as TaskRequirementModel,
     TaskRuntimeGuard,
     User,
@@ -41,6 +42,7 @@ from app.services.audit_service import record_audit
 from app.services.auth_service import UserRecord
 from app.services.env_service import get_env_for_user
 from app.services.node_service import can_user_access_node
+from app.services.task_progress_service import load_progress
 
 WAIT_STATES = {"wait", "on_hold"}
 ALLOC_ERROR_STOP_REASON_PREFIX = "Runtime Guard 检测到任务使用未分配 GPU"
@@ -111,14 +113,21 @@ def task_change_cursor(user: UserRecord, db: Session) -> dict[str, int | dict[st
         .join(TaskEvent, TaskEvent.task_id == visible_tasks.c.id)
         .group_by(visible_tasks.c.state)
     ).all()
+    # 进度使用独立版本号触发 SSE，避免每分钟向任务事件表写入大量重复事件。
+    progress_version = db.scalar(select(func.coalesce(func.sum(TaskProgress.summary_version), 0))
+                                 .join(visible_tasks, visible_tasks.c.id == TaskProgress.task_id)
+                                 .where(visible_tasks.c.state == "running"))
     total = sum(int(row[1] or 0) for row in state_rows)
     max_task_id = max((int(row[2] or 0) for row in state_rows), default=0)
     max_event_id = max((int(row[1] or 0) for row in event_rows), default=0)
+    zones = build_task_zone_cursors(state_rows, event_rows)
+    zones["running"]["progress_version"] = int(progress_version or 0)
     return {
         "total": int(total),
         "max_task_id": int(max_task_id),
         "max_event_id": int(max_event_id),
-        "zones": build_task_zone_cursors(state_rows, event_rows),
+        "zones": zones,
+        "progress_version": int(progress_version or 0),
     }
 
 
@@ -671,6 +680,7 @@ def build_task_infos(tasks: list[Task], db: Session) -> list[TaskInfo]:
         if task.state in RUNNING_STATES or task.state in TERMINAL_STATES
     ]
     allocations = load_latest_allocations(allocation_task_ids, db)
+    progress = load_progress(tasks, allocations, db)
     node_ids = {allocation.node_id for allocation in allocations.values()}
     for task in tasks:
         if task.id not in allocations and task.requirement and task.requirement.node_id is not None:
@@ -730,6 +740,8 @@ def build_task_infos(tasks: list[Task], db: Session) -> list[TaskInfo]:
             created_at=datetime_to_iso(task.created_at),
             started_at=datetime_to_iso(task.started_at) if task.started_at else None,
             finished_at=datetime_to_iso(task.finished_at) if task.finished_at else None,
+            duration_seconds=task.duration_seconds,
+            progress=progress.get(task.id),
             predecessor_task_id=predecessor.task_id if predecessor else None,
             predecessor_task_no=predecessor.task_id if predecessor else None,
             node_id=node.id if node else None,
@@ -787,6 +799,8 @@ def build_task_info(task: Task, db: Session) -> TaskInfo:
         created_at=datetime_to_iso(task.created_at),
         started_at=datetime_to_iso(task.started_at) if task.started_at else None,
         finished_at=datetime_to_iso(task.finished_at) if task.finished_at else None,
+        duration_seconds=task.duration_seconds,
+        progress=load_progress([task], {task.id: allocation} if allocation else {}, db).get(task.id),
         predecessor_task_id=predecessor.task_id if predecessor else None,
         predecessor_task_no=predecessor.task_id if predecessor else None,
         node_id=node.id if node else None,

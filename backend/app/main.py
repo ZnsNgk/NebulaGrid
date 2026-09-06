@@ -12,6 +12,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.responses import api_error
 from app.db.init_db import init_database
+from app.workers.task_progress import start_progress_worker, stop_progress_worker
 from app.services.file_executor import shutdown_file_operation_executor
 from app.services.file_service import mark_interrupted_file_jobs
 from app.services.user_service import ensure_existing_user_linux_accounts
@@ -54,7 +55,12 @@ def register_startup_tasks(app: FastAPI) -> None:
     def initialize_database_on_startup() -> None:
         """同步完成登录必需的数据库初始化，再异步执行可延后的启动维护。"""
         init_database()
+        start_progress_worker(app)
         start_post_startup_maintenance(app)
+
+    @app.on_event("shutdown")
+    def stop_task_progress_on_shutdown() -> None:
+        stop_progress_worker(app)
 
     def start_post_startup_maintenance(app: FastAPI) -> None:
         """后台执行慢维护任务，避免 API lifespan 被 sudo、NFS 或历史数据修复长时间阻塞。

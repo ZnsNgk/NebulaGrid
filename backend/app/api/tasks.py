@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -78,13 +79,17 @@ async def stream_task_events(
     token: str = Query(min_length=1),
 ):
     """推送当前用户可见任务的轻量变化事件，前端据此刷新当前任务区。"""
-    current_user = get_user_by_token(token)
+    current_user = await run_in_threadpool(get_user_by_token, token)
+
+    def read_cursor():
+        # SSE 使用异步事件循环；同步数据库调用必须连同会话生命周期一起移出循环。
+        with SessionLocal() as db:
+            return task_change_cursor(current_user, db)
 
     async def event_generator():
         previous: dict[str, int] | None = None
         while not await request.is_disconnected():
-            with SessionLocal() as db:
-                cursor = task_change_cursor(current_user, db)
+            cursor = await run_in_threadpool(read_cursor)
             if cursor != previous:
                 previous = cursor
                 yield f"event: tasks\ndata: {json.dumps(cursor, ensure_ascii=False)}\n\n"

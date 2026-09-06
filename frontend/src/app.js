@@ -535,7 +535,7 @@ async function refreshPage() {
   const loaders = {
     dashboard: async () => {
       state.data.dashboard = (await api("/dashboard/summary")).data;
-      if (can("nodes:read")) state.data.nodes = (await api("/nodes")).data;
+      if (can("nodes:read")) state.data.nodes = (await api("/nodes?include_occupancy=true")).data;
       state.lastDashboardRefreshAt = new Date();
     },
     tasks: async () => {
@@ -691,11 +691,17 @@ function updateTaskEventStream() {
   if (!state.user || !state.token || isPresenterUser() || typeof EventSource === "undefined") return;
   const base = state.apiBase.replace(/\/$/, "");
   const source = new EventSource(`${base}/tasks/events?token=${encodeURIComponent(state.token)}`);
+  let previousDashboardKey = "";
   source.addEventListener("tasks", (event) => {
     const cursor = parseTaskEventCursor(event.data);
+    // 仪表盘不显示日志进度，只在任务状态/事件变化时刷新，避免补读触发无关请求。
+    const dashboardKey = ["wait", "running", "history"]
+      .map((zone) => taskCursorKey(cursor?.zones?.[zone] || cursor, false)).join("|");
+    const dashboardChanged = dashboardKey !== previousDashboardKey;
+    previousDashboardKey = dashboardKey;
     if (state.page === "tasks") {
       refreshTasksFromEvent(cursor);
-    } else if (state.page === "dashboard") {
+    } else if (state.page === "dashboard" && dashboardChanged) {
       autoRefreshDashboard();
     }
   });
@@ -713,9 +719,10 @@ function parseTaskEventCursor(data) {
   }
 }
 
-function taskCursorKey(cursor) {
+function taskCursorKey(cursor, includeProgress = true) {
   if (!cursor) return "";
-  return [cursor.count ?? cursor.total ?? 0, cursor.max_task_id ?? 0, cursor.max_event_id ?? 0].join(":");
+  return [cursor.count ?? cursor.total ?? 0, cursor.max_task_id ?? 0, cursor.max_event_id ?? 0,
+    includeProgress ? cursor.progress_version ?? 0 : 0].join(":");
 }
 
 function changedTaskZones(cursor) {
@@ -726,7 +733,7 @@ function changedTaskZones(cursor) {
     const nextKey = taskCursorKey(next);
     const previousKey = state.taskZoneCursors[zone];
     state.taskZoneCursors[zone] = nextKey;
-    if (previousKey && previousKey !== nextKey) result.push(zone);
+    if (previousKey !== nextKey) result.push(zone);
   });
   return result;
 }
@@ -734,8 +741,8 @@ function changedTaskZones(cursor) {
 function refreshTasksFromEvent(cursor) {
   if (!state.user || state.page !== "tasks") return;
   const zone = normalizeTaskZone(state.taskZone);
-  changedTaskZones(cursor);
-  scheduleTaskRealtimeRefresh(zone);
+  const changed = changedTaskZones(cursor);
+  if (changed.includes(zone)) scheduleTaskRealtimeRefresh(zone);
 }
 
 function scheduleTaskRealtimeRefresh(zone) {
@@ -1183,7 +1190,6 @@ async function openTaskForm(mode) {
   state.drawer = {
     type: "task-form",
     title: mode === "batch" ? "批量添加任务" : (mode === "edit" ? `修改任务 ${selected.task_id}` : "添加任务"),
-    body: renderTaskForm(mode, selected),
   };
   render();
   loadTaskPredecessorOptions(selected?.task_id || "")
@@ -1193,7 +1199,6 @@ async function openTaskForm(mode) {
       const draft = syncTaskFormDraftFromDom() || state.taskFormDraft || taskToDraft(mode, selected);
       state.taskPredecessorLoading = false;
       state.taskFormDraft = draft;
-      state.drawer.body = renderTaskForm(draft.mode, selectedTask());
       render();
     })
     .catch((error) => {
@@ -1287,7 +1292,6 @@ async function openTaskWorkdirPicker() {
     currentPath: current,
     items: [],
   };
-  if (state.drawer && draft) state.drawer.body = renderTaskForm(draft.mode, selectedTask());
   await loadFileTargetPickerPath(current);
   render();
 }
@@ -1745,7 +1749,6 @@ async function confirmFileTargetPicker() {
     const draft = state.taskFormDraft || syncTaskFormDraftFromDom() || taskToDraft("add");
     draft.workdir = selectedPath;
     state.taskFormDraft = draft;
-    if (state.drawer) state.drawer.body = renderTaskForm(draft.mode, selectedTask());
     state.fileTargetPicker = null;
     render();
     return;
@@ -2442,6 +2445,7 @@ function renderNodeCard(node) {
             <div class="gpu-summary">
               ${percent(gpu.gpu_usage)} · 显存 ${formatMb(vramUsedMb(gpu))} / ${formatMb(gpu.total_vram_mb)} · 调度占用 ${gpu.scheduled_occupied ? "是" : "否"}
             </div>
+            <div class="gpu-summary">${escapeHtml(gpuOccupancyText(gpu, node))}</div>
             <div class="gpu-bars">
               ${metricBar("GPU 使用率", gpu.gpu_usage, percent(gpu.gpu_usage))}
               ${metricBar("显存使用量", vramUsedPercent(gpu), `${formatMb(vramUsedMb(gpu))} / ${formatMb(gpu.total_vram_mb)}`)}
@@ -2452,6 +2456,19 @@ function renderNodeCard(node) {
       ` : ""}
     </article>
   `;
+}
+
+function gpuOccupancyText(gpu, node) {
+  if (gpu.scheduled_occupied) {
+    const seconds = gpu.remaining_occupancy_seconds;
+    if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return "剩余占用时间未知";
+    return `预计剩余占用时间：${gpu.occupancy_estimate_rough ? "粗估 " : ""}${formatTaskDuration(seconds, true)}`;
+  }
+  if (gpu.occupancy_status === "unavailable" || node.state !== "online" || !node.scheduling_enabled) return "不可调度";
+  if (gpu.occupancy_status === "external") return "外部占用";
+  if (gpu.occupancy_status === "available") return "可使用";
+  // 前后端分批升级时缺少新字段，不能把尚未判断的卡错误标成可使用。
+  return "可用状态未知";
 }
 
 function renderPresenter() {
@@ -2680,6 +2697,7 @@ function renderTasks() {
 function renderTaskZoneTable(tasks) {
   const preserveKey = `task-list-${state.taskZone}`;
   const headers = ["", "状态", "任务ID", "环境", "路径", "命令", "节点", "GPU数", "GPU型号", "前驱", "紧急", "复用", "所有人", "时间"];
+  if (state.taskZone === "running") headers.splice(2, 0, "当前进度");
   const rows = tasks.map((task) => {
     const selected = state.selectedTaskId === task.task_id;
     // 仅复用现有黄色过渡态配色；状态未知属于异常历史结果，沿用失败配色但保留 unknown 类供后续扩展。
@@ -2702,6 +2720,7 @@ function renderTaskZoneTable(tasks) {
       `${escapeHtml(task.owner_name || task.owner_username || "-")}`,
       renderTaskTimes(task),
     ];
+    if (state.taskZone === "running") cells.splice(2, 0, renderTaskProgress(task));
     return `<tr class="task-row ${selected ? "selected" : ""}" data-task-row="${escapeAttr(task.task_id)}" title="双击查看日志">${cells.map((cell) => `<td>${cell}</td>`).join("")}</tr>`;
   });
   return `
@@ -2742,11 +2761,56 @@ function taskGpuModelText(task) {
   return requested.length ? requested.join(", ") : "不限型号";
 }
 
+function formatTaskDuration(value, approximate = false) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value)) || Number(value) < 0) return "未知";
+  const seconds = Math.round(Number(value));
+  if (approximate && seconds < 60) return seconds === 0 ? "当前进度已完成，等待后续阶段" : "不足 1 分钟";
+  const parts = [];
+  let rest = seconds;
+  [[86400, "天"], [3600, "小时"], [60, "分"], [1, "秒"]].forEach(([unit, label]) => {
+    const count = Math.floor(rest / unit);
+    rest %= unit;
+    if (count && (!approximate || unit !== 1)) parts.push(`${count} ${label}`);
+  });
+  return `${approximate ? "约 " : ""}${parts.join(" ") || "0 秒"}`;
+}
+
+function renderTaskProgress(task) {
+  const pending = { dispatching: "准备派发", preparing: "准备中", starting: "启动中", cancelling: "停止中" };
+  if (task.state !== "running") return escapeHtml(pending[task.state] || "-");
+  const progress = task.progress;
+  if (progress?.catchup) {
+    // 补读百分比是日志字节进度，不是训练进度；只使用校验后的数值生成进度条。
+    const info = progress.catchup;
+    const value = Number(info.percent);
+    const percent = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+    const size = (bytes) => Number.isFinite(Number(bytes)) ? (Math.max(0, Number(bytes)) / 1048576).toFixed(1) : "0.0";
+    return `<div class="task-log-catchup" title="正在补读日志；日志继续增长时，百分比会随总大小调整。">
+      <span>日志补读 ${percent.toFixed(1)}%</span>
+      <progress max="100" value="${percent}" aria-label="日志补读进度">${percent.toFixed(1)}%</progress>
+      <span class="muted">已读 ${size(info.read_bytes)} / ${size(info.total_bytes)} MiB</span>
+    </div>`;
+  }
+  const updated = progress?.updated_at ? `；最后进度更新：${formatDate(new Date(progress.updated_at * 1000).toISOString())}` : "";
+  return `<span title="${escapeAttr((progress?.reason || "等待首次日志扫描") + updated)}">${escapeHtml(progress?.text || "采样中")}${progress?.stale ? " · 待更新" : ""}</span>`;
+}
+
 function renderTaskTimes(task) {
+  let extra = "";
+  // 列和补充信息按当前分区显示，等待/历史区不会出现训练进度或预估剩余时间。
+  if (state.taskZone === "running") {
+    const p = task.progress;
+    const label = task.state !== "running" ? "-" : (p?.remaining_seconds != null && !p.stale
+      ? `${p.scope === "stage" ? "本阶段 " : ""}${p.estimate_kind === "rough" ? "粗估 " : ""}${formatTaskDuration(p.remaining_seconds, true)}`
+      : (p?.reason || "采样中"));
+    extra = `<br><span class="muted" title="${escapeAttr(p?.reason || "")}">预估剩余时间：${escapeHtml(label)}</span>`;
+  } else if (state.taskZone === "history") {
+    extra = `<br><span class="muted">运行时长：${escapeHtml(formatTaskDuration(task.duration_seconds))}</span>`;
+  }
   return `
     <span class="muted">提交：${formatDate(task.created_at)}</span><br>
     <span class="muted">执行：${formatDate(task.started_at)}</span><br>
-    <span class="muted">结束：${formatDate(task.finished_at)}</span>
+    <span class="muted">结束：${formatDate(task.finished_at)}</span>${extra}
   `;
 }
 
@@ -2770,16 +2834,17 @@ function taskToDraft(mode, task = null) {
 }
 
 function captureTaskFormDraft(form) {
+  // 草稿保留正在编辑的原始值（包括空格和暂时清空的数量），提交时再做规范化。
   return {
     mode: form.dataset.taskFormMode || "add",
     task_id: formValue(form, "task_id"),
-    description: formValue(form, "description"),
+    description: form.elements.description?.value || "",
     env_id: formValue(form, "env_id"),
     workdir: formValue(form, "workdir") || "/",
     command: form.elements.command?.value || "",
     commands: form.elements.commands?.value || "",
     node_id: formValue(form, "node_id"),
-    need_gpus: formValue(form, "need_gpus") || 1,
+    need_gpus: form.elements.need_gpus?.value ?? 1,
     gpu_types: checkedValues("taskGpuTypeOptions", form),
     predecessor_task_id: formValue(form, "predecessor_task_id"),
     urgent: form.elements.urgent?.checked || false,
@@ -4520,13 +4585,17 @@ function renderTable(headers, rows) {
 }
 
 function renderDrawer() {
+  // 任务表单使用最新草稿生成；缓存打开时的 HTML 会让实时刷新覆盖后续输入。
+  const body = state.drawer.type === "task-form"
+    ? renderTaskForm(state.taskFormDraft.mode)
+    : (state.drawer.type === "task-log" ? renderTaskLogDrawer() : state.drawer.body);
   return `
     <aside class="drawer" data-preserve-scroll="drawer">
       <div class="drawer-head">
         <h2>${escapeHtml(state.drawer.title)}</h2>
         <button class="secondary" data-action="close-drawer">关闭</button>
       </div>
-      ${state.drawer.type === "task-log" ? renderTaskLogDrawer() : state.drawer.body}
+      ${body}
     </aside>
   `;
 }
@@ -5022,11 +5091,43 @@ function render() {
   };
   ensureVisiblePage();
   const scrollPositions = capturePreservedScrollPositions();
+  const taskFormFocus = captureTaskFormFocus();
   document.querySelector("#app").innerHTML = state.user
     ? (isPresenterUser() ? renderPresenter() : (renderers[state.page] || renderDashboard)())
     : renderLogin();
   bindEvents();
+  restoreTaskFormFocus(taskFormFocus);
   restorePreservedScrollPositions(scrollPositions);
+}
+
+function captureTaskFormFocus() {
+  const element = document.activeElement;
+  if (state.drawer?.type !== "task-form" || element?.form?.id !== "taskForm") return null;
+  return {
+    drawer: state.drawer,
+    name: element.name,
+    value: element.value,
+    start: element.selectionStart,
+    end: element.selectionEnd,
+    direction: element.selectionDirection,
+    scrollTop: element.scrollTop,
+    scrollLeft: element.scrollLeft,
+  };
+}
+
+function restoreTaskFormFocus(saved) {
+  // 仅恢复同一张任务卡片，避免关闭、切换卡片后抢走焦点；保留多行命令的光标及滚动位置。
+  if (!saved || state.drawer !== saved.drawer) return;
+  const form = document.querySelector("#taskForm");
+  const element = saved.name ? form?.elements.namedItem(saved.name)
+    : Array.from(form?.querySelectorAll('#taskGpuTypeOptions input') || []).find((input) => input.value === saved.value);
+  if (!element) return;
+  element.focus({ preventScroll: true });
+  if (saved.start != null && typeof element.setSelectionRange === "function") {
+    element.setSelectionRange(saved.start, saved.end, saved.direction);
+  }
+  element.scrollTop = saved.scrollTop;
+  element.scrollLeft = saved.scrollLeft;
 }
 
 function capturePreservedScrollPositions() {
@@ -5049,6 +5150,10 @@ function bindEvents() {
   document.querySelector("#loginForm")?.addEventListener("submit", (event) => run(() => login(event), "登录成功"));
   document.querySelector("#nodeForm")?.addEventListener("submit", (event) => run(() => submitNode(event), "节点已保存"));
   document.querySelector("#taskForm")?.addEventListener("submit", (event) => run(() => submitTask(event), "任务已提交"));
+  // 输入立即写入草稿，change 同时覆盖下拉框和复选框；节点/环境联动先在目标控件更新后再冒泡到表单。
+  ["input", "change"].forEach((type) => {
+    document.querySelector("#taskForm")?.addEventListener(type, syncTaskFormDraftFromDom);
+  });
   document.querySelector("#profileForm")?.addEventListener("submit", (event) => run(() => submitProfile(event), "资料已保存"));
   document.querySelector("#passwordForm")?.addEventListener("submit", (event) => run(() => changePassword(event), "密码已更新"));
   document.querySelector("#userForm")?.addEventListener("submit", (event) => run(() => submitUser(event), "账号已创建"));

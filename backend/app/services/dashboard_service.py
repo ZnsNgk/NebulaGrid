@@ -1,8 +1,11 @@
+import math
+import time
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.rbac import require_permission
-from app.db.models import Node, Task
+from app.db.models import Node, Task, TaskAllocation, TaskProgress
 from app.schemas.dashboard import (
     DashboardSummary,
     PresenterDashboard,
@@ -20,6 +23,7 @@ from app.services.node_service import (
     load_occupied_gpu_ids,
 )
 from app.services.task_service import RUNNING_STATES, TERMINAL_STATES, WAIT_STATES, list_tasks
+from app.services.task_progress_service import run_key, scan_interval
 
 AVAILABLE_GPU_MAX_USAGE = 20
 AVAILABLE_GPU_MIN_FREE_VRAM_RATIO = 0.80
@@ -68,6 +72,62 @@ def gpu_is_summary_available(gpu) -> bool:
         if free_ratio < AVAILABLE_GPU_MIN_FREE_VRAM_RATIO:
             return False
     return True
+
+
+def annotate_gpu_occupancy(nodes: list, db: Session) -> None:
+    """仅对已授权可见的节点聚合占用时间；不返回其他用户的任务 ID、命令或日志。"""
+    node_ids = [node.id for node in nodes]
+    if not node_ids:
+        return
+    latest_allocation = select(func.max(TaskAllocation.id)).where(
+        TaskAllocation.task_id == Task.id).correlate(Task).scalar_subquery()
+    # 批量读取轻量摘要，不能在总览请求中读日志或加载 parser_state。
+    rows = db.execute(select(TaskAllocation.node_id, TaskAllocation.gpu_ids,
+                             Task.id, Task.state, Task.started_at, Task.log_path,
+                             latest_allocation.label("latest_allocation_id"),
+                             TaskProgress.run_key, TaskProgress.summary)
+                      .join(Task, Task.id == TaskAllocation.task_id)
+                      .outerjoin(TaskProgress, TaskProgress.task_id == Task.id)
+                      .where(TaskAllocation.node_id.in_(node_ids), TaskAllocation.released_at.is_(None))).all()
+    interval = scan_interval(db) if rows else 60
+    now = time.time()
+    occupants = {}
+    for row in rows:
+        summary = row.summary or {}
+        value = summary.get("remaining_seconds")
+        updated = summary.get("updated_at")
+        known = (row.state == "running" and row.run_key == run_key(row, row.latest_allocation_id)
+                 and not summary.get("catchup") and not summary.get("stale")
+                 and summary.get("scope") == "task"
+                 and isinstance(updated, (int, float)) and math.isfinite(updated)
+                 and now - updated <= max(180, 3 * interval)
+                 and isinstance(value, (int, float)) and not isinstance(value, bool)
+                 and math.isfinite(value) and value > 0)
+        # 已结束但 allocation 尚未释放、停止中和 ETA 为零，都不能承诺显卡已经可用。
+        estimate = math.ceil(value) if known else None
+        for raw_id in row.gpu_ids or []:
+            try:
+                gpu_id = int(raw_id)
+            except (ValueError, TypeError):
+                continue
+            occupants.setdefault((row.node_id, gpu_id), []).append((estimate, summary.get("estimate_kind") == "rough"))
+    for node in nodes:
+        for gpu in node.gpus:
+            entries = occupants.get((node.id, gpu.id), [])
+            gpu.scheduled_occupied = bool(entries)
+            gpu.remaining_occupancy_seconds = None
+            gpu.occupancy_estimate_rough = False
+            if entries:
+                gpu.occupancy_status = "scheduled"
+                # 复用卡须等待所有任务释放；任一任务未知时不能仅采用已知任务的 ETA。
+                if all(value is not None for value, _ in entries):
+                    gpu.remaining_occupancy_seconds = max(value for value, _ in entries)
+                    gpu.occupancy_estimate_rough = any(rough for _, rough in entries)
+            elif node.state != "online" or not node.scheduling_enabled or not gpu.schedulable:
+                # 管理员禁用/节点离线不是外部进程占用，也不能标成可使用。
+                gpu.occupancy_status = "unavailable"
+            else:
+                gpu.occupancy_status = "available" if gpu_is_summary_available(gpu) else "external"
 
 
 def build_presenter_dashboard(user: UserRecord, db: Session, history_hours: int = 1) -> PresenterDashboard:

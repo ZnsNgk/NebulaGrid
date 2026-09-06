@@ -15,6 +15,10 @@ class GpuInfo(BaseModel):
     detected_compute_capability: str | None = None
     schedulable: bool = True
     scheduled_occupied: bool = False
+    # 总览按当前 allocation 和进度摘要即时聚合，不在 GPU 表中保存派生状态。
+    occupancy_status: str | None = None
+    remaining_occupancy_seconds: int | None = None
+    occupancy_estimate_rough: bool = False
     remark: str | None = None
     free_vram_mb: int | None = None
     gpu_usage: int | None = None

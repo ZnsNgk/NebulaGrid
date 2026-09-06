@@ -132,6 +132,8 @@ class TaskInfo(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    duration_seconds: float | None = None
+    progress: dict | None = None
     predecessor_task_id: str | None = None
     predecessor_task_no: str | None = None
     node_id: int | None = None
