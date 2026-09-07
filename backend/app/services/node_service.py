@@ -489,7 +489,7 @@ def can_user_access_node(user: UserRecord, node: Node, db: Session) -> bool:
 
 
 def load_group_shared_user_ids(owner_ids: list[int], db: Session) -> set[int]:
-    """展开组内共享对象：学生 owner 共享给其导师名下学生，导师 owner 共享给其学生。"""
+    """展开组内共享对象：学生所有人的导师及导师名下学生，或导师所有人名下学生。"""
     owners = db.scalars(select(User).where(User.id.in_(owner_ids))).all()
     shared_user_ids: set[int] = set()
     for owner in owners:
@@ -498,6 +498,8 @@ def load_group_shared_user_ids(owner_ids: list[int], db: Session) -> set[int]:
                 select(UserSupervisor.supervisor_id).where(UserSupervisor.student_id == owner.id)
             ).all()
             if supervisor_ids:
+                # 导师本人同样属于共享组；多导师取并集，不沿同组学生的其他导师继续扩散。
+                shared_user_ids.update(supervisor_ids)
                 shared_user_ids.update(
                     db.scalars(
                         select(UserSupervisor.student_id).where(UserSupervisor.supervisor_id.in_(supervisor_ids))
