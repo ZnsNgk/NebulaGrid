@@ -4,6 +4,11 @@ const state = {
   deviceId: getOrCreateDeviceId(),
   user: null,
   page: location.hash.replace("#/", "") || "dashboard",
+  usageTab: "tasks",
+  usageDays: 7,
+  usageNodeId: "",
+  usageRequestSeq: 0,
+  usageError: "",
   taskZone: normalizeTaskZone(localStorage.getItem("ng_task_zone") || "wait"),
   selectedTaskId: "",
   taskHistoryAllLoaded: false,
@@ -66,6 +71,8 @@ const state = {
   fileMarkdownPreviewPath: "",
   data: {
     dashboard: null,
+    usageTasks: null,
+    usageNodes: null,
     presenter: null,
     nodes: [],
     tasks: { items: [], total: 0, page: 1, page_size: 100 },
@@ -181,6 +188,7 @@ const pages = [
   { id: "files", label: "文件管理", icon: "📁", permission: "files:read" },
   { id: "envs", label: "环境管理", icon: "🧪", permission: "envs:read" },
   { id: "manual", label: "使用手册", icon: "📖" },
+  { id: "usage", label: "用量统计", icon: "📈", permission: "usage:read" },
   { id: "account", label: "账号管理", icon: "👤" },
   { id: "students", label: "学生管理", icon: "🎓", roles: ["mentor"], permission: "users:read" },
   { id: "admin", label: "管理员后台", icon: "⚙️", roles: ["admin"], permission: "admin:settings:read" },
@@ -380,6 +388,10 @@ function isAuthExpiredMessage(message) {
 }
 
 function resetLocalLoginState(message = "") {
+  // 注销立即清除统计和未完成请求，避免切换账号时短暂展示上一账号的数据。
+  state.usageRequestSeq += 1;
+  state.data.usageTasks = null;
+  state.data.usageNodes = null;
   state.token = "";
   state.user = null;
   state.data.sessions = [];
@@ -533,6 +545,7 @@ async function refreshPage() {
     return;
   }
   const loaders = {
+    usage: loadUsageData,
     dashboard: async () => {
       state.data.dashboard = (await api("/dashboard/summary")).data;
       if (can("nodes:read")) state.data.nodes = (await api("/nodes?include_occupancy=true")).data;
@@ -581,6 +594,27 @@ async function refreshPage() {
     },
   };
   await loaders[state.page]?.();
+}
+
+async function loadUsageData() {
+  // 切换周期、页签或账号后，旧响应不得覆盖新范围的数据。
+  const seq = ++state.usageRequestSeq;
+  const userId = state.user?.id;
+  const tab = state.usageTab;
+  const key = tab === "tasks" ? "usageTasks" : "usageNodes";
+  state.data[key] = null;
+  state.usageError = "";
+  render();
+  try {
+    const path = tab === "tasks" ? "/usage/tasks" : `/usage/nodes?days=${state.usageDays}`;
+    const data = (await api(path)).data;
+    if (seq !== state.usageRequestSeq || userId !== state.user?.id) return;
+    state.data[key] = data;
+  } catch (error) {
+    if (seq !== state.usageRequestSeq || userId !== state.user?.id) return;
+    state.usageError = error.message || "统计加载失败，请刷新重试";
+    throw error;
+  }
 }
 
 async function loadPresenterDashboard() {
@@ -2414,6 +2448,98 @@ function renderDashboard() {
       ${state.data.nodes.length ? `<div class="node-grid">${state.data.nodes.map(renderNodeCard).join("")}</div>` : renderEmpty("暂无计算节点")}
     </section>
   `);
+}
+
+function usageHours(seconds) {
+  return `${((Number(seconds) || 0) / 3600).toLocaleString("zh-CN", { maximumFractionDigits: 2 })} 小时`;
+}
+
+function usagePercent(value) {
+  return value == null ? "无数据" : `${Number(value).toFixed(1)}%`;
+}
+
+function usageCards(items) {
+  return `<section class="metrics usage-metrics">${items.map(([label, value]) =>
+    `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`).join("")}</section>`;
+}
+
+function renderUsage() {
+  const taskTab = state.usageTab === "tasks";
+  const data = taskTab ? state.data.usageTasks : state.data.usageNodes;
+  return shell(`
+    <section class="panel usage-toolbar">
+      <div class="usage-switch" aria-label="统计子界面">
+        ${[["tasks", "任务统计"], ["nodes", "节点统计"]].map(([key, label]) => `<button class="${state.usageTab === key ? "" : "secondary"}" data-usage-tab="${key}" aria-pressed="${state.usageTab === key}">${label}</button>`).join("")}
+      </div>
+      ${taskTab ? '<span class="muted">全部保留任务 · 最近一次执行</span>' : `<div class="usage-switch" aria-label="统计周期">${[7, 30, 90].map((days) => `<button data-usage-days="${days}" class="${state.usageDays === days ? "" : "secondary"}" aria-pressed="${state.usageDays === days}">近 ${days} 天</button>`).join("")}</div>`}
+    </section>
+    ${state.usageError ? `<section class="panel" role="alert">${escapeHtml(state.usageError)} <button data-action="refresh">重试</button></section>` : !data ? '<section class="panel" role="status">正在加载统计...</section>' : taskTab ? renderTaskUsage(data) : renderNodeUsage(data)}
+    ${data ? `<p class="muted usage-note">统计截止：${formatDate(data.generated_at)}。点击右上角“刷新”更新运行中任务与占用时长。</p>` : ""}
+  `);
+}
+
+function renderTaskUsage(data) {
+  const own = data.personal;
+  const managed = ["mentor", "admin"].includes(state.user?.role);
+  const scope = state.user?.role === "admin" ? "所有用户" : "本人及名下学生";
+  const cards = (total) => usageCards([
+    ["提交任务", total.submitted], ["已开始执行", total.executed], ["成功", total.succeeded],
+    ["失败（含异常）", total.failed], ["取消", total.cancelled], ["执行中（含准备/停止）", total.running],
+    ["等待 / 挂起", total.waiting], ["其他 / 未知", total.other],
+    ["总运行时长", usageHours(total.runtime_seconds)], ["GPU 卡时（卡/时）", Number(total.gpu_hours).toFixed(2)],
+  ]);
+  const incomplete = managed ? data.summary : own;
+  return `
+    <h2 class="usage-heading">我的任务</h2>${cards(own)}
+    <section class="panel usage-note">
+      <p>运行时长只计算程序执行时间，运行中计至本次刷新。1 块 GPU 运行 1 小时 = 1 卡时；2 块 GPU 运行 3 小时 = 6 卡时。CPU 任务计运行时间，卡时为 0。</p>
+      <p>统计当前保留的任务记录；原任务重新入队后只计最近一次执行，重新提交生成的新任务单独计数。删除记录会减少统计。失败含调度错误、节点离线和依赖失败；未知状态单列。</p>
+      ${incomplete.unknown_duration_tasks || incomplete.unknown_gpu_tasks ? `<p class="usage-warning">当前范围有 ${incomplete.unknown_duration_tasks} 个任务缺少有效起止时间，${incomplete.unknown_gpu_tasks} 个任务缺少可信 GPU 分配；对应总量仅包含可确认的部分。</p>` : ""}
+    </section>
+    ${managed ? `<h2 class="usage-heading">${scope}汇总</h2>${cards(data.summary)}
+      <section class="panel"><div class="panel-head"><h2>${state.user.role === "admin" ? "用户" : "学生及本人"}任务明细</h2><span>包括尚未提交任务的用户；占用时长见“节点统计”</span></div>
+      <div class="table-wrap"><table class="usage-table"><thead><tr><th>用户</th><th>角色</th><th>提交</th><th>已执行</th><th>成功</th><th>失败</th><th>取消</th><th>执行中</th><th>等待</th><th>其他</th><th>运行时长</th><th>GPU 卡时</th></tr></thead><tbody>${data.users.map((item) => `<tr><td>${escapeHtml(item.real_name)}<br><span class="muted">${escapeHtml(item.username)}</span></td><td>${escapeHtml(roleLabels[item.role] || item.role)}</td>${[item.submitted, item.executed, item.succeeded, item.failed, item.cancelled, item.running, item.waiting, item.other].map((value) => `<td>${value}</td>`).join("")}<td>${usageHours(item.runtime_seconds)}${item.unknown_duration_tasks ? "（部分未知）" : ""}</td><td>${Number(item.gpu_hours).toFixed(2)}${item.unknown_gpu_tasks ? "（部分未知）" : ""}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+  `;
+}
+
+function renderNodeUsage(data) {
+  const nodes = data.nodes || [];
+  const selected = nodes.find((node) => String(node.id) === state.usageNodeId) || nodes[0];
+  const managed = ["mentor", "admin"].includes(state.user?.role);
+  // 后端已做权限及零时长过滤；前端再过滤一次，避免旧响应或异常行占据节点用量列表。
+  const selectedUsers = (selected?.users || []).filter((item) => item.occupied_seconds > 0);
+  const messages = {
+    not_configured: "尚未配置 InfluxDB，实测使用率暂无数据。",
+    timeout: "小时汇总读取超时，请稍后刷新；若持续出现，请联系管理员检查 InfluxDB 负载。",
+    building: "部分小时汇总缺失，当前均值仅按已有小时计算，缺失小时已排除；后台仍会尝试补算，可查看每日完整度并稍后刷新。",
+    access_denied: "监控数据读取权限不足，请联系管理员检查 InfluxDB 授权。",
+    query_error: "历史监控查询被数据服务拒绝，请联系管理员检查 API 日志。",
+    unavailable: "监控服务暂不可用，请稍后刷新。",
+    no_data: "该周期没有监控采样，可能尚未采集或已超过保留期限。",
+  };
+  return `
+    ${usageCards([["可见节点", nodes.length], ["我的服务器占用", usageHours(data.own_occupied_seconds)], ["统计周期", `近 ${data.days} 天（含今天）`]])}
+    <section class="panel usage-note">
+      <p>周期从 ${formatDate(data.start_at)} 到本次刷新，按服务器时区分日，今天尚未结束。日均使用时长 = 平台占用总时长 ÷ ${data.days} 天（无占用日期也参与平均）。</p>
+      <p>平台占用从资源分配到释放，包含准备和停止过程；同一节点并发任务合并，跨节点分别累加。外部 SSH 程序仅反映在 CPU / GPU 使用率中。</p>
+      <p>CPU / GPU 使用率读取保留 90 天的小时均值，统计截至 ${formatDate(data.metrics_end_at)}，不计当前未结束的小时。日均按实际已有小时计算，缺失小时不计入分母；例如 23 / 24 表示按已有 23 小时计算。周期均值同样按实际小时数加权，已保存的 0% 仍参与平均。历史数据过期后无法还原真实使用率。</p>
+      <p>占用统计累计保留的各次资源分配记录。个人及用户占用仅计算当前可见节点；“本期提交”按任务创建日期计算全部保留任务。</p>
+      ${managed ? `<p>本页 GPU 占用卡时按实际分配到释放计算，包含准备和清理：2 块 GPU 占用 3 小时 = 6 卡时。同一用户在同一节点复用同一张 GPU 的重叠时间去重，不同卡分别累加；CPU 任务卡时为 0。任务统计页的卡时仅计执行时间。</p>` : ""}
+      ${messages[data.metrics_status] ? `<p class="usage-warning" role="status">${messages[data.metrics_status]} 任务占用仍可查看；“无数据”不等于 0%。</p>` : ""}
+    </section>
+    <section class="panel"><div class="panel-head"><h2>节点使用情况</h2><span>点击节点查看每日明细</span></div>
+      ${nodes.length ? `<div class="table-wrap"><table class="usage-table"><thead><tr><th>节点</th><th>GPU 日均使用率</th><th>CPU 日均使用率</th><th>平台占用率</th><th>日均使用时长</th><th>总占用时长</th><th>我的占用时长</th></tr></thead><tbody>${nodes.map((node) => `<tr><td><button class="${node.id === selected?.id ? "" : "secondary"}" data-usage-node="${node.id}" aria-pressed="${node.id === selected?.id}">${escapeHtml(node.name)}</button></td><td>${usagePercent(node.gpu_usage_percent)}</td><td>${usagePercent(node.cpu_usage_percent)}</td><td>${usagePercent(node.occupancy_percent)}</td><td>${usageHours(node.average_daily_seconds)}</td><td>${usageHours(node.occupied_seconds)}</td><td>${usageHours(node.own_occupied_seconds)}</td></tr>`).join("")}</tbody></table></div>` : renderEmpty("暂无可见计算节点")}
+    </section>
+    ${selected ? `<section class="panel"><div class="panel-head"><h2>${escapeHtml(selected.name)} · 每日明细</h2><span>条形表示当日平台占用比例</span></div>
+      <div class="usage-chart" aria-label="每日平台占用率">${selected.daily.map((day) => `<div class="usage-chart-column" title="${day.date}：${usagePercent(day.occupancy_percent)} / ${usageHours(day.occupied_seconds)}"><div class="usage-chart-track"><div style="height:${Math.max(0, Math.min(100, day.occupancy_percent))}%"></div></div><span>${day.date.slice(5)}</span></div>`).join("")}</div>
+      <div class="table-wrap"><table class="usage-table"><thead><tr><th>日期</th><th>已汇总 / 应汇总小时</th><th>GPU 平均使用率</th><th>CPU 平均使用率</th><th>平台占用率</th><th>使用时长</th><th>我的占用时长</th></tr></thead><tbody>${selected.daily.slice().reverse().map((day) => `<tr><td>${day.date}</td><td>${day.metric_hours ?? 0} / ${day.expected_metric_hours ?? 0}</td><td>${usagePercent(day.gpu_usage_percent)}</td><td>${usagePercent(day.cpu_usage_percent)}</td><td>${usagePercent(day.occupancy_percent)}</td><td>${usageHours(day.occupied_seconds)}</td><td>${usageHours(day.own_occupied_seconds)}</td></tr>`).join("")}</tbody></table></div>
+    </section>` : ""}
+    ${managed && selected ? `<section class="panel" data-usage-node-users><div class="panel-head"><h2>${escapeHtml(selected.name)} · 用户用量</h2><span>近 ${data.days} 天 · ${state.user.role === "admin" ? "所有用户" : "名下学生及本人"} · 仅显示有占用的用户</span></div>
+      <div class="table-wrap"><table class="usage-table"><thead><tr><th>用户</th><th>角色</th><th>服务器占用时长</th><th>GPU 占用卡时</th></tr></thead><tbody>${selectedUsers.map((item) => `<tr><td>${escapeHtml(item.real_name)} <span class="muted">${escapeHtml(item.username)}</span></td><td>${escapeHtml(roleLabels[item.role] || item.role)}</td><td>${usageHours(item.occupied_seconds)}</td><td>${Number(item.gpu_hours ?? 0).toFixed(2)}</td></tr>`).join("")}</tbody></table></div>
+      ${selectedUsers.length ? "" : renderEmpty("该周期内暂无可查看的用户占用记录")}
+    </section>` : ""}
+    ${managed ? `<section class="panel" data-usage-period-users><div class="panel-head"><h2>${state.user.role === "admin" ? "所有用户" : "名下学生及本人"} · 本期用量</h2><span>同节点并发去重，不同用户的占用可能重叠</span></div><div class="table-wrap"><table class="usage-table"><thead><tr><th>用户</th><th>角色</th><th>本期提交任务</th><th>服务器占用时长（可见节点）</th><th>GPU 占用卡时（可见节点）</th></tr></thead><tbody>${data.users.map((item) => `<tr><td>${escapeHtml(item.real_name)} <span class="muted">${escapeHtml(item.username)}</span></td><td>${escapeHtml(roleLabels[item.role] || item.role)}</td><td>${item.submitted}</td><td>${usageHours(item.occupied_seconds)}</td><td>${Number(item.gpu_hours ?? 0).toFixed(2)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+  `;
 }
 
 function renderNodeCard(node) {
@@ -5080,6 +5206,7 @@ function escapeAttr(value) {
 
 function render() {
   const renderers = {
+    usage: renderUsage,
     dashboard: renderDashboard,
     tasks: renderTasks,
     files: renderFiles,
@@ -5253,6 +5380,18 @@ function bindEvents() {
     });
   });
   document.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.nav)));
+  document.querySelectorAll("[data-usage-tab]").forEach((button) => button.addEventListener("click", () => {
+    state.usageTab = button.dataset.usageTab;
+    run(loadUsageData);
+  }));
+  document.querySelectorAll("[data-usage-days]").forEach((button) => button.addEventListener("click", () => {
+    state.usageDays = Number(button.dataset.usageDays);
+    run(loadUsageData);
+  }));
+  document.querySelectorAll("[data-usage-node]").forEach((button) => button.addEventListener("click", () => {
+    state.usageNodeId = button.dataset.usageNode;
+    render();
+  }));
   bindManualTocEvents();
   document.querySelector("[data-action='logout']")?.addEventListener("click", () => run(logout));
   document.querySelectorAll("[data-action='refresh']").forEach((button) => button.addEventListener("click", () => run(refreshPage, "已刷新")));

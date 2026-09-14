@@ -452,6 +452,10 @@ NEBULAGRID_INFLUXDB_TOKEN=replace-with-influx-token
 NEBULAGRID_INFLUXDB_LATEST_RANGE=30m
 NEBULAGRID_INFLUXDB_PRESENTER_RANGE=30m
 NEBULAGRID_INFLUXDB_PRESENTER_WINDOW=30s
+# 小时均值写入独立 bucket，由 API 托管的后台进程自动创建并设置 90 天保留期。
+NEBULAGRID_INFLUXDB_USAGE_BUCKET=nebulagrid_usage_hourly
+# 只影响后台每小时原始采样聚合；页面读取小时汇总和实时监控仍为 5 秒。
+NEBULAGRID_INFLUXDB_USAGE_TIMEOUT_SECONDS=60
 NEBULAGRID_DATA_ROOT=/home/ddltm/data
 NEBULAGRID_USER_HOME_ROOT=/home/ddltm/data/user
 NEBULAGRID_SHARED_FOLDER_ROOT=/home/ddltm/shared
@@ -508,6 +512,8 @@ sudo grep -v SECRET /etc/nebulagrid/backend.env
 | `NEBULAGRID_INFLUXDB_LATEST_RANGE` | 普通节点监控读取最近数据的时间范围，例如 `30m` 表示最近 30 分钟。 |
 | `NEBULAGRID_INFLUXDB_PRESENTER_RANGE` | 展示者大屏历史曲线读取的时间范围；范围越大，查询数据越多。 |
 | `NEBULAGRID_INFLUXDB_PRESENTER_WINDOW` | 展示者大屏历史曲线的聚合窗口，例如 `30s` 表示按 30 秒聚合一个点。 |
+| `NEBULAGRID_INFLUXDB_USAGE_BUCKET` | 小时用量专用 bucket，默认 `nebulagrid_usage_hourly`，不得与原始监控 bucket 同名。后台自动创建并设置 90 天保留期；token 须能创建 bucket，或由管理员预建后授予读写权限。 |
+| `NEBULAGRID_INFLUXDB_USAGE_TIMEOUT_SECONDS` | 后台每小时原始采样聚合的网络等待上限，默认 `60` 秒，限制在 `5～120` 秒；页面只读小时汇总，仍为 5 秒。修改环境文件后重启 API。 |
 | `NEBULAGRID_DATA_ROOT` | 平台数据根目录，通过 NFS 共享到计算节点；包含用户 home、日志、运行时文件和备份目录。 |
 | `NEBULAGRID_USER_HOME_ROOT` | 平台用户 home 根目录，用户 `alice` 的目录会落在 `<该路径>/alice`。 |
 | `NEBULAGRID_SHARED_FOLDER_ROOT` | 文件管理中“共享文件夹”视图对应的真实目录，所有登录用户可查看并与个人目录互相复制文件。 |
@@ -1070,6 +1076,48 @@ curl -s http://127.0.0.1:8000/api/users \
 进入 `总览`，每张 GPU 的“使用率 · 显存 · 调度占用”下方应显示 `预计剩余占用时间`、`剩余占用时间未知`、`可使用` 或 `外部占用`。系统占用时间来自未释放 allocation 的任务整体预估；多任务复用时取最大值，任一任务补读中、估计过期、停止中或未知时均显示未知。未被系统占用的卡沿用总览现有可用性阈值（GPU 使用率不超过 20%、可用显存不少于 80%）；节点离线或调度关闭另显示 `不可调度`，不改变调度器的独占/复用策略。
 
 后端通过 `/api/nodes?include_occupancy=true` 即时聚合，只处理当前用户可见节点，返回时间和资源标签，不返回其他用户的任务 ID、命令或日志，也不读取原始日志或新增落库字段。其他节点列表不请求此聚合。更新前后端后随总览刷新即可查看；已存在的自动刷新间隔继续生效，无需停止训练。
+
+### 17.11 用量统计部署与验收
+
+本功能新增侧边栏 `用量统计`，分为 `任务统计` 和 `节点统计`。后端路由为 `GET /api/usage/tasks`、`GET /api/usage/nodes?days=7`，节点周期严格支持 `7`、`30`、`90`；学生、导师新增 `usage:read` 权限，管理员沿用全权限，展示者不可访问。
+
+部署步骤：
+
+1. 按第 20 节更新仓库，按第 15 节同步前端文件。须包含 `backend/app/services/usage_rollup_service.py`、`backend/app/workers/usage_rollup.py`，以及配置、API 启停、用量路由、权限和监控服务的配套改动。
+2. 检查 `/etc/nebulagrid/backend.env` 的 InfluxDB 配置。可沿用默认汇总 bucket 名 `nebulagrid_usage_hourly`；如需自定义，设置 `NEBULAGRID_INFLUXDB_USAGE_BUCKET`，禁止与原始 bucket 同名。执行 `sudo systemctl restart nebulagrid-api`。API 自动托管独立汇总进程，使用 PostgreSQL 会话锁确保多 API 进程中只有一个汇总器；不新增 PostgreSQL 表、依赖或 systemd 服务，无须重启 scheduler/executor 或中断训练。
+3. 浏览器刷新，进入 `用量统计`。若看不到按钮，确认后端已更新、账号为学生/导师/管理员，并刷新登录权限。检查 `journalctl -u nebulagrid-api -n 100 --no-pager` 排查接口错误。
+4. 确认 `nebulagrid-monitor` 持续采样。汇总进程会自动创建专用 bucket（已有时校正为 90 天保留期），写入 measurement `node_usage_hourly`，tag 为 `node_id`，字段为浮点 `cpu_usage`、`gpu_usage` 及整数完成标记 `complete=1`，时间戳为该小时开始时刻。原始 bucket 的数据和保留策略不变。若 token 没有 bucket 管理权限，先在 InfluxDB 管理界面创建此 bucket，保留期设为 `90 days`（`7776000` 秒），再给 API token 授予原始 bucket 读取及汇总 bucket 读写权限。
+5. 首次升级会在后台扫描保留期内每个计算节点的每小时缺口，按最近小时优先逐小时补算；已有部分日期也逐小时检查，不会漏掉日内缺口。每到整点重新扫描，优先补算刚结束的小时；无缺口时每分钟复查，以发现新节点。首次重建需等待，页面提示“部分小时汇总缺失”并显示每日 `已汇总 / 应汇总小时`，已有小时可先参与均值。重启后根据持久完成标记接续，不重复扫描已完成小时的原始采样。
+
+页面请求仅从专用 bucket 读取已保存的小时均值，不回退读取原始监控，也不等待历史重建。当前未结束的小时始终排除：例如 13:25 刷新时只读到 13:00，13:00–14:00 不参与 CPU/GPU 统计；当天 00:25 尚无已结束小时，今天均值显示 `无数据`、进度为 `0 / 0`。平台任务占用仍按数据库分配记录计至刷新时刻。
+
+原始查询成功但整小时没有 CPU 或 GPU 采样时，对缺少的指标写入 0 和完成标记，之后不再重建该小时；有 GPU 采样时跨卡取样本均值。查询超时、HTTP 错误、CSV 错误或无效数值不写零、不写完成标记，至少一分钟后重试，且不阻塞其他小时。**无采样按零统计不等于能证明当时确实离线**：升级前已过期、未采集的数据无法恢复真实使用率，按同一规则记零；不能用当前节点在线状态或任务日志推算旧监控值。已完成小时不会因迟到采样再次自动改算。
+
+排障执行 `journalctl -u nebulagrid-api --since "15 minutes ago" --no-pager`，关注“小时用量扫描”“小时用量已保存”“小时用量补算失败”。若后台原始小时查询持续 `TimeoutError`，检查 InfluxDB 负载，可设置 `NEBULAGRID_INFLUXDB_USAGE_TIMEOUT_SECONDS=120` 后重启 API；该值只作用于后台，不延长页面等待。页面区分“小时汇总读取超时”（`timeout`）、读取权限不足（`access_denied`，HTTP 401/403）、查询被拒绝（`query_error`，HTTP 400）和服务不可用。`building` 表示尚有缺口或 bucket 尚未创建；若长期不变，检查后台日志和 bucket 权限。不要清空原始 bucket 或重新初始化监控库。
+
+若启动日志在 `ensure_usage_bucket → influx_json` 的第一次按名称查询处反复出现 HTTP 404，检查是否仍使用早期只处理空列表的初始化代码。首次查询目标 bucket 返回 404 时，修复版会先确认原始 bucket 可读，再创建保留 90 天的汇总 bucket；401/403、服务故障或原始 bucket 不可读仍报错，不会误创建。更新 `backend/app/services/usage_rollup_service.py` 后执行 `sudo systemctl restart nebulagrid-api`，应开始出现“小时用量扫描”和“小时用量已保存”。此项修复不需要前端更新或清理任何 bucket；若仍失败，按新的异常位置检查地址、组织或权限。
+
+角色验收：
+
+- 学生：仅看到自己的任务总量和当前可见节点；节点总占用可匿名包括其他用户，`我的占用时长` 只计算自己。没有其他用户的身份明细。
+- 导师：除个人数据，显示本人和当前名下所有学生的任务明细（含零任务学生）；节点页底部显示每人的本期提交数及可见节点上的服务器占用时长、GPU 占用卡时。点击节点后，其每日明细下方显示该节点的用户用量，只包含本人及名下学生中在本周期有占用的用户。解除导师关联后刷新，相关学生立即从两处明细移除。
+- 管理员：任务页显示所有用户汇总及明细；节点页含所有计算节点（不含 master），并展示所有用户本期用量及 GPU 占用卡时。点击节点可在每日明细下方查看该节点各用户的占用时长和卡时。
+- 展示者：无用量统计按钮，用其令牌直接请求上述 API 返回 403。
+
+统计口径及检查样例：
+
+1. 任务页累计全部保留任务，不受任务列表 200 条分页影响。分别统计提交、已开始执行、成功、失败、取消、执行中、等待/挂起及其他/未知；失败包括调度/离线/依赖异常，准备和停止确认仍属于执行中。
+2. 任务运行时长为执行起止差，运行中的任务算至本次请求；GPU 卡时按实际分配卡数折算，并截止于资源释放。2 块 GPU 运行 3 小时应为 3 小时运行时长、6 卡时。纯 CPU 任务卡时为 0。起止时间异常、缺少可信实际 GPU 分配时，页面提示总量仅包含可确认部分，不用申请卡数代替实际分配。
+3. 节点周期按服务器时区的自然日划分，包含今天并截止到刷新时刻。服务器占用为资源分配到释放的区间并集，包含准备及停止清理。同节点任务分别占用 01:00–03:00、02:00–04:00，总占用应为 3 小时而非 4 小时；跨午夜分摊到两天，跨节点累加。
+4. 日均使用时长为所选周期的总占用除以天数，无占用日期也参与平均；平台占用率的分母为周期已过去的时间。GPU/CPU 日均按当天实际已有的小时均值等权平均，已保存的零值也参与；例如三小时均值为 30%、60%、0%，日均为 30%。服务重启导致某天仅有 `23 / 24` 小时汇总时，按 23 小时计算日均，缺失小时不占分母，该天仍参与周期统计；周期均值按实际已有小时数加权，完全没有有效小时才显示 `无数据`。页面保留完整度和缺口提示，后台继续尝试补算，补回后下次刷新自动纳入。外部 SSH 进程反映在监控均值中，不产生个人平台占用。
+5. 用户本期提交数按任务创建日期计算；周期前创建但周期内执行的任务应贡献占用而不增加本期提交。同节点每个用户各自去重，但用户之间可能重叠，其占用之和不要求等于节点总占用。所有角色的用户占用都只汇总请求者当前可见节点。
+6. 点击近 7/30/90 天及节点名称，检查每日图表和明细完整切换；运行任务在右上角刷新后更新。未配置或暂时无法访问 InfluxDB 时应有明确提示，任务和平台占用仍能读取。
+7. 节点页的 `GPU 占用卡时` 按本周期内实际分配到释放的 GPU 占用计算，包含准备和清理，未释放时计至刷新时刻；同一用户在同一节点复用同一张 GPU 的重叠区间取并集，不同卡和不同节点分别累加。例如 2 块 GPU 占用 3 小时为 6 卡时；一张卡上两个任务分别占用 01:00–03:00、02:00–04:00，则该用户为 3 卡时。CPU 任务为 0 卡时，缺少实际 GPU ID 的记录不根据申请数量推测。此口径与任务统计页仅计算程序执行时间的卡时不同。
+8. `节点名 · 用户用量` 表展示用户、角色、服务器占用时长、GPU 占用卡时；随节点和周期切换，按占用时长降序排列，仅返回占用时长大于 0 的授权用户。没有记录时列表为空并显示说明，CPU 用户有占用时长也应显示。底部本期汇总保留零用量用户，新增卡时等于该用户各可见节点卡时之和。学生接口不返回节点用户明细，前端也不显示该表。此次增强只需更新 `usage_service.py` 和前端 `app.js` 后重启 API、刷新浏览器，不新增表或修改 InfluxDB 汇总。
+
+历史边界：本功能统计当前保留的任务及资源分配，**不是永久用量账本**。原记录重新入队后任务页只计最近一次执行，重新提交产生的新任务单独计数；节点占用累计仍保留的各次分配。删除任务会减少对应统计，升级前已删除或被覆盖的历史不能恢复。无须读取历史任务日志回填用量。
+
+可在隔离测试环境执行 `cd backend && python -m pytest tests/test_usage.py tests/test_usage_rollup.py tests/test_node_permissions.py tests/test_task_progress.py -q`；前端浏览器回归为 `node --test frontend/tests/usage.browser.cjs`（需 Playwright 和 Chrome）。这些测试不连接真实集群或 InfluxDB。
 
 ## 18. 防火墙
 

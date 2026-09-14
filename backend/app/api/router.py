@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api import admin, auth, dashboard, envs, files, health, manual, nodes, tasks, users
+from app.api import admin, auth, dashboard, envs, files, health, manual, nodes, tasks, usage, users
 
 
 def get_api_router() -> APIRouter:
@@ -9,6 +9,7 @@ def get_api_router() -> APIRouter:
     router.include_router(health.router, tags=["health"])
     router.include_router(auth.router, prefix="/auth", tags=["auth"])
     router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
+    router.include_router(usage.router, prefix="/usage", tags=["usage"])
     router.include_router(nodes.router, prefix="/nodes", tags=["nodes"])
     router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
     router.include_router(files.router, prefix="/files", tags=["files"])

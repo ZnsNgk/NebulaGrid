@@ -8,7 +8,7 @@ class Settings:
     """保存后端运行所需的非敏感配置，敏感项后续从 secrets/env 注入。"""
 
     app_name: str = "NebulaGrid"
-    app_version: str = "1.0.3"
+    app_version: str = "1.0.4"
     environment: str = "development"
     data_root: str = "/home/ddltm/data"
     user_home_root: str = "/home/ddltm/data/user"
@@ -26,6 +26,10 @@ class Settings:
     influxdb_latest_range: str = "30m"
     influxdb_presenter_range: str = "30m"
     influxdb_presenter_window: str = "30s"
+    # 小时汇总独立保留 90 天，不能与原始 bucket 共用以免改动原始数据的保留策略。
+    influxdb_usage_bucket: str = "nebulagrid_usage_hourly"
+    # 只供后台重建原始采样使用；页面读取小时汇总仍采用短超时。
+    influxdb_usage_timeout_seconds: int = 60
     task_log_root: str = "/home/ddltm/data/logs/task_logs"
     conda_env_root: str = "/home/ddltm/envs/miniconda3/envs"
     env_package_root: str = "/home/ddltm/envs/packages"
@@ -66,7 +70,7 @@ def get_settings() -> Settings:
     )
     return Settings(
         app_name=os.getenv("NEBULAGRID_APP_NAME", "NebulaGrid"),
-        app_version=os.getenv("NEBULAGRID_APP_VERSION", "1.0.3"),
+        app_version=os.getenv("NEBULAGRID_APP_VERSION", "1.0.4"),
         environment=os.getenv("NEBULAGRID_ENV", "development"),
         data_root=os.getenv("NEBULAGRID_DATA_ROOT", "/home/ddltm/data"),
         user_home_root=os.getenv("NEBULAGRID_USER_HOME_ROOT", "/home/ddltm/data/user"),
@@ -84,6 +88,8 @@ def get_settings() -> Settings:
         influxdb_latest_range=os.getenv("NEBULAGRID_INFLUXDB_LATEST_RANGE", "30m"),
         influxdb_presenter_range=os.getenv("NEBULAGRID_INFLUXDB_PRESENTER_RANGE", "30m"),
         influxdb_presenter_window=os.getenv("NEBULAGRID_INFLUXDB_PRESENTER_WINDOW", "30s"),
+        influxdb_usage_bucket=os.getenv("NEBULAGRID_INFLUXDB_USAGE_BUCKET", "nebulagrid_usage_hourly"),
+        influxdb_usage_timeout_seconds=max(5, min(120, int(os.getenv("NEBULAGRID_INFLUXDB_USAGE_TIMEOUT_SECONDS", "60")))),
         task_log_root=os.getenv("NEBULAGRID_TASK_LOG_ROOT", "/home/ddltm/data/logs/task_logs"),
         conda_env_root=os.getenv("NEBULAGRID_CONDA_ENV_ROOT", "/home/ddltm/envs/miniconda3/envs"),
         env_package_root=os.getenv("NEBULAGRID_ENV_PACKAGE_ROOT", "/home/ddltm/envs/packages"),

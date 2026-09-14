@@ -15,6 +15,7 @@ class Role(StrEnum):
 ROLE_PERMISSIONS: dict[Role, set[str]] = {
     Role.STUDENT: {
         "dashboard:read",
+        "usage:read",
         "nodes:read",
         "tasks:read",
         "tasks:create",
@@ -25,6 +26,7 @@ ROLE_PERMISSIONS: dict[Role, set[str]] = {
     },
     Role.MENTOR: {
         "dashboard:read",
+        "usage:read",
         "nodes:read",
         "tasks:read",
         "tasks:create",

@@ -939,6 +939,77 @@ nav {
   padding: 14px 18px 28px;
 }
 
+/* 统计页使用独立布局，长周期图表及用户明细横向滚动，不挤压窄屏侧栏。 */
+.usage-toolbar,
+.usage-switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.usage-toolbar {
+  justify-content: space-between;
+}
+
+.usage-heading {
+  font-size: 18px;
+  margin: 20px 0 12px;
+}
+
+.usage-metrics strong {
+  font-size: 25px;
+  overflow-wrap: anywhere;
+}
+
+.usage-note {
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--muted);
+}
+
+.usage-note p {
+  margin: 6px 0;
+}
+
+.usage-warning {
+  color: var(--yellow);
+}
+
+.usage-table {
+  white-space: nowrap;
+}
+
+.usage-chart {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  margin: 18px 0;
+  padding-bottom: 10px;
+}
+
+.usage-chart-column {
+  flex: 1 0 36px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 11px;
+}
+
+.usage-chart-track {
+  height: 110px;
+  display: flex;
+  align-items: end;
+  background: var(--surface-soft);
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+
+.usage-chart-track > div {
+  width: 100%;
+  background: linear-gradient(0deg, var(--accent), var(--brand));
+  border-radius: 4px;
+}
+
 .presenter-topbar {
   display: flex;
   justify-content: space-between;

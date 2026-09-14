@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from app.core.config import Settings, get_settings
@@ -197,6 +200,34 @@ from(bucket: "{escape_flux_string(settings.influxdb_bucket)}")
 '''
 
 
+def get_daily_usage_metrics(node_ids: list[int], start: datetime, stop: datetime) -> tuple[dict, str]:
+    """页面只读取已保存的小时均值；原始采样的补算由独立后台进程负责。"""
+    settings = get_settings()
+    if not influx_enabled(settings):
+        return {}, "not_configured"
+    if not node_ids:
+        return {}, "ok"
+    # 延迟导入，复用底层 HTTP 客户端时避免与汇总模块形成循环导入。
+    from app.services.usage_rollup_service import daily_from_rollups, read_hourly_rollups
+    try:
+        hourly = read_hourly_rollups(settings, node_ids, start, stop)
+        return daily_from_rollups(node_ids, start, stop, hourly)
+    except Exception as exc:
+        # 监控故障只影响实测均值，数据库中的任务与占用统计仍可正常读取。
+        logging.getLogger(__name__).warning("用量统计读取每日监控均值失败", exc_info=True)
+        if isinstance(exc, TimeoutError) or (isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)):
+            return {}, "timeout"
+        if isinstance(exc, urllib.error.HTTPError):
+            if exc.code in {401, 403}:
+                return {}, "access_denied"
+            if exc.code == 404:
+                return {}, "building"
+            if exc.code == 400:
+                # 只将类别返回浏览器，不把数据服务的地址、凭据或内部错误正文暴露给普通用户。
+                return {}, "query_error"
+        return {}, "unavailable"
+
+
 def build_history_query(settings: Settings, node_ids: list[int], gpu_ids: list[int], hours: int | None = None) -> str:
     """构造展示大屏历史曲线 Flux 查询，按配置窗口聚合以限制响应体大小。"""
     node_filter = " or ".join(f'r.node_id == "{node_id}"' for node_id in node_ids) or "false"
@@ -243,8 +274,8 @@ def presenter_history_window(hours: int) -> str:
     return "5m"
 
 
-def query_flux(settings: Settings, flux: str) -> list[dict[str, str]]:
-    """调用 InfluxDB 查询接口并把 CSV 响应解析为字典行。"""
+def query_flux(settings: Settings, flux: str, timeout_seconds: float = 5) -> list[dict[str, str]]:
+    """调用 InfluxDB 并解析 CSV；页面默认 5 秒，后台原始采样聚合使用独立超时。"""
     params = urllib.parse.urlencode({"org": settings.influxdb_org})
     url = f"{settings.influxdb_url.rstrip('/')}/api/v2/query?{params}"
     request = urllib.request.Request(
@@ -257,7 +288,7 @@ def query_flux(settings: Settings, flux: str) -> list[dict[str, str]]:
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=5) as response:
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         content = response.read().decode("utf-8")
     return parse_flux_csv(content)
 
@@ -269,6 +300,9 @@ def parse_flux_csv(content: str) -> list[dict[str, str]]:
     for raw_row in csv.reader(line for line in content.splitlines() if line):
         if not raw_row or raw_row[0].startswith("#"):
             continue
+        # InfluxDB 可能在 HTTP 200 的 CSV 流中返回错误表；不能把失败当作离线并物化成零。
+        if "error" in raw_row and "reference" in raw_row:
+            raise ValueError("InfluxDB query returned an error table")
         if "_measurement" in raw_row and "_field" in raw_row and "_value" in raw_row:
             headers = raw_row
             continue
